@@ -1,20 +1,20 @@
 {
   "name": "filecodebox",
   "main": "src/index.ts",
-  "account_id": "ea2143f29e816a521fc066bda417c798",
+  "account_id": "e92856e679a70f072a27ff6f4d2b13aa",
   "compatibility_date": "2025-08-16",
   "compatibility_flags": ["nodejs_compat"],
   "triggers": {
     "crons": ["*/30 * * * *"]
   },
   "vars": {
-    "MAX_FILE_SIZE": "104857600",
+    "MAX_FILE_SIZE": "26214400",
     "DEFAULT_EXPIRE_DAYS": "7"
   },
   "d1_databases": [{
     "binding": "DB",
     "database_name": "filecodebox-db",
-    "database_id": "64ed02dd-5ce9-4c8b-9ef3-005542ac6389"
+    "database_id": "66d79b81-1c45-42df-91eb-41a1e825c498"
   }],
   "r2_buckets": [{
     "binding": "FILE_STORE",
