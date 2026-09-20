@@ -165,11 +165,12 @@ app.get('/api/text/:code', async (c) => {
   const file = await getFileByCode(c.env.DB, code);
   if (!file || file.is_text !== 1) return c.text('Not found', 404);
 
-  if (c.req.method !== 'HEAD') {
-    await incrementDownload(c.env.DB, code);
+  if (c.req.method !== 'HEAD' && !(await incrementDownload(c.env.DB, code))) {
+    return c.text('Max downloads exceeded', 403);
   }
   const textObj = await c.env.FILE_STORE.get(`file:${code}`);
-  return c.text(textObj ? await textObj.text() : '');
+  if (!textObj) return c.text('Not found', 404);
+  return c.text(await textObj.text());
 });
 
 // ===================== 下载 =====================

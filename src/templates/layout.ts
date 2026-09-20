@@ -1,7 +1,8 @@
 /**
  * 通用 HTML 布局包装器
+ * wide=true 时容器放宽到 720px（取件/分享/管理面板双栏布局用）
  */
-export function layout(title: string, content: string, showFooter = true): string {
+export function layout(title: string, content: string, showFooter = true, wide = false): string {
   const footer = showFooter
     ? `<div class="footer">
         <a href="/">FileCodeBox</a> · 安全临时文件分享
@@ -19,15 +20,14 @@ export function layout(title: string, content: string, showFooter = true): strin
   <title>${title}</title>
   <link rel="icon" href="https://q1.qlogo.cn/g?b=qq&nk=2847495839&s=640">
   <link rel="preconnect" href="/static">
-  <link rel="preload" as="image" href="/static/bg.webp" fetchpriority="high">
-  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
-  <div class="container">
+  <div class="container${wide ? ' container-wide' : ''}">
     <div class="card">${content}</div>
     ${footer}
   </div>
-  <script>function copyText(t,e){var n=this;navigator.clipboard.writeText(t).then(function(){n.textContent='已复制';setTimeout(function(){n.textContent=e},1500)})}</script>
+  <script>function copyText(t,e){var n=this;navigator.clipboard.writeText(t).then(function(){n.textContent='已复制';setTimeout(function(){n.textContent=e},1500)})}function codeCopy(el,t){navigator.clipboard.writeText(t).then(function(){var h=el.querySelector('.click-hint');h.textContent='已复制';setTimeout(function(){h.textContent='点击复制'},1500)})}</script>
 </body>
 </html>`;
 }

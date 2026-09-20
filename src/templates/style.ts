@@ -80,7 +80,7 @@ export const STYLE = `
 body {
   font-family: var(--font-body);
   background-color: var(--color-paper);
-  background-image: url("/static/bg.webp");
+  background-image: url("https://t.alcy.cc/ycy");
   background-size: cover;
   background-position: center;
   background-repeat: no-repeat;
@@ -96,15 +96,25 @@ body {
   margin: 0 auto;
   padding: 40px 16px 64px;
 }
+.container.container-wide {
+  max-width: 720px;
+}
 
 .card {
-  background: color-mix(in oklab, var(--color-paper-2) 50%, transparent);
-  backdrop-filter: blur(5px) saturate(1.15);
-  -webkit-backdrop-filter: blur(5px) saturate(1.15);
-  border-radius: var(--radius);
+  background: color-mix(in oklab, var(--color-paper) 55%, transparent);
+  backdrop-filter: blur(18px) saturate(1.15);
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
+  border-radius: 20px;
   padding: 28px 24px;
-  border: 1px solid var(--color-rule);
+  border: 1px solid color-mix(in oklab, var(--color-rule) 70%, transparent);
+  box-shadow: 0 20px 50px oklch(0% 0 0 / 0.12);
   animation: cardIn var(--dur-long) var(--ease-out) both;
+}
+@media (prefers-color-scheme: dark) {
+  .card {
+    background: color-mix(in oklab, var(--color-paper-2) 45%, transparent);
+    box-shadow: 0 20px 50px oklch(0% 0 0 / 0.35);
+  }
 }
 
 @keyframes cardIn {
@@ -560,5 +570,148 @@ textarea.input {
     transition: none;
   }
   .undo-toast { animation: none; }
+}
+
+/* ---- share 双栏布局（毛玻璃宽屏版） ---- */
+.share-grid {
+  display: flex;
+  gap: 32px;
+  align-items: stretch;
+}
+.share-left {
+  flex: 1.5;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.share-right {
+  flex: 1;
+  background: color-mix(in oklab, var(--color-paper) 45%, transparent);
+  border: 1px solid color-mix(in oklab, var(--color-rule) 70%, transparent);
+  border-radius: 16px;
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.share-title {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--color-ink);
+  word-break: break-all;
+  margin-bottom: 14px;
+}
+
+/* 内容框：文本在上、操作按钮在下 */
+.command-box {
+  background: color-mix(in oklab, var(--color-paper) 60%, transparent);
+  border: 1px solid var(--color-rule);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+  flex-grow: 1;
+}
+.command-text {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 380px;
+  overflow-y: auto;
+  color: var(--color-ink);
+}
+.btn-copy-cmd {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  border: 1px solid color-mix(in oklab, var(--color-accent) 30%, transparent);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-family: var(--font-body);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: background var(--dur-short) var(--ease-out), transform var(--dur-micro) var(--ease-out);
+  flex-shrink: 0;
+  align-self: flex-end;
+}
+.btn-copy-cmd:hover { background: color-mix(in oklab, var(--color-accent) 20%, transparent); }
+.btn-copy-cmd:active { transform: scale(0.96); }
+
+/* 元信息：size · 下载次数 · 过期时间 */
+.meta-row {
+  font-size: 12px;
+  color: var(--color-ink-2);
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.meta-row span { display: flex; align-items: center; }
+.meta-row span::after { content: "·"; margin-left: 12px; color: var(--color-rule-strong); }
+.meta-row span:last-child::after { display: none; }
+
+/* 取件码卡：点击复制 */
+.code-card {
+  width: 100%;
+  cursor: pointer;
+  transition: background var(--dur-short) var(--ease-out), transform var(--dur-micro) var(--ease-out);
+  padding: 10px 0;
+  border-radius: 12px;
+}
+.code-card:hover { background: var(--color-accent-soft); }
+.code-card:active { transform: scale(0.98); }
+.code-label { font-size: 12px; color: var(--color-ink-2); margin-bottom: 8px; }
+.code-value {
+  font-size: 38px;
+  font-weight: 800;
+  color: var(--color-accent);
+  letter-spacing: 6px;
+  font-family: var(--font-mono);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.click-hint { font-size: 10px; color: var(--color-muted); margin-top: 6px; }
+
+.share-divider {
+  height: 1px;
+  background: var(--color-rule);
+  width: 80%;
+  margin: 20px 0;
+}
+
+.qr-img {
+  width: 110px;
+  height: 110px;
+  border-radius: 10px;
+  border: 1px solid var(--color-rule);
+  padding: 4px;
+  background: #fff;
+}
+.qr-title { font-size: 12px; color: var(--color-ink-2); margin-top: 10px; }
+.share-link-btn {
+  margin-top: 14px;
+  width: auto;
+  display: inline-flex;
+  padding: 8px 16px;
+  font-size: 13px;
+}
+
+@media (max-width: 719px) {
+  .share-grid { flex-direction: column; gap: 20px; }
+  .command-box { flex-grow: 0; }
+  .code-value { font-size: 34px; letter-spacing: 5px; }
+  .share-right { padding: 20px 12px; }
 }
 `;

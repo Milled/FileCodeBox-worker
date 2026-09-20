@@ -169,38 +169,47 @@ export function retrievePage(code?: string): string {
 export function resultPage(code: string, filename: string, size: number, baseUrl: string): string {
   const shareUrl = `${baseUrl}/r/${code}`;
   const content = `
-    <div class="header">
-      <div>
-        <h1>上传成功</h1>
-      </div>
-      <div class="header-actions">
-        <a href="/">上传</a>
-        <a href="/admin">管理</a>
-      </div>
-    </div>
-    <div class="code-box">
-      <div style="font-size:13px;color:var(--color-ink-2);margin-bottom:8px">取件码</div>
-      <div class="code-display" onclick="copyText('${escapeHtml(code)}','${escapeHtml(code)}')">${code}</div>
-      <div class="info-row" style="margin-top:16px">
-        <span class="info-tag">${escapeHtml(filename)}</span>
-        <span class="info-tag">${formatFileSize(size)}</span>
-      </div>
-      <div style="margin-top:16px">
-        <button class="copy-text-btn" onclick="var t=this;navigator.clipboard.writeText('${escapeHtml(shareUrl)}').then(function(){t.textContent='\u94fe\u63a5\u5df2\u590d\u5236'});setTimeout(function(){t.textContent='\u590d\u5236\u5206\u4eab\u94fe\u63a5'},2000)">复制分享链接</button>
-      </div>
-      <!-- 二维码区域 -->
-      <div style="margin-top:24px;text-align:center">
-        <div style="font-size:12px;color:var(--color-ink-2);margin-bottom:8px">扫码快速分享</div>
-        <div style="display:inline-block;background:#fff;padding:8px;border-radius:var(--radius);border:1px solid var(--color-rule)">
-          <img src="/qrcode/${code}?v=${Date.now()}" alt="QR Code" style="display:block;width:140px;height:140px" loading="lazy">
+    <div class="share-grid">
+      <div class="share-left">
+        <div class="header">
+          <div>
+            <h1>上传成功</h1>
+          </div>
+          <div class="header-actions">
+            <a href="/">上传</a>
+            <a href="/admin">管理</a>
+          </div>
+        </div>
+        <div class="share-title">${escapeHtml(filename)}</div>
+        <div class="command-box" style="align-items:center;justify-content:center">
+          <div class="meta-row" style="font-size:13px">
+            <span>${formatFileSize(size)}</span>
+          </div>
+          <a href="/" class="btn btn-secondary" style="width:auto">继续上传</a>
         </div>
       </div>
-    </div>
-    <a href="/" class="btn btn-secondary" style="margin-top:12px">继续上传</a>`;
-  return layout('上传成功', content);
+      ${shareRightPanel(code, shareUrl)}
+    </div>`;
+  return layout('上传成功', content, true, true);
 }
 
 // ---- 文件详情页 ----
+
+/** 分享页右栏：取件码卡 + 二维码（取件页文本/文件视图与上传结果页共用） */
+function shareRightPanel(code: string, shareUrl: string): string {
+  return `
+    <div class="share-right">
+      <div class="code-card" onclick="codeCopy(this,'${escapeHtml(code)}')">
+        <div class="code-label">取件码</div>
+        <div class="code-value">${escapeHtml(code)}</div>
+        <div class="click-hint">点击复制</div>
+      </div>
+      <div class="share-divider"></div>
+      <img src="/qrcode/${code}?v=${Date.now()}" alt="QR Code" class="qr-img" loading="lazy">
+      <div class="qr-title">扫码快速分享</div>
+      <button class="btn btn-secondary share-link-btn" onclick="navigator.clipboard.writeText('${escapeHtml(shareUrl)}')">复制分享链接</button>
+    </div>`;
+}
 
 export function filePage(file: FileRecord, baseUrl: string): string {
   const sizeStr = formatFileSize(file.size);
@@ -213,39 +222,35 @@ export function filePage(file: FileRecord, baseUrl: string): string {
   const expired = expireDate.getTime() < Date.now();
   const shareUrl = `${baseUrl}/r/${file.code}`;
 
-  // 文本内容 — 页面内展示
+  // 文本内容 — 双栏：左侧内容框，右侧取件码/二维码
   if (file.is_text === 1 && !expired) {
     const content = `
-      <div class="header">
-        <div>
-          <h1>取件</h1>
-        </div>
-        <div class="header-actions">
-          <a href="/">上传</a>
-          <a href="/admin">管理</a>
-        </div>
-      </div>
-      <div style="text-align:center;padding:16px 0">
-        <div style="font-size:20px;font-weight:600;margin-bottom:4px;word-break:break-all">${escapeHtml(file.filename)}</div>
-        <div style="display:flex;justify-content:center;gap:24px;font-size:13px;color:var(--color-ink-2);margin-bottom:16px">
-          <span>${sizeStr}</span>
-          <span>${dlInfo}</span>
-          <span>${expireStr}</span>
-        </div>
-        <div class="text-content" id="textContent">加载中…</div>
-        <div style="margin-top:12px;font-size:13px;color:var(--color-ink-2)">
-          取件码: <strong style="font-size:18px;color:var(--color-accent);letter-spacing:3px;font-family:var(--font-mono);cursor:pointer" onclick="copyText('${escapeHtml(file.code)}','${escapeHtml(file.code)}')" title="点击复制">${escapeHtml(file.code)}</strong>
-        </div>
-        <div style="margin-top:8px">
-          <button onclick="navigator.clipboard.writeText('${escapeHtml(shareUrl)}')" class="btn btn-secondary" style="width:auto;display:inline-flex;padding:8px 16px;font-size:13px">复制分享链接</button>
-        </div>
-        <!-- 二维码 -->
-        <div style="margin-top:20px;text-align:center">
-          <div style="font-size:12px;color:var(--color-ink-2);margin-bottom:8px">扫码快速分享</div>
-          <div style="display:inline-block;background:#fff;padding:8px;border-radius:var(--radius);border:1px solid var(--color-rule)">
-            <img src="/qrcode/${file.code}?v=${Date.now()}" alt="QR Code" style="display:block;width:140px;height:140px" loading="lazy">
+      <div class="share-grid">
+        <div class="share-left">
+          <div class="header">
+            <div>
+              <h1>取件</h1>
+            </div>
+            <div class="header-actions">
+              <a href="/">上传</a>
+              <a href="/admin">管理</a>
+            </div>
+          </div>
+          <div class="share-title">${escapeHtml(file.filename)}</div>
+          <div class="command-box">
+            <div class="command-text" id="textContent">加载中…</div>
+            <button class="btn-copy-cmd" id="copyAllBtn" hidden onclick="var s=this.querySelector('span');navigator.clipboard.writeText(window.__shareText||'').then(function(){s.textContent='已复制';setTimeout(function(){s.textContent='复制全文'},1500)})">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              <span>复制全文</span>
+            </button>
+          </div>
+          <div class="meta-row">
+            <span>${sizeStr}</span>
+            <span>${dlInfo}</span>
+            <span>${expireStr}</span>
           </div>
         </div>
+        ${shareRightPanel(file.code, shareUrl)}
       </div>
       <script>
         (function(){
@@ -253,10 +258,24 @@ export function filePage(file: FileRecord, baseUrl: string): string {
           var ctrl = new AbortController();
           var timer = setTimeout(function(){ ctrl.abort(); }, 8000);
           fetch('/api/text/${file.code}', { signal: ctrl.signal })
-            .then(function(r){ return r.text(); })
-            .then(function(t){
+            .then(function(r){
               clearTimeout(timer);
-              el.textContent = t;
+              if (!r.ok) {
+                var msg = r.status === 403 ? '\u8be5\u5185\u5bb9\u5df2\u8fbe\u6700\u5927\u67e5\u770b\u6b21\u6570\u3002'
+                        : r.status === 404 ? '\u5185\u5bb9\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u6e05\u7406\u3002'
+                        : '\u5185\u5bb9\u52a0\u8f7d\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002';
+                el.textContent = msg;
+                el.style.color = 'var(--color-danger)';
+                return null;
+              }
+              return r.text();
+            })
+            .then(function(t){
+              if (t !== null) {
+                window.__shareText = t;
+                el.textContent = t;
+                document.getElementById('copyAllBtn').hidden = false;
+              }
             })
             .catch(function(err){
               clearTimeout(timer);
@@ -270,51 +289,41 @@ export function filePage(file: FileRecord, baseUrl: string): string {
             });
         })();
       </script>`;
-    return layout('取件', content);
+    return layout('取件', content, true, true);
   }
 
-  // 文件下载页
+  // 文件下载页 — 双栏：左侧文件信息/下载，右侧取件码/二维码
   const content = `
-    <div class="header">
-      <div>
-        <h1>取件</h1>
-      </div>
-      <div class="header-actions">
-        <a href="/">上传</a>
-        <a href="/admin">管理</a>
-      </div>
-    </div>
     ${expired ? '<div style="text-align:center;color:var(--color-danger);font-size:14px;margin-bottom:16px">此文件已过期</div>' : ''}
-    <div style="text-align:center;padding:16px 0">
-      <div class="file-icon">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
-        </svg>
-      </div>
-      <div style="font-size:18px;font-weight:500;margin-bottom:6px;word-break:break-all">${escapeHtml(file.filename)}</div>
-      <div style="display:flex;justify-content:center;gap:20px;font-size:13px;color:var(--color-ink-2);margin-bottom:6px">
-        <span>${sizeStr}</span>
-        <span>${dlInfo}</span>
-      </div>
-      <div style="font-size:12px;color:var(--color-ink-2);margin-bottom:20px">${expireStr}</div>
-      ${!expired ? `
-        <a href="/api/download/${file.code}" class="btn btn-primary" style="width:auto;padding:12px 40px;display:inline-flex">下载文件</a>
-        <div style="margin-top:12px;font-size:13px;color:var(--color-ink-2)">
-          取件码 <strong style="font-size:18px;color:var(--color-accent);letter-spacing:3px;font-family:var(--font-mono);cursor:pointer" onclick="copyText('${escapeHtml(file.code)}','${escapeHtml(file.code)}')" title="点击复制">${escapeHtml(file.code)}</strong>
-        </div>
-        <div style="margin-top:8px">
-          <button onclick="navigator.clipboard.writeText('${escapeHtml(shareUrl)}')" class="btn btn-secondary" style="width:auto;display:inline-flex;padding:8px 16px;font-size:13px">复制分享链接</button>
-        </div>
-        <!-- 二维码 -->
-        <div style="margin-top:20px;text-align:center">
-          <div style="font-size:12px;color:var(--color-ink-2);margin-bottom:8px">扫码快速分享</div>
-          <div style="display:inline-block;background:#fff;padding:8px;border-radius:var(--radius);border:1px solid var(--color-rule)">
-            <img src="/qrcode/${file.code}?v=${Date.now()}" alt="QR Code" style="display:block;width:140px;height:140px" loading="lazy">
+    <div class="share-grid">
+      <div class="share-left">
+        <div class="header">
+          <div>
+            <h1>取件</h1>
+          </div>
+          <div class="header-actions">
+            <a href="/">上传</a>
+            <a href="/admin">管理</a>
           </div>
         </div>
-      ` : ''}
+        <div class="share-title">${escapeHtml(file.filename)}</div>
+        <div class="command-box" style="align-items:center;justify-content:center">
+          <div class="file-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
+          </div>
+          ${!expired ? `<a href="/api/download/${file.code}" class="btn btn-primary" style="width:auto;padding:12px 40px">下载文件</a>` : ''}
+        </div>
+        <div class="meta-row">
+          <span>${sizeStr}</span>
+          <span>${dlInfo}</span>
+          <span>${expireStr}</span>
+        </div>
+      </div>
+      ${shareRightPanel(file.code, shareUrl)}
     </div>`;
-  return layout('取件', content);
+  return layout('取件', content, true, true);
 }
 
 // ---- 错误页 ----
@@ -445,5 +454,5 @@ export function adminPanel(
       ${page > 1 ? `<a href="${pageUrl(page - 1)}" style="font-size:13px;margin-right:10px;color:var(--color-accent);text-decoration:none">&larr; 上一页</a>` : ''}
       ${page < totalPages ? `<a href="${pageUrl(page + 1)}" style="font-size:13px;color:var(--color-accent);text-decoration:none">下一页 &rarr;</a>` : ''}
     </div>`;
-  return layout('管理面板', content);
+  return layout('管理面板', content, true, true);
 }

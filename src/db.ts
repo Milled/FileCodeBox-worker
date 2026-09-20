@@ -73,12 +73,16 @@ export async function isCodeTaken(db: D1Database, code: string): Promise<boolean
   return row !== null;
 }
 
-/** 记录取件码为已使用（调用前确保 code 格式正确） */
-export async function markCodeUsed(db: D1Database, code: string): Promise<void> {
-  await db
+/**
+ * 原子抢占取件码：INSERT OR IGNORE + changes 判定。
+ * 并发同码时仅一个请求返回 true，消除 check-then-act 竞态窗口。
+ */
+export async function claimCode(db: D1Database, code: string): Promise<boolean> {
+  const result = await db
     .prepare('INSERT OR IGNORE INTO fc_used_codes(code) VALUES (?)')
     .bind(code)
     .run();
+  return result.meta.changes === 1;
 }
 
 /** 释放取件码（删除/过期后允许复用） */
@@ -429,15 +433,24 @@ export async function cleanupOrphanedR2Objects(
   db: D1Database,
   bucket: R2Bucket,
 ): Promise<{ scanned: number; removed: number }> {
-  const listed = await bucket.list({ prefix: 'file:' });
-  const keys = listed.objects.map((o) => o.key);
+  // cursor 翻页收集全部 file: 对象（4 位码全空间上限约 1 万个 ≈ 11 页），
+  // 只扫首页会永久漏扫字典序靠后的 key
+  const objects: R2Object[] = [];
+  let cursor: string | undefined;
+  do {
+    const listed = await bucket.list({ prefix: 'file:', cursor });
+    objects.push(...listed.objects);
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+  const keys = objects.map((o) => o.key);
   if (keys.length === 0) return { scanned: 0, removed: 0 };
 
-  // 批量查询 D1 中存在的取件码（每批 1000 个，D1 IN 上限约 900，这里安全截断）
-  const BATCH = 900;
+  // 批量查询 D1 中存在的取件码（D1 单条查询绑定变量上限 100）
+  const BATCH = 100;
   const activeCodes = new Set<string>();
   for (let i = 0; i < keys.length; i += BATCH) {
-    const batch = keys.slice(i, i + BATCH);
+    // R2 key 带 file: 前缀，D1 code 无前缀，查询前必须剥离
+    const batch = keys.slice(i, i + BATCH).map((k) => k.replace('file:', ''));
     const placeholders = batch.map(() => '?').join(',');
     const rows = await db
       .prepare(`SELECT code FROM fc_files WHERE code IN (${placeholders})`)
@@ -446,8 +459,13 @@ export async function cleanupOrphanedR2Objects(
     for (const row of rows.results ?? []) activeCodes.add(row.code);
   }
 
-  // 删除孤儿对象（不在 D1 中的）
-  const orphans = keys.filter((k) => !activeCodes.has(k.replace('file:', '')));
+  // 删除孤儿对象（不在 D1 中的）。宽限期 1 小时：上传先写 R2 后写 D1，
+  // 窗口内的正常对象无 D1 记录，过早清理会静默丢数据
+  const GRACE_MS = 3_600_000;
+  const now = Date.now();
+  const orphans = objects
+    .filter((o) => !activeCodes.has(o.key.replace('file:', '')) && now - o.uploaded.getTime() > GRACE_MS)
+    .map((o) => o.key);
   if (orphans.length === 0) return { scanned: keys.length, removed: 0 };
 
   await Promise.all(orphans.map((k) => bucket.delete(k)));

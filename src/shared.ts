@@ -9,9 +9,9 @@ import { isValidCode, generateCode, getClientIp } from './utils';
 import {
   getFileByCode,
   isCodeTaken,
+  claimCode,
   insertFile,
   incrementDownload,
-  markCodeUsed,
   releaseCode,
   checkUploadRateLimit,
 } from './db';
@@ -41,32 +41,28 @@ export function parseExpire(
 
 // ===================== 取件码生成 =====================
 
-async function generateUniqueCode(env: Env): Promise<string> {
-  for (let i = 0; i < 20; i++) {
-    const code = generateCode();
-    const taken = await isCodeTaken(env.DB, code);
-    if (!taken) return code;
-  }
-  throw new Error('无法生成唯一取件码');
-}
-
 /**
- * 校验自定义取件码格式，检查占用状态，占位后返回码。
- * rawCode 为空时自动调用 generateUniqueCode 生成。
+ * 校验并原子抢占取件码。rawCode 为空时自动生成（最多 20 次重试）。
+ * isCodeTaken 预检双表快速失败；claimCode（INSERT OR IGNORE + changes）为
+ * 原子门闩，并发同码时仅一个请求成功，失败方不再继续写 R2/D1。
  */
-async function ensureCodeAvailable(
-  rawCode: string,
-  env: Env,
-): Promise<string> {
-  const code = rawCode || (await generateUniqueCode(env));
+async function ensureCodeAvailable(rawCode: string, env: Env): Promise<string> {
   if (rawCode && !isValidCode(rawCode)) {
     throw { status: 400 as const, message: '取件码必须为 4 位数字' };
   }
-  if (await isCodeTaken(env.DB, code)) {
-    throw { status: 409 as const, message: '取件码已被占用' };
+  for (let i = 0; i < 20; i++) {
+    const code = rawCode || generateCode();
+    if (await isCodeTaken(env.DB, code)) {
+      if (rawCode) break;
+      continue;
+    }
+    if (await claimCode(env.DB, code)) return code;
+    if (rawCode) break;
   }
-  await markCodeUsed(env.DB, code);
-  return code;
+  throw {
+    status: rawCode ? 409 as const : 500 as const,
+    message: rawCode ? '取件码已被占用' : '无法生成唯一取件码',
+  };
 }
 
 // ===================== 文件上传 =====================
