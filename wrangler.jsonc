@@ -18,6 +18,6 @@
   }],
   "r2_buckets": [{
     "binding": "FILE_STORE",
-    "bucket_name": "filecodebox"
+    "bucket_name": "filecodebox-file"
   }]
 }
