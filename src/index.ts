@@ -66,52 +66,23 @@ function getBaseUrl(c: Context<{ Bindings: Env }>): string {
   return `${proto}://${host}`;
 }
 
-// ===================== 缓存助手 =====================
-
-/**
- * Cache API 缓存 GET 响应（Workers 响应默认不被 CDN 缓存，需显式 put）
- * 带查询参数（如 ?t=）的请求直接回源，不写入缓存
- */
-async function cached(
-  c: Context<{ Bindings: Env }>,
-  makeResponse: () => Response | Promise<Response>,
-  ttlSeconds: number,
-): Promise<Response> {
-  if (c.req.method !== 'GET' || c.req.url.includes('?')) {
-    return makeResponse();
-  }
-  const cache = await caches.open('default');
-  const cacheKey = new Request(c.req.url);
-  const cachedRes = await cache.match(cacheKey);
-  if (cachedRes) return cachedRes;
-
-  const res = await makeResponse();
-  res.headers.set('Cache-Control', `public, max-age=${ttlSeconds}`);
-  c.executionCtx.waitUntil(cache.put(cacheKey, res.clone()));
-  return res;
-}
-
 // ===================== 静态资源 =====================
 
-// 样式表独立成文件 + immutable 长缓存，避免每次页面内联 ~10KB CSS
-app.get('/static/style.css', (c) =>
-  cached(c, () => {
-    const res = new Response(STYLE, { headers: { 'Content-Type': 'text/css; charset=utf-8' } });
-    res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return res;
-  }, 31536000),
-);
+// 样式表独立成文件 + immutable 长缓存（由 CDN/浏览器缓存，避免每次页面内联 ~10KB CSS）
+app.get('/static/style.css', (c) => {
+  const res = new Response(STYLE, { headers: { 'Content-Type': 'text/css; charset=utf-8' } });
+  res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  return res;
+});
 
 // 背景图本地提供：固定 URL + 长缓存，替代外部随机图源（每次 301 跳转 + 1.2MB 8K 图）
-app.get('/static/bg.webp', (c) =>
-  cached(c, async () => {
-    const obj = await c.env.FILE_STORE.get('bg.webp');
-    if (!obj) return new Response('Not Found', { status: 404 });
-    const res = new Response(obj.body, { headers: { 'Content-Type': 'image/webp' } });
-    res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return res;
-  }, 31536000),
-);
+app.get('/static/bg.webp', async (c) => {
+  const obj = await c.env.FILE_STORE.get('bg.webp');
+  if (!obj) return new Response('Not Found', { status: 404 });
+  const res = new Response(obj.body, { headers: { 'Content-Type': 'image/webp' } });
+  res.headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  return res;
+});
 
 // ===================== 页面路由 =====================
 
@@ -182,8 +153,8 @@ app.get('/api/download/:code', async (c) => {
     if (result.maxExceeded) return c.html(errorPage('已达最大下载次数', '该文件的下载次数已用完'), 403);
 
     const headers: Record<string, string> = {
-      'Content-Type': result.file.mime_type || 'application/octet-stream',
-      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file.filename)}`,
+      'Content-Type': result.file!.mime_type || 'application/octet-stream',
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file!.filename)}`,
       'Content-Length': String(result.obj?.size ?? 0),
     };
     return new Response(result.isHead ? null : result.obj?.body, { headers });
@@ -302,6 +273,8 @@ app.post('/admin/cleanup', async (c) => {
 // ===================== 初始化 =====================
 
 app.get('/api/init', async (c) => {
+  // 需管理员登录，避免公开触发数据库初始化
+  if (!(await adminAuth(c, c.env))) return c.json({ error: 'unauthorized' }, 401);
   try {
     await initDB(c.env.DB);
     return c.json({ ok: true });
@@ -331,6 +304,8 @@ export default {
     ctx.waitUntil(
       (async () => {
         try {
+          // 幂等初始化：确保首次部署后表结构自动就绪（/api/init 已需鉴权）
+          await initDB(env.DB);
           const { expiredCount, cleanedCodes } = await cleanupExpired(env.DB, env.FILE_STORE);
           const { scanned, removed } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
           const rateLimitCleaned = await cleanupRateLimitEntries(env.DB);

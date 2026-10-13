@@ -112,8 +112,8 @@ api.get('/share/download', async (c) => {
 
     return new Response(result.isHead ? null : result.obj?.body, {
       headers: {
-        'Content-Type': result.file.mime_type || 'application/octet-stream',
-        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file.filename)}`,
+        'Content-Type': result.file!.mime_type || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file!.filename)}`,
         'Content-Length': String(result.obj?.size ?? 0),
       },
     });

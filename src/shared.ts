@@ -99,13 +99,20 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
 
   const maxSize = parseInt(env.MAX_FILE_SIZE || '104857600');
 
+  // Content-Length 预检：超限直接拒绝，避免读入大请求体占用内存；
+  // 头部缺失时（如 chunked）回退到读取后校验
+  const contentLength = Number(c.req.header('Content-Length'));
+  if (Number.isFinite(contentLength) && contentLength > maxSize) {
+    throw { status: 413 as const, message: `文件过大，最大 ${Math.floor(maxSize / 1048576)}MB` };
+  }
+
   // 一次性读取请求体（Cloudflare Workers 中 body 只能消费一次），
   // 计算实际大小并做上限校验，然后转为 Blob 流写入 R2。
   const requestBody = await c.req.arrayBuffer();
   const size = requestBody.byteLength;
 
   if (size > maxSize) {
-    throw { status: 400 as const, message: `文件过大，最大 ${Math.floor(maxSize / 1048576)}MB` };
+    throw { status: 413 as const, message: `文件过大，最大 ${Math.floor(maxSize / 1048576)}MB` };
   }
 
   const bodyBlob = new Blob([requestBody]);
@@ -133,7 +140,7 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
 // ===================== 文件下载 =====================
 
 export interface DownloadResult {
-  file: FileRecord;
+  file: FileRecord | null;
   obj: R2ObjectBody | null;
   notFound: boolean;
   maxExceeded: boolean;
@@ -149,7 +156,7 @@ export async function downloadFile(
   if (!code) throw { status: 422 as const, message: '缺少取件码' };
 
   const file = await getFileByCode(env.DB, code);
-  if (!file) return { file: null as any, obj: null, notFound: true, maxExceeded: false, isHead: false };
+  if (!file) return { file: null, obj: null, notFound: true, maxExceeded: false, isHead: false };
 
   const obj = await env.FILE_STORE.get(`file:${code}`);
   if (!obj) return { file, obj: null, notFound: true, maxExceeded: false, isHead: false };

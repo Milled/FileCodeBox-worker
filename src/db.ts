@@ -270,8 +270,11 @@ export async function cleanupExpired(
   const files = expired.results ?? [];
   if (files.length === 0) return { expiredCount: 0, cleanedCodes: 0 };
 
-  // 并发删除 R2 对象，避免串行等待
-  await Promise.all(files.map((f) => bucket.delete(`file:${f.code}`)));
+  // 批量删除 R2 对象（每批最多 1000 键），避免逐个请求的 RTT
+  const keys = files.map((f) => `file:${f.code}`);
+  for (let i = 0; i < keys.length; i += 1000) {
+    await bucket.delete(keys.slice(i, i + 1000));
+  }
 
   // 先删记录，再释放取件码（并行执行，释放顺序不影响结果）
   await db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')").run();
