@@ -9,7 +9,6 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cloudflare/workerd-linux-64": "^1.20260722.1",
     "hono": "^4.13.7",
     "qr": "^0.7.0"
   },
