@@ -148,7 +148,6 @@ export async function deleteFileRecord(
   const file = await getFileById(db, id);
   if (file) {
     await db.prepare('DELETE FROM fc_files WHERE id = ?').bind(id).run();
-    // 释放取件码，允许复用
     await releaseCode(db, file.code);
   }
   return file;
@@ -280,7 +279,6 @@ export async function cleanupExpired(
   await db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')").run();
   await Promise.all(files.map((f) => releaseCode(db, f.code)));
 
-  // 防御性清理：删除 fc_used_codes 中所有无对应文件（含已过期）的记录
   const cleanedCodes = await cleanupUsedCodes(db);
 
   return { expiredCount: files.length, cleanedCodes };
@@ -341,7 +339,6 @@ export async function checkRateLimit(
     } catch { /* 损坏则重置 */ }
   }
 
-  // 始终写入（含超限情况），防止窗口被绕过
   const newCount = count + 1;
   await setSetting(db, key, JSON.stringify({ count: newCount, windowStart }));
 

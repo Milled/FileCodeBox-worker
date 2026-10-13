@@ -67,7 +67,7 @@ async function ensureCodeAvailable(rawCode: string, env: Env): Promise<string> {
 
 // ===================== 文件上传 =====================
 
-/** 共享的文件上传核心逻辑（流式写入 R2，流式计算实际大小） */
+/** 共享的文件上传核心逻辑 */
 export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promise<{
   code: string;
   filename: string;
@@ -177,7 +177,6 @@ export async function uploadText(
   c: Context<{ Bindings: Env }>,
   env: Env,
 ): Promise<{ code: string; title: string; textSize: number }> {
-  // 上传速率限制：60 秒内同一 IP 最多 10 次上传
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
     throw { status: 429 as const, message: '上传过于频繁，请稍后再试' };
@@ -191,7 +190,6 @@ export async function uploadText(
   if (textSize > 512 * 1024) throw { status: 400 as const, message: '文本过长，最大支持 512KB' };
 
   const rawCode = typeof body['code'] === 'string' ? body['code'] : '';
-  // 兼容旧参数名 (expire_days/max_downloads) 和新参数名 (expire_value/expire_style)
   const expireValueRaw = typeof body['expire_value'] === 'string' ? body['expire_value'] :
                          typeof body['expire_days'] === 'string' ? body['expire_days'] : env.DEFAULT_EXPIRE_DAYS || '7';
   const expireStyleRaw = typeof body['expire_style'] === 'string' ? body['expire_style'] : 'day';
@@ -202,7 +200,6 @@ export async function uploadText(
   const code = await ensureCodeAvailable(rawCode, env);
 
   const { expireAt, maxDownloads: parsedMaxDownloads } = parseExpire(safeExpireValue, expireStyleRaw);
-  // 用户显式指定的 max_downloads 优先，否则用 expire_style=count 推得的次数（默认不限）
   const effectiveMaxDownloads = safeMaxDownloads >= 0 ? safeMaxDownloads : parsedMaxDownloads;
   const title = text.replace(/\s+/g, ' ').slice(0, 50) + (text.length > 50 ? '…' : '');
 
@@ -216,7 +213,7 @@ export async function uploadText(
     });
     return { code, title, textSize };
   } catch (e) {
-    await releaseCode(env.DB, code);  // 写入失败则释放码
+    await releaseCode(env.DB, code);
     throw e;
   }
 }
