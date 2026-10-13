@@ -13,10 +13,10 @@ import {
   getFileByCode,
   getFileById,
   deleteFileRecord,
-  listFiles,
   listFilesAdvanced,
   cleanupExpired,
   cleanupOrphanedR2Objects,
+  cleanupRateLimitEntries,
   incrementDownload,
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
@@ -156,7 +156,7 @@ app.post('/api/upload/text', async (c) => {
     const result = await uploadText(c, c.env);
     return c.html(resultPage(result.code, result.title, result.textSize, getBaseUrl(c)));
   } catch (e: any) {
-    return c.html(errorPage(e?.message ?? '保存失败', '服务器内部错误'));
+    return c.html(errorPage(e?.message ?? '保存失败', '服务器内部错误'), e?.status ?? 500);
   }
 });
 
@@ -178,8 +178,8 @@ app.get('/api/text/:code', async (c) => {
 app.get('/api/download/:code', async (c) => {
   try {
     const result = await downloadFile(c, c.env);
-    if (result.notFound) return c.html(errorPage('文件不存在', '该文件可能已被清理'));
-    if (result.maxExceeded) return c.html(errorPage('已达最大下载次数', '该文件的下载次数已用完'));
+    if (result.notFound) return c.html(errorPage('文件不存在', '该文件可能已被清理'), 404);
+    if (result.maxExceeded) return c.html(errorPage('已达最大下载次数', '该文件的下载次数已用完'), 403);
 
     const headers: Record<string, string> = {
       'Content-Type': result.file.mime_type || 'application/octet-stream',
@@ -188,7 +188,7 @@ app.get('/api/download/:code', async (c) => {
     };
     return new Response(result.isHead ? null : result.obj?.body, { headers });
   } catch (e: any) {
-    return c.html(errorPage(e?.message ?? '未找到文件', ''));
+    return c.html(errorPage(e?.message ?? '未找到文件', ''), e?.status ?? 404);
   }
 });
 
@@ -204,8 +204,12 @@ app.get('/qrcode/:code', async (c) => {
     if (!file) return c.text('File not found', 404);
     const baseUrl = getBaseUrl(c);
     const url = `${baseUrl}/r/${code}`;
-    const gif = await generateQRCodeGIF(url, 200);
-    return c.body(gif, 200, { 'Content-Type': 'image/gif', 'Cache-Control': 'public, max-age=31536000, immutable' });
+    const gif = generateQRCodeGIF(url, 200);
+    // Uint8Array 运行时即合法 BodyInit，仅需绕开 TS 泛型数组限制
+    return new Response(gif as unknown as BodyInit, {
+      status: 200,
+      headers: { 'Content-Type': 'image/gif', 'Cache-Control': 'public, max-age=31536000, immutable' },
+    });
   } catch (e) {
     console.error('[QR] Error:', e);
     return c.text(`QR Error: ${e instanceof Error ? e.message : String(e)}`, 500);
@@ -248,7 +252,8 @@ app.get('/admin', async (c) => {
 // 兼容旧路径 /console
 app.get('/console', (c) => c.redirect('/admin'));
 
-app.post('/api/admin/login', async (c) => {
+// Web 表单登录（HTML 页面）；JSON 登录见 /api/admin/login（兼容 API）
+app.post('/admin/login', async (c) => {
   const env = c.env;
   const body = await c.req.parseBody();
   const password = typeof body['password'] === 'string' ? body['password'] : '';
@@ -260,19 +265,21 @@ app.post('/api/admin/login', async (c) => {
   return c.redirect('/admin');
 });
 
-app.post('/api/admin/logout', async (c) => {
-  handleAdminLogout(c, c.env);
+// Web 登出（GET 链接点击即退出，并清除 DB token）
+app.get('/admin/logout', async (c) => {
+  await handleAdminLogout(c, c.env);
   return c.redirect('/');
 });
 
 // 兼容旧路径
-app.get('/api/console/logout', (c) => c.redirect('/api/admin/logout'));
+app.get('/api/console/logout', (c) => c.redirect('/admin/logout'));
 
-app.post('/api/admin/delete/:id', async (c) => {
+app.post('/admin/delete/:id', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
 
   const id = parseInt(c.req.param('id'));
+  if (!Number.isInteger(id)) return c.redirect('/admin');
   const file = await getFileById(env.DB, id);
   if (!file) return c.redirect('/admin');
   // 先删 R2，再删 DB（finally 保证 DB 清理），避免 R2 删除失败产生孤儿文件
@@ -284,7 +291,7 @@ app.post('/api/admin/delete/:id', async (c) => {
   return c.redirect('/admin');
 });
 
-app.post('/api/admin/cleanup', async (c) => {
+app.post('/admin/cleanup', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
 
@@ -305,7 +312,11 @@ app.get('/api/init', async (c) => {
 });
 
 // ===================== FileCodeBox 兼容 API =====================
-app.route('/', api);
+// 挂载在 /api 前缀，路径与 FileCodeBox v2.1.0 文档一致（如 /api/share/file）
+app.route('/api', api);
+
+// 未知 API 路径返回 404 JSON，不落入首页兜底
+app.all('/api/*', (c) => c.json({ code: 404, msg: 'Not Found' }, 404));
 
 // ===================== 兜底 =====================
 
@@ -322,12 +333,14 @@ export default {
         try {
           const { expiredCount, cleanedCodes } = await cleanupExpired(env.DB, env.FILE_STORE);
           const { scanned, removed } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
+          const rateLimitCleaned = await cleanupRateLimitEntries(env.DB);
           console.log(JSON.stringify({
             event: 'scheduled_cleanup',
             expiredCount,
             cleanedCodes,
             r2Scanned: scanned,
             r2Removed: removed,
+            rateLimitCleaned,
           }));
         } catch (e) {
           console.error(JSON.stringify({ event: 'scheduled_cleanup_error', error: String(e) }));

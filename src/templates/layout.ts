@@ -27,7 +27,7 @@ export function layout(title: string, content: string, showFooter = true, wide =
     <div class="card">${content}</div>
     ${footer}
   </div>
-  <script>function copyText(t,e){var n=this;navigator.clipboard.writeText(t).then(function(){n.textContent='已复制';setTimeout(function(){n.textContent=e},1500)})}function codeCopy(el,t){navigator.clipboard.writeText(t).then(function(){var h=el.querySelector('.click-hint');h.textContent='已复制';setTimeout(function(){h.textContent='点击复制'},1500)})}</script>
+  <script>function codeCopy(el,t){navigator.clipboard.writeText(t).then(function(){var h=el.querySelector('.click-hint');h.textContent='已复制';setTimeout(function(){h.textContent='点击复制'},1500)})}</script>
 </body>
 </html>`;
 }

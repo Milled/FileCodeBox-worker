@@ -4,7 +4,7 @@
  */
 import { chromium } from 'playwright';
 
-const BASE_URL = 'https://filebox.994613.xyz';
+const BASE_URL = process.env.BASE_URL || 'https://filebox.994613.xyz';
 
 async function test() {
   const browser = await chromium.launch({ headless: true });
@@ -65,7 +65,7 @@ async function test() {
     const url = page.url();
     results.textUpload = { url };
     // 提取取件码
-    const codeMatch = url.match(/\/r\/(\d{4})/) || (await page.locator('.code-display').textContent().catch(() => '')).match(/(\d{4})/);
+    const codeMatch = url.match(/\/r\/(\d{4})/) || (await page.locator('.code-value').textContent().catch(() => '')).match(/(\d{4})/);
     if (codeMatch) textCode = codeMatch[1];
     results.textUpload.code = textCode;
     console.log(`  URL: ${url}`);

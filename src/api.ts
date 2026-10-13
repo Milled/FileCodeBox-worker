@@ -10,7 +10,7 @@ import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env } from './types';
 import { formatFileSize } from './utils';
-import { getFileById, deleteFileRecord, listFilesWithSearch, listFilesAdvanced, getDashboardStats, getSetting, setSetting } from './db';
+import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
 import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile } from './shared';
 

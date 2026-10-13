@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node test-headless.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@cloudflare/workerd-linux-64": "^1.20260722.1",

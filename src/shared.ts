@@ -13,7 +13,7 @@ import {
   insertFile,
   incrementDownload,
   releaseCode,
-  checkUploadRateLimit,
+  checkRateLimit,
 } from './db';
 
 // ===================== 过期策略 =====================
@@ -75,7 +75,7 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
 }> {
   // 上传速率限制：60 秒内同一 IP 最多 10 次上传
   const ip = getClientIp(c.req.raw.headers);
-  if (!(await checkUploadRateLimit(env.DB, ip))) {
+  if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
     throw { status: 429 as const, message: '上传过于频繁，请稍后再试' };
   }
 
@@ -86,15 +86,15 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   const maxDownloadsRaw = c.req.query('max_downloads') || '-1';
   const safeExpireValue = Number.isFinite(parseInt(expireValueRaw)) ? parseInt(expireValueRaw) : parseInt(env.DEFAULT_EXPIRE_DAYS || '7');
   const safeMaxDownloads = Number.isFinite(parseInt(maxDownloadsRaw)) ? parseInt(maxDownloadsRaw) : -1;
-  // decodeURIComponent 可能因非法 URI 编码抛 URIError，失败时回退到原始头值
+  // decodeURIComponent 可能因非法 URI 编码抛 URIError，失败时回退到原始头值；
+  // 先解码再截断，避免截断处切开多字节转义序列导致解码失败
   let filename = c.req.header('X-Filename') || '未命名';
-  // 截断超长文件名（R2 customMetadata 单字段上限 2KB，保留 200 字符绰绰有余）
-  filename = filename.slice(0, 200);
   try {
     filename = decodeURIComponent(filename);
   } catch {
     /* 保留原始值 */
   }
+  filename = filename.slice(0, 200);
   const mimeType = c.req.header('Content-Type') || 'application/octet-stream';
 
   const maxSize = parseInt(env.MAX_FILE_SIZE || '104857600');
@@ -111,9 +111,9 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   const bodyBlob = new Blob([requestBody]);
   const code = await ensureCodeAvailable(rawCode, env);
 
-  const { expireAt } = parseExpire(safeExpireValue, expireStyleRaw);
-  // 用户指定的 max_downloads 优先于 parseExpire 的默认值 -1
-  const effectiveMaxDownloads = safeMaxDownloads >= 0 ? safeMaxDownloads : -1;
+  const { expireAt, maxDownloads: parsedMaxDownloads } = parseExpire(safeExpireValue, expireStyleRaw);
+  // 用户显式指定的 max_downloads 优先，否则用 expire_style=count 推得的次数（默认不限）
+  const effectiveMaxDownloads = safeMaxDownloads >= 0 ? safeMaxDownloads : parsedMaxDownloads;
 
   try {
     await env.FILE_STORE.put(`file:${code}`, bodyBlob.stream(), {
@@ -172,7 +172,7 @@ export async function uploadText(
 ): Promise<{ code: string; title: string; textSize: number }> {
   // 上传速率限制：60 秒内同一 IP 最多 10 次上传
   const ip = getClientIp(c.req.raw.headers);
-  if (!(await checkUploadRateLimit(env.DB, ip))) {
+  if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
     throw { status: 429 as const, message: '上传过于频繁，请稍后再试' };
   }
 
@@ -194,8 +194,9 @@ export async function uploadText(
 
   const code = await ensureCodeAvailable(rawCode, env);
 
-  const { expireAt } = parseExpire(safeExpireValue, expireStyleRaw);
-  const effectiveMaxDownloads = safeMaxDownloads >= 0 ? safeMaxDownloads : -1;
+  const { expireAt, maxDownloads: parsedMaxDownloads } = parseExpire(safeExpireValue, expireStyleRaw);
+  // 用户显式指定的 max_downloads 优先，否则用 expire_style=count 推得的次数（默认不限）
+  const effectiveMaxDownloads = safeMaxDownloads >= 0 ? safeMaxDownloads : parsedMaxDownloads;
   const title = text.replace(/\s+/g, ' ').slice(0, 50) + (text.length > 50 ? '…' : '');
 
   try {
@@ -227,7 +228,8 @@ export async function selectFile(
   env: Env,
   countAsDownload: boolean,
 ): Promise<SelectResult> {
-  const code = (c.req.query('code') || '').trim();
+  // 兼容 key（FileCodeBox 文档字段）和 code 两种参数名
+  const code = (c.req.query('code') || c.req.query('key') || '').trim();
   if (!code) throw { status: 422 as const, message: '缺少取件码' };
 
   const file = await getFileByCode(env.DB, code);
