@@ -628,11 +628,14 @@ export function filePage(file: FileRecord, baseUrl: string): string {
 // ---- 错误页 ----
 
 export function errorPage(title: string, message: string): string {
+  // 两处都会回显到 HTML：message 可能来自后端异常文本，必须转义
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
   const content = `
-    <div class="header"><h1>${title}</h1></div>
-    <p style="text-align:center">${message}</p>
+    <div class="header"><h1>${safeTitle}</h1></div>
+    <p style="text-align:center">${safeMessage}</p>
     <a href="/" class="btn btn-secondary" style="margin-top:16px">返回</a>`;
-  return layout(title, content);
+  return layout(safeTitle, content);
 }
 
 // ---- 管理员登录页 ----
@@ -660,12 +663,23 @@ const SORT_LABELS: Record<string, string> = {
   leastDownloaded: '下载最少',
 };
 
+/** getDashboardStats 的返回结构（db.ts），后台统计卡片用 */
+export interface AdminStats {
+  totalFiles: number;
+  totalSize: number;
+  todayCount: number;
+  todaySize: number;
+  yesterdayCount: number;
+  yesterdaySize: number;
+}
+
 export function adminPanel(
   files: FileRecord[],
   total: number,
   page: number,
   error?: string,
   filters?: { keyword: string; dateFrom: string; dateTo: string; sort: string },
+  stats?: AdminStats,
 ): string {
   const totalPages = Math.ceil(total / 50);
   const pagination =
@@ -680,7 +694,8 @@ export function adminPanel(
       const expired = new Date(f.expire_at).getTime() < Date.now();
       const size = formatFileSize(f.size);
       return `<div class="file-list-item ${expired ? 'expired' : ''}">
-        <span class="fname">${escapeHtml(f.filename)}</span>
+        <span class="tag">${f.is_text === 1 ? '文本' : '文件'}</span>
+        <a class="fname" href="/r/${escapeHtml(f.code)}" title="打开取件页">${escapeHtml(f.filename)}</a>
         <span class="fmeta">${escapeHtml(f.code)}</span>
         <span class="fmeta">${size}</span>
         <span class="fmeta">${f.download_count}次</span>
@@ -707,6 +722,16 @@ export function adminPanel(
     .map(([k, v]) => `<option value="${k}"${k === f.sort ? ' selected' : ''}>${v}</option>`)
     .join('');
 
+  const statCards = stats
+    ? `
+    <div class="stat-grid">
+      <div class="stat-card"><div class="stat-label">文件总数</div><div class="stat-value">${stats.totalFiles}</div><div class="stat-sub">累计 ${formatFileSize(stats.totalSize)}</div></div>
+      <div class="stat-card"><div class="stat-label">今日上传</div><div class="stat-value">${stats.todayCount}</div><div class="stat-sub">${formatFileSize(stats.todaySize)}</div></div>
+      <div class="stat-card"><div class="stat-label">昨日上传</div><div class="stat-value">${stats.yesterdayCount}</div><div class="stat-sub">${formatFileSize(stats.yesterdaySize)}</div></div>
+      <div class="stat-card"><div class="stat-label">已用空间</div><div class="stat-value">${formatFileSize(stats.totalSize)}</div><div class="stat-sub">R2 对象存储</div></div>
+    </div>`
+    : '';
+
   const content = `
     <div class="header">
       <div>
@@ -715,9 +740,11 @@ export function adminPanel(
       </div>
       <div class="header-actions">
         <a href="/">首页</a>
+        <a href="/admin/settings">设置</a>
         <a href="/admin/logout">退出</a>
       </div>
     </div>
+    ${statCards}
     ${error ? `<div style="color:var(--color-danger);text-align:center;margin-bottom:14px;font-size:14px">${error}</div>` : ''}
 
     <!-- 筛选栏 -->
@@ -754,4 +781,64 @@ export function adminPanel(
       ${page < totalPages ? `<a href="${pageUrl(page + 1)}" style="font-size:13px;color:var(--color-accent);text-decoration:none">下一页 &rarr;</a>` : ''}
     </div>`;
   return layout('管理面板', content, true, true);
+}
+
+// ---- 后台设置页 ----
+
+export interface AdminConfig {
+  /** '1' 允许游客上传 / '0' 仅管理员可上传 */
+  openUpload: string;
+  /** 当前生效的单文件上限（字节） */
+  maxFileSize: number;
+  /** 当前生效的默认过期天数 */
+  defaultExpireDays: number;
+  /** wrangler vars 的原始值，用于提示「未覆盖时的回退值」 */
+  varsMaxFileSize: number;
+  varsDefaultExpireDays: number;
+}
+
+export function adminSettingsPage(config: AdminConfig, saved?: string): string {
+  const mb = (n: number) => (n / 1048576).toFixed(n % 1048576 === 0 ? 0 : 1);
+  const content = `
+    <div class="header">
+      <div>
+        <h1>系统设置</h1>
+        <p>覆盖 wrangler 变量，保存后立即生效，无需重新部署</p>
+      </div>
+      <div class="header-actions">
+        <a href="/">首页</a>
+        <a href="/admin">文件</a>
+        <a href="/admin/logout">退出</a>
+      </div>
+    </div>
+    ${saved ? `<div style="color:var(--color-success);text-align:center;margin-bottom:14px;font-size:14px">${escapeHtml(saved)}</div>` : ''}
+    <form method="post" action="/admin/settings">
+      <div class="setting-row">
+        <div class="setting-text">
+          <div class="setting-title">游客上传</div>
+          <div class="setting-desc">关闭后首页表单与开放 API 都只允许管理员上传，取件不受影响。</div>
+        </div>
+        <select name="openUpload" class="input setting-control">
+          <option value="1"${config.openUpload !== '0' ? ' selected' : ''}>允许游客上传</option>
+          <option value="0"${config.openUpload === '0' ? ' selected' : ''}>仅管理员可上传</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-text">
+          <div class="setting-title">单文件大小上限</div>
+          <div class="setting-desc">单位字节。wrangler 变量为 ${config.varsMaxFileSize}（${mb(config.varsMaxFileSize)} MB），清空保存即回退到它。</div>
+        </div>
+        <input type="number" name="maxFileSize" class="input setting-control" min="1024" step="1" value="${config.maxFileSize}" placeholder="${config.varsMaxFileSize}">
+      </div>
+      <div class="setting-row">
+        <div class="setting-text">
+          <div class="setting-title">默认过期天数</div>
+          <div class="setting-desc">上传时未指定有效期才使用；有效期选择器里的「永久 / 按次数」优先于它。</div>
+        </div>
+        <input type="number" name="defaultExpireDays" class="input setting-control" min="1" max="3650" value="${config.defaultExpireDays}" placeholder="${config.varsDefaultExpireDays}">
+      </div>
+      <button type="submit" class="btn btn-primary">保存设置</button>
+    </form>
+    <div style="text-align:center;margin-top:16px"><a href="/admin" style="font-size:13px;color:var(--color-ink-2);text-decoration:none">&larr; 返回文件列表</a></div>`;
+  return layout('系统设置', content, true, true);
 }

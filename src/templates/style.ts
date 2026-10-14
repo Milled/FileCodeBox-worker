@@ -664,6 +664,39 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
 
 .hint { font-size: 12px; color: var(--color-muted); font-weight: 400; }
 
+/* ---- 后台统计卡 ---- */
+.stat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 20px; }
+.stat-card {
+  border: 1px solid var(--color-rule);
+  border-radius: 1.25rem;
+  background: var(--color-paper-2);
+  padding: 14px 16px;
+  min-width: 0;
+}
+.stat-label { font-size: 12px; color: var(--color-ink-2); }
+.stat-value { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.stat-sub { font-size: 11px; color: var(--color-muted); font-family: var(--font-mono); margin-top: 2px; }
+
+/* ---- 设置行 ---- */
+.setting-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--color-rule);
+}
+.setting-title { font-size: 14px; font-weight: 600; color: var(--color-ink); }
+.setting-desc { font-size: 12px; color: var(--color-ink-2); margin-top: 2px; }
+.setting-control { width: auto; min-width: 12rem; flex-shrink: 0; }
+form[action="/admin/settings"] > .btn { margin-top: 20px; }
+
+/* ---- 类型标签 / 可点文件名 ---- */
+.tag {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--color-rule); background: var(--color-paper-3);
+  color: var(--color-ink-2); flex-shrink: 0;
+}
+a.fname { color: inherit; text-decoration: none; }
+a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
+
 /* ---- responsive ---- */
 @media (min-width: 640px) {
   :root { --radius-card: 2.5rem; }
@@ -677,6 +710,8 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   .expire-control .expire-unit { flex-basis: 6.5rem; width: 6.5rem; }
   .expire-control .expire-value { padding-right: 12px; }
   .dz { padding: 22px 14px; }
+  .setting-row { flex-direction: column; align-items: stretch; gap: 8px; }
+  .setting-control { min-width: 0; width: 100%; }
 }
 
 @media (max-width: 719px) {

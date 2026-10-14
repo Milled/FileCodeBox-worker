@@ -18,7 +18,9 @@ import {
   cleanupOrphanedR2Objects,
   cleanupRateLimitEntries,
   incrementDownload,
+  getDashboardStats,
   getSetting,
+  setSetting,
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
@@ -26,6 +28,7 @@ import { uploadFile, uploadText, downloadFile, resolveLimits } from './shared';
 import { generateQRCodeGIF } from './qr';
 import { STYLE } from './templates/style';
 import type { HomeOptions } from './templates/pages';
+import type { AdminConfig } from './templates/pages';
 import {
   homePage,
   retrievePage,
@@ -34,6 +37,7 @@ import {
   errorPage,
   adminLoginPage,
   adminPanel,
+  adminSettingsPage,
 } from './templates/pages';
 
 // ===================== 应用初始化 =====================
@@ -80,6 +84,22 @@ async function homeOptions(env: Env): Promise<HomeOptions> {
   } catch {
     return { uploadAllowed: true, defaultExpireDays: 7 };
   }
+}
+
+/** 后台设置页所需的当前值（生效值 + vars 回退值） */
+async function adminConfig(env: Env): Promise<AdminConfig> {
+  const [openUpload, limits] = await Promise.all([getSetting(env.DB, 'open_upload'), resolveLimits(env)]);
+  const toInt = (v: string | undefined, fallback: number) => {
+    const n = parseInt(v ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  return {
+    openUpload: openUpload ?? '1',
+    maxFileSize: limits.maxSize,
+    defaultExpireDays: limits.defaultExpireDays,
+    varsMaxFileSize: toInt(env.MAX_FILE_SIZE, 26214400),
+    varsDefaultExpireDays: toInt(env.DEFAULT_EXPIRE_DAYS, 7),
+  };
 }
 
 // ===================== 静态资源 =====================
@@ -232,8 +252,32 @@ app.get('/admin', async (c) => {
   const dateTo = c.req.query('date_to') || '';
   const sort = c.req.query('sort') || 'newest';
 
-  const { files, total } = await listFilesAdvanced(env.DB, page, 50, keyword, dateFrom, dateTo, sort);
-  return c.html(adminPanel(files, total, page, undefined, { keyword, dateFrom, dateTo, sort }));
+  const [{ files, total }, stats] = await Promise.all([
+    listFilesAdvanced(env.DB, page, 50, keyword, dateFrom, dateTo, sort),
+    getDashboardStats(env.DB),
+  ]);
+  return c.html(adminPanel(files, total, page, undefined, { keyword, dateFrom, dateTo, sort }, stats));
+});
+
+// 后台设置页：写入 fc_settings 覆盖 wrangler vars（resolveLimits 中 DB 优先），保存即生效
+app.get('/admin/settings', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  const env = c.env;
+  if (!(await adminAuth(c, env))) return c.redirect('/admin');
+  const saved = c.req.query('saved') ? '设置已保存，立即生效' : undefined;
+  return c.html(adminSettingsPage(await adminConfig(env), saved));
+});
+
+app.post('/admin/settings', async (c) => {
+  const env = c.env;
+  if (!(await adminAuth(c, env))) return c.redirect('/admin');
+  const body = await c.req.parseBody();
+  const field = (k: string) => (typeof body[k] === 'string' ? (body[k] as string).trim() : '');
+  await setSetting(env.DB, 'open_upload', field('openUpload') === '0' ? '0' : '1');
+  // 清空即回退到 wrangler vars：resolveLimits 会忽略空值与非法值
+  await setSetting(env.DB, 'max_file_size', field('maxFileSize'));
+  await setSetting(env.DB, 'default_expire_days', field('defaultExpireDays'));
+  return c.redirect('/admin/settings?saved=1');
 });
 
 // 兼容旧路径 /console

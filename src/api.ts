@@ -39,20 +39,9 @@ async function effectiveConfig(c: Context<Bindings>) {
   };
 }
 
-// ===================== 上传门控 =====================
-
-/**
- * 游客上传开关（openUpload）。
- * 默认 '1'（免登录游客可上传）；设为 '0' 时需 Bearer token 才能上传。
- */
-async function uploadGate(c: Context<Bindings>, next: () => Promise<void>) {
-  const openUpload = (await getSetting(c.env.DB, 'open_upload')) ?? '1';
-  if (openUpload !== '0') return next();
-  if (await adminAuth(c, c.env)) return next();
-  return c.json({ code: 401, msg: '游客上传已关闭，请先登录' }, 401);
-}
-
 // ===================== 路由 =====================
+// 游客上传开关（open_upload）已下沉到 shared.ts 的 assertUploadAllowed，
+// 由 uploadFile / uploadText 统一拦截，兼容 API 与首页表单共用同一道闸。
 
 const api = new Hono<Bindings>();
 
@@ -78,8 +67,8 @@ const shareText = async (c: Context<Bindings>) => {
     return fail(c, e?.status ?? 500, e?.message ?? '服务器内部错误');
   }
 };
-api.post('/share/text/', uploadGate, shareText);
-api.post('/share/text', uploadGate, shareText);
+api.post('/share/text/', shareText);
+api.post('/share/text', shareText);
 
 // ---- 分享文件 ----
 const shareFile = async (c: Context<Bindings>) => {
@@ -90,8 +79,8 @@ const shareFile = async (c: Context<Bindings>) => {
     return fail(c, e?.status ?? 500, e?.message ?? '服务器内部错误');
   }
 };
-api.post('/share/file/', uploadGate, shareFile);
-api.post('/share/file', uploadGate, shareFile);
+api.post('/share/file/', shareFile);
+api.post('/share/file', shareFile);
 
 // ---- 获取/选择文件信息 ----
 async function selectFile(c: Context<Bindings>, countAsDownload: boolean) {

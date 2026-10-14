@@ -6,13 +6,13 @@
 
 ## ✨ 功能
 
-- 📤 **上传文件** — 获取 4 位纯数字取件码，存入 R2 对象存储（上限可配置，见[上传大小与过期配置](#上传大小与过期配置)）
-- 📝 **文本分享** — 粘贴文本即可生成分享链接，页面内直接查看
+- 📤 **上传文件** — 点击 / 拖拽 / 粘贴均可，支持多选，每个文件各自生成 4 位取件码（上限可配置，见[上传大小与过期配置](#上传大小与过期配置)）
+- 📝 **文本分享** — 粘贴文本即可生成分享链接，页面内直接查看，实时显示 UTF-8 字节数
 - 📥 **取件下载** — 输入取件码下载文件或查看文本
-- 🔐 **管理面板** — 查看/删除/清理文件，登录速率限制
-- ⏰ **自动过期** — 文件到期自动清理（Cron 定时触发）
-- 🎨 **暖纸墨色设计** — 琥珀色调 + 文学感排版，支持深色模式
-- 🔌 **开放 API** — 兼容 FileCodeBox v2.1.0，免登录游客上传
+- 🔐 **管理后台** — 统计仪表盘、文件筛选/排序/分页/删除、系统设置页、登录速率限制
+- ⏰ **灵活有效期** — 天 / 小时 / 分钟 / 按次数 / 永久，五种方式在上传时直接选择
+- 🎨 **中性 zinc 设计系统** — 对齐上游 2024 主题：纯色底、大圆角玻璃卡、单色强调，深色模式跟随系统
+- 🔌 **开放 API** — 兼容 FileCodeBox v2.1.0，游客上传可在后台一键关闭
 
 ## 🛡️ 安全特性
 
@@ -266,7 +266,9 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 | GET | `/qrcode/:code` | 取件链接二维码（GIF）|
 | GET | `/static/style.css` | 样式表（immutable 长缓存）|
 | GET | `/static/bg.webp` | 背景图，需自行上传到 R2 根目录，否则 404 |
-| GET | `/admin` | 管理面板（受保护）|
+| GET | `/admin` | 管理面板：统计卡 + 文件列表（受保护）|
+| GET | `/admin/settings` | 系统设置页（受保护）|
+| POST | `/admin/settings` | 保存游客上传开关 / 大小上限 / 默认过期天数 |
 | POST | `/admin/login` | 管理员登录（HTML 表单，成功后 302 到 `/admin`）|
 | GET | `/admin/logout` | 管理员登出（清除 Cookie 与 DB token）|
 | POST | `/admin/delete/:id` | 删除文件（表单，按数据库 id）|
@@ -277,7 +279,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 
 > - 登录入口有两套：`/admin/login` 是浏览器表单（302 重定向），`/api/admin/login` 是 JSON API（返回 Bearer token）。
 > - 未匹配的 `/api/*` 返回 `{"code":404,"msg":"Not Found"}`，其余任意路径兜底渲染首页。
-> - `openUpload` 开关只拦截 `/api/share/*` 兼容接口，首页的 `/api/upload`、`/api/upload/text` 不受该开关限制。
+> - `openUpload` 开关在 `src/shared.ts` 的 `assertUploadAllowed()` 里统一拦截，**同时作用于首页 `/api/upload`、`/api/upload/text` 与兼容 API `/api/share/*`**；关闭后管理员登录态仍可上传。取件与下载不受影响。
 
 ---
 
@@ -307,17 +309,19 @@ npm test             # Playwright 无头浏览器跑完整取件流程，默认�
   ```
 - 测线上环境：`BASE_URL=https://你的域名 npm test`（会真实写入该环境的 D1 / R2）
 
-### 背景图与站点图标
+### 背景与站点图标
 
-页面背景当前由 `src/templates/style.ts:83` 直接引用第三方随机图接口 `https://t.alcy.cc/ycy`（每次访问可能换图，且依赖该站可用性）。若要固定背景、去掉外部依赖，把图片传到 R2 根目录，再把 `background-image` 改成站内已实现的 `/static/bg.webp` 路由（`src/index.ts` 从 R2 读取，带 immutable 长缓存）：
+页面背景已对齐上游 2024 主题：**纯色 `--color-page`（浅 `#f5f5f7` / 深 `#101012`），不再引用任何外部图床**。卡片观感由 `bg/78` 半透明 + `backdrop-blur` + `--shadow-panel` + 顶部 hairline 承担。
+
+想换回图片背景：把图传到 R2 根目录，再把 `style.ts` 的 `body` 加上 `background-image: url("/static/bg.webp")`（`src/index.ts` 已实现该路由，从 R2 读取并带 immutable 长缓存）：
 
 ```bash
 npx wrangler r2 object put filecodebox-file/bg.webp --file=./bg.webp --content-type=image/webp
 ```
 
-站点图标是 `src/templates/layout.ts` 里内联的 SVG data URI，不依赖任何外部图床，改图标直接替换那段 SVG 即可。
+站点图标是 `src/templates/layout.ts` 里内联的 SVG data URI，零外部请求，改图标直接替换那段 SVG。
 
-> 改完样式后请把 `layout.ts` 中的 `style.css?v=8` 版本号递增，否则浏览器与 CDN 会继续命中旧缓存。
+> 改完样式必须把 `layout.ts` 里的 `style.css?v=9` 版本号递增 —— 该响应是 `max-age=31536000, immutable`，不升版本浏览器与 CDN 会一直命中旧缓存。
 
 ### Cron 定时清理
 
@@ -352,8 +356,14 @@ npx wrangler r2 object put filecodebox-file/bg.webp --file=./bg.webp --content-t
 
 | 场景 | 做法 |
 |------|------|
+| 部署后随时调整（推荐） | 后台 `/admin/settings` 表单，保存即写入 `fc_settings` |
+| 程序化调整 | `PATCH /api/admin/config/update`（Bearer token 或管理员 Cookie 均可） |
 | 长期默认值 | 改 `wrangler.jsonc` 的 `vars.MAX_FILE_SIZE` 后 `npm run deploy` |
-| 部署后随时调整 | `PATCH /api/admin/config/update`（需 Bearer token，立即生效，无需重新部署） |
+
+设置页里把数值清空并保存，即删除覆盖、回退到 `wrangler.jsonc` 的 vars。
+
+有效期不再只有「天数」：上传表单的有效期选择器直接对应后端 `expire_style`，可选
+`day / hour / minute / count（按次数失效）/ forever（永久）`；选 `count` 时会自动把「最大下载次数」联动锁定为该数值，避免两个字段互相矛盾。
 
 直接改数据库也可以：`npx wrangler d1 execute filecodebox-db --remote --command "INSERT OR REPLACE INTO fc_settings(key,value) VALUES('max_file_size','52428800')"`。
 
@@ -374,7 +384,7 @@ FileCodeBox-worker/
 │   ├── utils.ts               # 工具: 取件码/哈希/IP 提取/HTML 转义
 │   └── templates/
 │       ├── layout.ts          # HTML 布局
-│       ├── style.ts           # 暖纸墨色设计系统 CSS
+│       ├── style.ts           # 中性 zinc 设计系统 CSS（对齐上游 2024 主题）
 │       └── pages.ts           # 页面模板
 ├── scripts/
 │   └── provision.mjs          # 自动创建 D1 / R2、回填 database_id 并执行 schema.sql

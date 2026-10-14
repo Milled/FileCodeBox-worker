@@ -6,6 +6,7 @@ import type { Context } from 'hono';
 import type { Env } from './types';
 import type { FileRecord } from './types';
 import { isValidCode, generateCode, getClientIp } from './utils';
+import { adminAuth } from './auth';
 import {
   getFileByCode,
   isCodeTaken,
@@ -94,6 +95,19 @@ async function ensureCodeAvailable(rawCode: string, env: Env): Promise<string> {
   };
 }
 
+// ===================== 上传门控 =====================
+
+/**
+ * open_upload 开关：为 '0' 时仅管理员可上传。
+ * 放在 shared.ts 而非路由中间件，是为了让首页 /api/upload、/api/upload/text
+ * 与兼容 API /api/share/* 共用同一道闸 —— 之前只拦兼容 API，后台开关形同虚设。
+ */
+export async function assertUploadAllowed(c: Context<{ Bindings: Env }>, env: Env): Promise<void> {
+  if (((await getSetting(env.DB, 'open_upload')) ?? '1') !== '0') return;
+  if (await adminAuth(c, env)) return;
+  throw { status: 401 as const, message: '游客上传已关闭，请先登录' };
+}
+
 // ===================== 文件上传 =====================
 
 /** 共享的文件上传核心逻辑 */
@@ -102,6 +116,8 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   filename: string;
   size: number;
 }> {
+  await assertUploadAllowed(c, env);
+
   // 上传速率限制：60 秒内同一 IP 最多 10 次上传
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
@@ -207,6 +223,8 @@ export async function uploadText(
   c: Context<{ Bindings: Env }>,
   env: Env,
 ): Promise<{ code: string; title: string; textSize: number }> {
+  await assertUploadAllowed(c, env);
+
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
     throw { status: 429 as const, message: '上传过于频繁，请稍后再试' };
