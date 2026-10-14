@@ -4,7 +4,43 @@ import { layout } from './layout';
 
 // ---- 首页 ----
 
-export function homePage(): string {
+export interface HomeOptions {
+  /** open_upload 设置；为 false 时首页只显示登录引导 */
+  uploadAllowed?: boolean;
+  /** 当前生效的默认过期天数（fc_settings 优先于 wrangler vars） */
+  defaultExpireDays?: number;
+}
+
+/** 有效期选择器：后端 parseExpire 已支持 day/hour/minute/count/forever，UI 全部开放 */
+function expireControl(o: {
+  valueId: string;
+  styleId: string;
+  /** 文本表单走原生 POST，需要 name；文件表单由 JS 读值，留空 */
+  names?: { value: string; style: string };
+  days: number;
+}): string {
+  const valueName = o.names ? ` name="${o.names.value}"` : '';
+  const styleName = o.names ? ` name="${o.names.style}"` : '';
+  return `
+        <div class="expire-control" data-style="day">
+          <input type="number" id="${o.valueId}"${valueName} class="input expire-value" min="1" value="${o.days}" aria-label="有效期数值">
+          <select id="${o.styleId}"${styleName} class="input expire-unit" aria-label="有效期单位">
+            <option value="day">天</option>
+            <option value="hour">小时</option>
+            <option value="minute">分钟</option>
+            <option value="count">次后失效</option>
+            <option value="forever">永久</option>
+          </select>
+          <div class="stepper">
+            <button type="button" data-step="1" tabindex="-1" aria-label="增加">▲</button>
+            <button type="button" data-step="-1" tabindex="-1" aria-label="减少">▼</button>
+          </div>
+        </div>`;
+}
+
+export function homePage(opts: HomeOptions = {}): string {
+  const uploadAllowed = opts.uploadAllowed !== false;
+  const days = typeof opts.defaultExpireDays === 'number' && opts.defaultExpireDays > 0 ? opts.defaultExpireDays : 7;
   const content = `
     <div class="header">
       <div>
@@ -29,6 +65,14 @@ export function homePage(): string {
     <!-- 上传区 -->
     <div style="font-size:13px;font-weight:500;color:var(--color-ink-2);margin-bottom:10px">上传新内容</div>
 
+    ${uploadAllowed ? uploadUi(days) : guestBlockedUi()}
+    ${uploadAllowed ? homeScript() : ''}`;
+  return layout('FileCodeBox', content);
+}
+
+/** 上传面板（文件 + 文本），仅在允许游客上传时渲染 */
+function uploadUi(days: number): string {
+  return `
     <div class="tabs">
       <button class="tab active" data-tab="file" onclick="switchTab('file')">文件</button>
       <button class="tab" data-tab="text" onclick="switchTab('text')">文本</button>
@@ -36,108 +80,363 @@ export function homePage(): string {
 
     <!-- 文件上传面板 -->
     <div id="tab-file" class="tab-panel active">
-      <form id="uploadForm" onsubmit="handleUpload(event)">
-        <div class="input-group"><label>选择文件</label><input type="file" name="file" id="fileInput" required class="input"></div>
-        <div style="display:flex;gap:12px">
-          <div class="input-group" style="flex:1"><label>最大下载次数</label><input type="number" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限"></div>
-          <div class="input-group" style="flex:1"><label>过期天数</label><input type="number" name="expire_days" min="1" max="365" value="7" class="input" placeholder="7"></div>
+      <form id="uploadForm" onsubmit="return handleUpload(event)">
+        <div class="input-group">
+          <label>选择文件</label>
+          <div class="dz" id="dropZone" tabindex="0" role="button" aria-label="点击或拖拽文件上传">
+            <span class="dz-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V5"/><path d="m7 10 5-5 5 5"/><path d="M5 19h14"/></svg></span>
+            <span class="dz-title">点击选择，或拖拽文件到此处</span>
+            <span class="dz-hint">支持直接粘贴 · 可多选，每个文件各自生成取件码</span>
+            <input type="file" name="file" id="fileInput" class="dz-input" multiple>
+          </div>
+          <div class="file-chips" id="fileList"></div>
         </div>
-        <div class="input-group"><label>自定义取件码 <span style="font-weight:400;color:var(--color-ink-2)">（可选，留空自动生成）</span></label><input type="text" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}"></div>
+        <div class="field-row">
+          <div class="input-group">
+            <label>有效期</label>
+${expireControl({ valueId: 'fileExpireValue', styleId: 'fileExpireStyle', days })}
+          </div>
+          <div class="input-group">
+            <label>最大下载次数</label>
+            <input type="number" id="fileMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
+          </div>
+        </div>
+        <div class="input-group">
+          <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
+          <input type="text" id="fileCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
+        </div>
         <div class="upload-progress" id="uploadProgress"><div class="upload-progress-bar" id="uploadProgressBar"></div></div>
         <div class="upload-status" id="uploadStatus"></div>
+        <div class="progress-meta" id="uploadMeta" hidden></div>
         <button type="submit" id="submitBtn" class="btn btn-primary">上传并获取取件码</button>
+        <div class="result-list" id="uploadResults"></div>
       </form>
     </div>
 
     <!-- 文本分享面板 -->
     <div id="tab-text" class="tab-panel">
-      <form action="/api/upload/text" method="post" onsubmit="var b=document.getElementById('textSubmitBtn');b.disabled=true;b.textContent='保存中\u2026'">
-        <div class="input-group"><label>文本内容</label><textarea name="text" class="input" placeholder="粘贴或输入要分享的文本内容\u2026" required></textarea></div>
-        <div style="display:flex;gap:12px">
-          <div class="input-group" style="flex:1"><label>最大查看次数</label><input type="number" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限"></div>
-          <div class="input-group" style="flex:1"><label>过期天数</label><input type="number" name="expire_days" min="1" max="365" value="7" class="input" placeholder="7"></div>
+      <form action="/api/upload/text" method="post" onsubmit="return prepareTextSubmit(event)">
+        <div class="input-group">
+          <label>文本内容</label>
+          <textarea name="text" id="textInput" class="input" placeholder="粘贴或输入要分享的文本内容…" required oninput="updateTextBytes(this)"></textarea>
+          <div class="progress-meta"><span id="textBytes">0 B</span><span>上限 512 KB</span></div>
         </div>
-        <div class="input-group"><label>自定义取件码 <span style="font-weight:400;color:var(--color-ink-2)">（可选，留空自动生成）</span></label><input type="text" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}"></div>
+        <div class="field-row">
+          <div class="input-group">
+            <label>有效期</label>
+${expireControl({ valueId: 'textExpireValue', styleId: 'textExpireStyle', names: { value: 'expire_value', style: 'expire_style' }, days })}
+          </div>
+          <div class="input-group">
+            <label>最大查看次数</label>
+            <input type="number" id="textMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
+          </div>
+        </div>
+        <div class="input-group">
+          <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
+          <input type="text" id="textCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
+        </div>
         <button type="submit" id="textSubmitBtn" class="btn btn-primary">保存并获取取件码</button>
       </form>
-    </div>
+    </div>`;
+}
 
+/** 游客上传被关闭时的引导态（对齐上游 guestUploadBlocked 卡片） */
+function guestBlockedUi(): string {
+  return `
+    <div class="empty-state">
+      <span class="empty-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></span>
+      <div class="empty-title">游客上传已关闭</div>
+      <div class="empty-desc">管理员已在后台设置中关闭匿名上传。取件不受影响，登录后仍可上传。</div>
+      <a href="/admin" class="btn btn-primary">前往登录</a>
+    </div>`;
+}
+
+/** 首页交互脚本：拖拽/粘贴/多文件上传、字节与速度进度、有效期选择器 */
+function homeScript(): string {
+  return `
     <script>
+    var MAX_TEXT_BYTES = 524288;
+    var pendingFiles = [];
+
     function switchTab(name) {
-      document.querySelectorAll('.tab').forEach(function(t){ t.classList.toggle('active', t.getAttribute('data-tab') === name) });
-      document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active') });
-      document.getElementById('tab-' + name).classList.add('active');
+      document.querySelectorAll('.tab').forEach(function (t) {
+        t.classList.toggle('active', t.getAttribute('data-tab') === name);
+      });
+      document.querySelectorAll('.tab-panel').forEach(function (p) { p.classList.remove('active'); });
+      var panel = document.getElementById('tab-' + name);
+      if (panel) panel.classList.add('active');
     }
+
+    function fmtBytes(n) {
+      if (n > 1048576) return (n / 1048576).toFixed(1) + ' MB';
+      if (n > 1024) return (n / 1024).toFixed(1) + ' KB';
+      return Math.round(n) + ' B';
+    }
+
+    // ---- 文件选择：点击 / 拖拽 / 粘贴 ----
+    function addFiles(list) {
+      var seen = {};
+      pendingFiles.forEach(function (f) { seen[f.name + ':' + f.size] = true; });
+      Array.prototype.forEach.call(list, function (f) {
+        var key = f.name + ':' + f.size;
+        if (!seen[key]) { pendingFiles.push(f); seen[key] = true; }
+      });
+      renderChips();
+    }
+
+    function renderChips() {
+      var box = document.getElementById('fileList');
+      if (!box) return;
+      box.textContent = '';
+      pendingFiles.forEach(function (f, i) {
+        var chip = document.createElement('div');
+        chip.className = 'file-chip';
+        var name = document.createElement('span');
+        name.className = 'chip-name';
+        name.textContent = f.name;
+        var size = document.createElement('span');
+        size.className = 'chip-size';
+        size.textContent = fmtBytes(f.size);
+        var rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'chip-remove';
+        rm.setAttribute('aria-label', '移除 ' + f.name);
+        rm.textContent = '×';
+        rm.onclick = function () { pendingFiles.splice(i, 1); renderChips(); };
+        chip.appendChild(name); chip.appendChild(size); chip.appendChild(rm);
+        box.appendChild(chip);
+      });
+    }
+
+    function initDropZone() {
+      var dz = document.getElementById('dropZone');
+      var input = document.getElementById('fileInput');
+      if (!dz || !input) return;
+      dz.addEventListener('click', function (e) { if (e.target !== input) input.click(); });
+      dz.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); }
+      });
+      ['dragenter', 'dragover'].forEach(function (ev) {
+        dz.addEventListener(ev, function (e) { e.preventDefault(); dz.setAttribute('data-dragging', 'true'); });
+      });
+      ['dragleave', 'drop'].forEach(function (ev) {
+        dz.addEventListener(ev, function (e) { e.preventDefault(); dz.removeAttribute('data-dragging'); });
+      });
+      dz.addEventListener('drop', function (e) {
+        if (e.dataTransfer && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+      });
+      input.addEventListener('change', function () {
+        if (input.files.length) addFiles(input.files);
+        input.value = '';
+      });
+      // 关闭浏览器把拖入的图片直接导航走
+      ['dragover', 'drop'].forEach(function (ev) {
+        window.addEventListener(ev, function (e) { e.preventDefault(); });
+      });
+      window.addEventListener('paste', function (e) {
+        var files = e.clipboardData && e.clipboardData.files;
+        if (files && files.length) { e.preventDefault(); addFiles(files); }
+      });
+    }
+
+    // ---- 有效期选择器 ----
+    function bindExpire(valueId, styleId, maxId) {
+      var wrap = document.getElementById(valueId);
+      var style = document.getElementById(styleId);
+      var value = wrap;
+      var max = maxId ? document.getElementById(maxId) : null;
+      if (!style || !value) return;
+      var control = style.closest('.expire-control');
+
+      function sync() {
+        var m = style.value;
+        if (control) control.setAttribute('data-style', m);
+        value.disabled = (m === 'forever');
+        value.required = (m !== 'forever');
+        // 按次数失效时，最大下载次数由有效期数值决定，避免两个字段互相矛盾
+        if (max) {
+          if (m === 'count') { max.value = value.value; max.disabled = true; }
+          else { max.disabled = false; if (max.value === '') max.value = '-1'; }
+        }
+      }
+      style.addEventListener('change', sync);
+      value.addEventListener('input', function () {
+        if (max && style.value === 'count') max.value = value.value;
+      });
+      if (control) {
+        control.querySelectorAll('.stepper button').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            var step = parseInt(btn.getAttribute('data-step'), 10);
+            var n = parseInt(value.value, 10);
+            if (!Number.isFinite(n)) n = 1;
+            value.value = String(Math.max(1, n + step));
+            value.dispatchEvent(new Event('input', { bubbles: true }));
+          });
+        });
+      }
+      sync();
+    }
+
+    // ---- 上传 ----
+    function uploadParams() {
+      var style = document.getElementById('fileExpireStyle');
+      var value = document.getElementById('fileExpireValue');
+      var max = document.getElementById('fileMaxDownloads');
+      var code = document.getElementById('fileCode');
+      var q = 'expire_style=' + encodeURIComponent(style ? style.value : 'day');
+      q += '&expire_value=' + encodeURIComponent(value && value.value ? value.value : '7');
+      q += '&max_downloads=' + encodeURIComponent(max && max.value ? max.value : '-1');
+      q += '&code=' + encodeURIComponent(code ? code.value.trim() : '');
+      return q;
+    }
+
+    function uploadOne(file, query, onProgress) {
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/upload?' + query);
+        xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        xhr.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+        xhr.onload = function () {
+          var data = null;
+          try { data = JSON.parse(xhr.responseText); } catch (err) { data = null; }
+          if (xhr.status >= 200 && xhr.status < 300 && data && data.code) resolve(data);
+          else reject(new Error((data && data.error) || ('上传失败（HTTP ' + xhr.status + '）')));
+        };
+        xhr.onerror = function () { reject(new Error('网络错误')); };
+        xhr.send(file);
+      });
+    }
+
     function handleUpload(e) {
       e.preventDefault();
-      var file = document.getElementById('fileInput').files[0];
-      if (!file) return;
       var btn = document.getElementById('submitBtn');
-      var progress = document.getElementById('uploadProgress');
-      var progressBar = document.getElementById('uploadProgressBar');
+      var bar = document.getElementById('uploadProgressBar');
+      var wrap = document.getElementById('uploadProgress');
       var status = document.getElementById('uploadStatus');
+      var meta = document.getElementById('uploadMeta');
+      var results = document.getElementById('uploadResults');
+      if (!pendingFiles.length) { alert('请先选择文件'); return false; }
 
-      var code = document.querySelector('[name="code"]').value || '';
-      var maxDownloads = document.querySelector('[name="max_downloads"]').value || '-1';
-      var expireDays = document.querySelector('[name="expire_days"]').value || '7';
-
-      var url = '/api/upload?code=' + encodeURIComponent(code) +
-                '&max_downloads=' + encodeURIComponent(maxDownloads) +
-                '&expire_days=' + encodeURIComponent(expireDays);
-
-      function resetUpload() {
-        btn.disabled = false;
-        btn.textContent = '\u4e0a\u4f20\u5e76\u83b7\u53d6\u53d6\u4ef6\u7801';
-        progress.style.display = 'none';
-        status.style.display = 'none';
-        progressBar.style.width = '0%';
-      }
-
-      // 用 XMLHttpRequest 获取原生上传进度（fetch 不支持）
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', url);
-      xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
-      xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+      var totalBytes = pendingFiles.reduce(function (s, f) { return s + f.size; }, 0);
+      var query = uploadParams();
+      var startedAt = Date.now();
+      var lastBytes = 0;
+      var lastAt = startedAt;
+      var speed = 0;
 
       btn.disabled = true;
-      btn.textContent = '\u4e0a\u4f20\u4e2d\u2026';
-      progress.style.display = 'block';
+      btn.textContent = '上传中…';
+      wrap.style.display = 'block';
       status.style.display = 'block';
-      status.textContent = '\u4e0a\u4f20\u4e2d 0%';
+      meta.hidden = false;
+      results.textContent = '';
 
-      xhr.upload.onprogress = function(event) {
-        if (event.lengthComputable) {
-          var pct = Math.round(event.loaded / event.total * 100);
-          progressBar.style.width = pct + '%';
-          status.textContent = '\u4e0a\u4f20\u4e2d ' + pct + '%';
+      function paint(loadedSoFar, label) {
+        var pct = totalBytes ? Math.min(100, Math.round((loadedSoFar / totalBytes) * 100)) : 0;
+        bar.style.width = pct + '%';
+        status.textContent = label;
+        meta.textContent = fmtBytes(loadedSoFar) + ' / ' + fmtBytes(totalBytes) + ' · ' + fmtBytes(speed) + '/s';
+      }
+
+      function onProgress(loadedSoFar, fileLoaded) {
+        var now = Date.now();
+        var dt = now - lastAt;
+        if (dt > 200) {
+          speed = ((fileLoaded - lastBytes) / dt) * 1000;
+          lastBytes = fileLoaded;
+          lastAt = now;
         }
-      };
+      }
 
-      xhr.onload = function() {
-        try {
-          var data = JSON.parse(xhr.responseText);
-          if (data.code) {
-            status.textContent = '\u4e0a\u4f20\u5b8c\u6210\uff0c\u8df3\u8f6c\u4e2d\u2026';
-            window.location.href = '/r/' + data.code;
-          } else {
-            alert(data.error || '\u4e0a\u4f20\u5931\u8d25');
-            resetUpload();
-          }
-        } catch (err) {
-          alert('\u4e0a\u4f20\u5931\u8d25');
-          resetUpload();
+      var done = 0;
+      var jobs = pendingFiles.slice();
+      var chain = Promise.resolve();
+      var collected = [];
+      jobs.forEach(function (file, idx) {
+        chain = chain.then(function () {
+          return uploadOne(file, query, function (loaded, total) {
+            onProgress(0, loaded);
+            paint(done + loaded, '上传中 (' + (idx + 1) + '/' + jobs.length + ') ' + file.name);
+          }).then(function (data) {
+            done += file.size;
+            collected.push({ name: file.name, code: data.code, size: file.size });
+            paint(done, '已完成 ' + collected.length + '/' + jobs.length);
+          });
+        });
+      });
+
+      chain.then(function () {
+        var elapsed = Math.max(1, Date.now() - startedAt);
+        if (collected.length === 1) {
+          status.textContent = '上传完成，跳转中…';
+          window.location.href = '/r/' + collected[0].code;
+          return;
         }
-      };
-
-      xhr.onerror = function() {
-        alert('\u4e0a\u4f20\u5931\u8d25\uff1a\u7f51\u7edc\u9519\u8bef');
-        resetUpload();
-      };
-
-      xhr.send(file);
+        btn.disabled = false;
+        btn.textContent = '上传并获取取件码';
+        status.textContent = '全部完成 · ' + collected.length + ' 个文件 · ' + (elapsed / 1000).toFixed(1) + 's';
+        // 小文件走不到采样窗口，收尾用平均速率，避免显示 0 B/s
+        meta.textContent = fmtBytes(totalBytes) + ' / ' + fmtBytes(totalBytes) + ' · 平均 ' + fmtBytes((totalBytes / elapsed) * 1000) + '/s';
+        collected.forEach(function (item) {
+          var row = document.createElement('div');
+          row.className = 'result-item';
+          var name = document.createElement('span');
+          name.className = 'rname';
+          name.textContent = item.name;
+          var code = document.createElement('span');
+          code.className = 'rcode';
+          code.textContent = item.code;
+          var link = document.createElement('a');
+          link.href = '/r/' + item.code;
+          link.textContent = '打开';
+          row.appendChild(name); row.appendChild(code); row.appendChild(link);
+          results.appendChild(row);
+        });
+        pendingFiles = [];
+        renderChips();
+      }).catch(function (err) {
+        alert(err.message || '上传失败');
+        btn.disabled = false;
+        btn.textContent = '上传并获取取件码';
+        status.textContent = '上传中断';
+        wrap.style.display = 'none';
+        meta.hidden = true;
+      });
+      return false;
     }
+
+    // ---- 文本分享 ----
+    function updateTextBytes(el) {
+      var out = document.getElementById('textBytes');
+      if (out) out.textContent = fmtBytes(new TextEncoder().encode(el.value).length);
+    }
+
+    function prepareTextSubmit(e) {
+      var el = document.getElementById('textInput');
+      var bytes = el ? new TextEncoder().encode(el.value).length : 0;
+      if (bytes > MAX_TEXT_BYTES) {
+        e.preventDefault();
+        alert('文本过长，最大支持 512KB（当前 ' + fmtBytes(bytes) + '）');
+        return false;
+      }
+      var b = document.getElementById('textSubmitBtn');
+      if (b) { b.disabled = true; b.textContent = '保存中…'; }
+      return true;
+    }
+
+    // 浏览器后退会恢复表单页，需要把按钮还原
+    window.addEventListener('pageshow', function () {
+      var b = document.getElementById('textSubmitBtn');
+      if (b) { b.disabled = false; b.textContent = '保存并获取取件码'; }
+    });
+
+    document.addEventListener('DOMContentLoaded', function () {
+      initDropZone();
+      bindExpire('fileExpireValue', 'fileExpireStyle', 'fileMaxDownloads');
+      bindExpire('textExpireValue', 'textExpireStyle', 'textMaxDownloads');
+    });
     </script>`;
-  return layout('FileCodeBox', content);
 }
 
 // ---- 取件页 ----

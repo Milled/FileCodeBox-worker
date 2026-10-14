@@ -532,6 +532,138 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   font-size: 13px;
 }
 
+/* ---- 拖拽上传区 ---- */
+.dz {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  text-align: center;
+  padding: 28px 18px;
+  border: 1px dashed var(--color-rule-strong);
+  border-radius: 1.25rem;
+  background: var(--color-paper-2);
+  cursor: pointer;
+  transition: border-color var(--dur-short) var(--ease-out), background var(--dur-short) var(--ease-out);
+}
+.dz:hover { border-color: var(--color-ink-2); }
+.dz[data-dragging="true"] { border-color: var(--color-ink); background: var(--color-accent-soft); }
+.dz:focus-visible { outline: 3px solid var(--color-focus); outline-offset: 3px; }
+.dz-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.dz-icon {
+  width: 40px; height: 40px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+  display: inline-flex; align-items: center; justify-content: center;
+  margin-bottom: 4px;
+}
+.dz-title { font-size: 14px; font-weight: 600; color: var(--color-ink); }
+.dz-hint { font-size: 12px; color: var(--color-ink-2); }
+
+/* ---- 已选文件 ---- */
+.file-chips { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.file-chips:empty { display: none; }
+.file-chip {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-rule);
+  border-radius: var(--radius-control);
+  background: var(--color-paper-2);
+  font-size: 13px;
+}
+.file-chip .chip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-chip .chip-size { font-family: var(--font-mono); font-size: 12px; color: var(--color-ink-2); font-variant-numeric: tabular-nums; }
+.file-chip .chip-remove {
+  border: none; background: none; cursor: pointer;
+  color: var(--color-muted); font-size: 16px; line-height: 1; padding: 2px 6px;
+  border-radius: var(--radius);
+  transition: background var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out);
+}
+.file-chip .chip-remove:hover { background: var(--color-paper-3); color: var(--color-ink); }
+
+/* ---- 字段行 / 有效期控件 ---- */
+.field-row { display: flex; gap: 12px; }
+.field-row > .input-group { flex: 1; min-width: 0; }
+.expire-control { position: relative; display: flex; }
+.expire-control .expire-value {
+  flex: 1 1 auto; width: auto; min-width: 0;
+  border-top-right-radius: 0; border-bottom-right-radius: 0; border-right: none;
+  padding-right: 34px;
+  appearance: textfield; -moz-appearance: textfield;
+}
+.expire-control .expire-value::-webkit-outer-spin-button,
+.expire-control .expire-value::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.expire-control .expire-unit {
+  flex: 0 0 7rem; width: 7rem;
+  border-top-left-radius: 0; border-bottom-left-radius: 0;
+  border-left: 1px solid var(--color-rule);
+}
+.stepper {
+  position: absolute; right: calc(7rem + 1px); top: 1px; bottom: 1px;
+  display: flex; flex-direction: column; width: 28px;
+  border-left: 1px solid var(--color-rule);
+}
+.stepper button {
+  flex: 1; border: none; background: none; cursor: pointer;
+  color: var(--color-muted); display: flex; align-items: center; justify-content: center;
+  transition: background var(--dur-micro) var(--ease-out), color var(--dur-micro) var(--ease-out);
+}
+.stepper button:hover { background: var(--color-paper-3); color: var(--color-ink); }
+.expire-control[data-style="forever"] .expire-value,
+.expire-control[data-style="forever"] .stepper { opacity: 0.4; pointer-events: none; }
+.expire-control[data-style="count"] .expire-unit { color: var(--color-ink); }
+
+/* ---- 进度明细 ---- */
+.progress-meta {
+  display: flex; justify-content: space-between; gap: 10px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--color-muted); font-variant-numeric: tabular-nums;
+  margin-top: 6px;
+}
+
+/* ---- 多文件结果列表 ---- */
+.result-list { display: flex; flex-direction: column; gap: 6px; margin-top: 16px; }
+.result-list:empty { display: none; }
+.result-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--color-rule);
+  border-radius: var(--radius-control);
+  background: var(--color-paper-2);
+  font-size: 13px;
+}
+.result-item .rname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-item .rcode {
+  font-family: var(--font-mono); font-weight: 700; letter-spacing: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.result-item a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 2px; }
+.result-item a:hover { color: var(--color-ink-2); }
+
+/* ---- 游客上传关闭空态 ---- */
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  text-align: center;
+  padding: 36px 20px;
+  border: 1px dashed var(--color-rule-strong);
+  border-radius: 1.25rem;
+  background: var(--color-paper-2);
+}
+.empty-icon {
+  width: 48px; height: 48px; border-radius: 50%;
+  background: var(--color-accent); color: var(--color-accent-contrast);
+  display: inline-flex; align-items: center; justify-content: center;
+  margin-bottom: 6px;
+}
+.empty-title { font-size: 15px; font-weight: 600; color: var(--color-ink); }
+.empty-desc { font-size: 13px; color: var(--color-ink-2); max-width: 30rem; }
+.empty-state .btn { width: auto; margin-top: 10px; padding: 9px 20px; }
+
+.hint { font-size: 12px; color: var(--color-muted); font-weight: 400; }
+
 /* ---- responsive ---- */
 @media (min-width: 640px) {
   :root { --radius-card: 2.5rem; }
@@ -540,6 +672,11 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
 @media (max-width: 420px) {
   .container { padding: 24px 12px 48px; }
   .card { padding: 24px 18px; }
+  .field-row { flex-direction: column; gap: 0; }
+  .stepper { display: none; }
+  .expire-control .expire-unit { flex-basis: 6.5rem; width: 6.5rem; }
+  .expire-control .expire-value { padding-right: 12px; }
+  .dz { padding: 22px 14px; }
 }
 
 @media (max-width: 719px) {

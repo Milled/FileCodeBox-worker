@@ -18,12 +18,14 @@ import {
   cleanupOrphanedR2Objects,
   cleanupRateLimitEntries,
   incrementDownload,
+  getSetting,
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
-import { uploadFile, uploadText, downloadFile } from './shared';
+import { uploadFile, uploadText, downloadFile, resolveLimits } from './shared';
 import { generateQRCodeGIF } from './qr';
 import { STYLE } from './templates/style';
+import type { HomeOptions } from './templates/pages';
 import {
   homePage,
   retrievePage,
@@ -66,6 +68,20 @@ function getBaseUrl(c: Context<{ Bindings: Env }>): string {
   return `${proto}://${host}`;
 }
 
+/**
+ * 首页所需的生效设置。
+ * 全新数据库尚未建表时（initDB 由 Cron 或 provision 完成）必须降级为默认值，
+ * 否则首页会从「可用静态页」退化成 500。
+ */
+async function homeOptions(env: Env): Promise<HomeOptions> {
+  try {
+    const [openUpload, limits] = await Promise.all([getSetting(env.DB, 'open_upload'), resolveLimits(env)]);
+    return { uploadAllowed: (openUpload ?? '1') !== '0', defaultExpireDays: limits.defaultExpireDays };
+  } catch {
+    return { uploadAllowed: true, defaultExpireDays: 7 };
+  }
+}
+
 // ===================== 静态资源 =====================
 
 // 样式表独立成文件 + immutable 长缓存（由 CDN/浏览器缓存，避免每次页面内联 ~10KB CSS）
@@ -86,10 +102,10 @@ app.get('/static/bg.webp', async (c) => {
 
 // ===================== 页面路由 =====================
 
-// 首页（纯静态，但需避免 500 响应被 CDN 缓存，使用 no-store）
-app.get('/', (c) => {
+// 首页（需读一次生效设置，决定上传区还是登录引导；DB 未就绪时降级为默认可上传）
+app.get('/', async (c) => {
   c.header('Cache-Control', 'no-store');
-  return c.html(homePage());
+  return c.html(homePage(await homeOptions(c.env)));
 });
 
 // 取件页（静态，但需避免错误响应被 CDN 缓存，使用 no-store）
@@ -293,7 +309,7 @@ app.all('/api/*', (c) => c.json({ code: 404, msg: 'Not Found' }, 404));
 
 // ===================== 兜底 =====================
 
-app.all('*', (c) => c.html(homePage()));
+app.all('*', async (c) => c.html(homePage(await homeOptions(c.env))));
 
 // ===================== 导出 =====================
 // fetch: Hono 处理所有 HTTP 请求
