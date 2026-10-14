@@ -48,7 +48,7 @@ app.use('*', async (c, next) => {
     "default-src 'self'; " +
       "script-src 'self' 'unsafe-inline'; " +
       "style-src 'self' 'unsafe-inline'; " +
-      "img-src 'self' https://t.alcy.cc https://q1.qlogo.cn https: data:; " +
+      "img-src 'self' https: data:; " +
       "object-src 'none'; " +
       "frame-ancestors 'none';",
   );

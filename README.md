@@ -293,13 +293,17 @@ npm run typecheck    # tsc --noEmit
 - 本地测试线上环境：`BASE_URL=https://你的域名 npm test`（会真实写入该环境的 D1 / R2）
 - 若 `wrangler dev` 因 `database_id` 为空报错，先跑一次 `npm run provision` 完成回填
 
-### 背景图（可选）
+### 背景图与站点图标
 
-页面背景由 Worker 从 R2 根目录读取 `bg.webp`，未上传时 `/static/bg.webp` 返回 404（页面仍可用）。自定义背景：
+页面背景当前由 `src/templates/style.ts:83` 直接引用第三方随机图接口 `https://t.alcy.cc/ycy`（每次访问可能换图，且依赖该站可用性）。若要固定背景、去掉外部依赖，把图片传到 R2 根目录，再把 `background-image` 改成站内已实现的 `/static/bg.webp` 路由（`src/index.ts` 从 R2 读取，带 immutable 长缓存）：
 
 ```bash
 npx wrangler r2 object put filecodebox-file/bg.webp --file=./bg.webp --content-type=image/webp
 ```
+
+站点图标是 `src/templates/layout.ts` 里内联的 SVG data URI，不依赖任何外部图床，改图标直接替换那段 SVG 即可。
+
+> 改完样式后请把 `layout.ts` 中的 `style.css?v=8` 版本号递增，否则浏览器与 CDN 会继续命中旧缓存。
 
 ### Cron 定时清理
 

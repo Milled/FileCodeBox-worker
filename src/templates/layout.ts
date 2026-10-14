@@ -6,7 +6,7 @@ export function layout(title: string, content: string, showFooter = true, wide =
   const footer = showFooter
     ? `<div class="footer">
         <a href="/">FileCodeBox</a> · 安全临时文件分享
-        <a href="https://github.com/jeio258/FileCodeBox-worker" target="_blank" rel="noopener" class="github-link">
+        <a href="https://github.com/Milled/FileCodeBox-worker" target="_blank" rel="noopener" class="github-link">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
         </a>
@@ -18,8 +18,7 @@ export function layout(title: string, content: string, showFooter = true, wide =
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${title}</title>
-  <link rel="icon" href="https://q1.qlogo.cn/g?b=qq&nk=2847495839&s=640">
-  <link rel="preconnect" href="/static">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23d97706'/><path d='M7 12h18v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2z' fill='%23fdf3e3'/><path d='M6 8h20v4H6z' fill='%23fffbf2'/><path d='M14 8h4v18h-4z' fill='%23a16207'/></svg>">
   <link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
