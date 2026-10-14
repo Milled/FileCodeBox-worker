@@ -58,18 +58,19 @@ npm install
 npm run provision
 ```
 
-脚本按 `wrangler.jsonc` 里声明的资源名执行：
+脚本按 `wrangler.jsonc` 里声明的资源名执行（全程走 `wrangler` 命令，不经过 shell）：
 
-1. 检查 `wrangler whoami` 登录状态（未登录会提示先 `wrangler login`）
-2. 存在 `filecodebox-db` 就复用，不存在则 `wrangler d1 create`
+1. `wrangler whoami --json` 校验登录状态 —— 实测未登录时 `whoami` 仍返回退出码 0，所以只信它的 `loggedIn` 字段
+2. 存在 `filecodebox-db` 就复用，不存在则 `wrangler d1 create`（从输出中抓取 UUID）
 3. 存在 `filecodebox-file` 就复用，不存在则 `wrangler r2 bucket create`
 4. 把返回的 `database_id` 回填进 `wrangler.jsonc`（正则改写，保留注释）
+5. 对新库执行 `schema.sql` 建表 —— 空库上后台登录会因缺 `fc_settings` 表直接 500
 
 可选参数：
 
 ```bash
 npm run provision -- --dry-run        # 只报告将要执行的动作，不创建、不写文件
-npm run provision -- --location=apac  # 指定 D1 主位置，跳过 wrangler 的位置询问
+npm run provision -- --location=apac  # 指定 D1 主位置（weur/eeur/apac/oc/wnam/enam），跳过交互询问
 ```
 
 想换资源名或 Worker 名，直接改 `wrangler.jsonc` 后重跑 `npm run provision`：
@@ -108,7 +109,7 @@ wrangler secret put ADMIN_PASSWORD
 npm run deploy
 ```
 
-表结构会在首次 Cron 触发（每 30 分钟）时自动幂等创建；如需立即建表，登录后台后访问 `/api/init`。
+表结构已由第 4 步的 `schema.sql` 建好。若跳过 provision，Cron 每 30 分钟也会幂等补建，但**别指望部署后立刻访问 `/api/init`**：该接口要求管理员身份，而登录又要读 `fc_settings` 表，空库上两者都会 500（实测如此）。
 
 ---
 
@@ -161,7 +162,13 @@ npm run deploy
 
 #### 5. 初始化数据库
 
-登录后台后访问 `https://你的域名/api/init`，返回 `{"ok":true}` 即成功；该接口需要管理员身份，未登录会返回 401。若不主动调用，Cron 也会在 30 分钟内自动建表。
+用命令直接建表最可靠：
+
+```bash
+npx wrangler d1 execute filecodebox-db --remote --file=./schema.sql --yes
+```
+
+不要用 `/api/init` 做首次初始化 —— 它要求管理员身份，而登录要读 `fc_settings` 表，空库上两者互相卡死（都返回 500）。兜底方案是等 Cron 每 30 分钟自动幂等建表。
 
 ---
 
@@ -264,7 +271,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 | GET | `/admin/logout` | 管理员登出（清除 Cookie 与 DB token）|
 | POST | `/admin/delete/:id` | 删除文件（表单，按数据库 id）|
 | POST | `/admin/cleanup` | 手动清理过期文件 |
-| GET | `/api/init` | 幂等建表（需管理员身份，未登录返回 401）|
+| GET | `/api/init` | 幂等建表（需管理员身份；空库上不可用，见部署方式一第 4 步）|
 | GET | `/console` | 兼容旧路径，302 到 `/admin` |
 | GET | `/api/console/logout` | 兼容旧路径，302 到 `/admin/logout` |
 
@@ -285,13 +292,20 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 ### 本地开发与测试
 
 ```bash
+npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
 npm test             # Playwright 无头浏览器跑完整取件流程，默认打本地
-npm run typecheck    # tsc --noEmit
 ```
 
-- 本地测试线上环境：`BASE_URL=https://你的域名 npm test`（会真实写入该环境的 D1 / R2）
-- 若 `wrangler dev` 因 `database_id` 为空报错，先跑一次 `npm run provision` 完成回填
+`wrangler dev` 要求 `database_id` 非空，配置留空会直接崩溃，实测报 `The expression evaluated to a falsy value: (databaseId)`。两种解法：
+
+- **有 Cloudflare 账号**：跑一次 `npm run provision` 回填真实 ID，本地依旧用模拟存储，不产生线上写入。
+- **完全离线**：临时把 `database_id` 填成任意合法 UUID（**不要提交**），再建本地表并准备密码：
+  ```bash
+  npx wrangler d1 execute filecodebox-db --local --file=./schema.sql --yes
+  echo 'ADMIN_PASSWORD=你的本地密码' > .dev.vars   # 已在 .gitignore 中
+  ```
+- 测线上环境：`BASE_URL=https://你的域名 npm test`（会真实写入该环境的 D1 / R2）
 
 ### 背景图与站点图标
 
@@ -363,7 +377,8 @@ FileCodeBox-worker/
 │       ├── style.ts           # 暖纸墨色设计系统 CSS
 │       └── pages.ts           # 页面模板
 ├── scripts/
-│   └── provision.mjs          # 自动创建 D1 / R2 并回填 database_id
+│   └── provision.mjs          # 自动创建 D1 / R2、回填 database_id 并执行 schema.sql
+├── schema.sql                 # 表结构（全语句幂等，可重复执行）
 ├── wrangler.jsonc             # Cloudflare 配置（资源名在此声明）
 ├── tsconfig.json
 └── package.json

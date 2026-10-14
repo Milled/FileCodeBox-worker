@@ -6,6 +6,7 @@
  *   1. 检查 wrangler 登录状态
  *   2. 按 wrangler.jsonc 里的 database_name / bucket_name 创建缺失的 D1 数据库与 R2 存储桶
  *   3. 把创建返回的 database_id 回填进 wrangler.jsonc
+ *   4. 对新库执行 schema.sql（空库上后台登录会因缺表 500，必须先建表）
  *
  * 幂等：资源已存在则直接复用，可重复执行。
  *
@@ -21,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = join(ROOT, 'wrangler.jsonc');
+const SCHEMA_PATH = join(ROOT, 'schema.sql');
 const DRY_RUN = process.argv.includes('--dry-run');
 const LOCATION_ARG = process.argv.find((a) => a.startsWith('--location='));
 
@@ -29,6 +31,8 @@ const LOCAL_BIN = join(ROOT, 'node_modules', '.bin', process.platform === 'win32
 const BIN = existsSync(LOCAL_BIN) ? LOCAL_BIN : 'wrangler';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// d1 create 的输出是人类可读文本，需要从中等抓取 UUID
+const UUID_IN_TEXT = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 function die(msg, hint) {
   console.error(`\n✗ ${msg}`);
@@ -152,25 +156,32 @@ function findDatabaseId(name) {
 }
 
 function findBucket(name) {
-  const listed = wrangler(['r2', 'bucket', 'list', '--json']);
+  // r2 bucket list 不支持 --json，只能从表格里按名称边界匹配
+  const listed = wrangler(['r2', 'bucket', 'list']);
   if (!listed.ok) {
     console.warn(`  (r2 bucket list 调用失败，将尝试直接创建 "${name}")`);
     return false;
   }
-  return rows(parseJson(listed.stdout)).some((r) => nameOf(r) === name);
+  return new RegExp(`(^|[^a-z0-9-])${escRe(name)}([^a-z0-9-]|$)`, 'm').test(listed.stdout);
 }
 
 console.log(`wrangler: ${BIN}`);
 if (DRY_RUN) console.log('（--dry-run：只检查与报告，不创建资源、不写文件）');
 
 // ---- 1. 登录状态 ----
-const whoami = wrangler(['whoami']);
+// 实测 wrangler 4.114：未登录时 `wrangler whoami` 依然返回退出码 0，
+// 因此以 `whoami --json` 的 loggedIn 字段为准，文本匹配仅作降级兜底
+const whoami = wrangler(['whoami', '--json']);
 const whoamiText = `${whoami.stdout}${whoami.stderr}`;
 if (/ENOENT|command not found|spawn/i.test(whoamiText)) {
   die('未找到 wrangler 可执行文件', '先在项目目录执行 npm install，或 npm i -g wrangler');
 }
-// whoami 在未登录时某些版本仍返回 0，因此同时匹配输出文本
-if (!whoami.ok || /not logged in|no access token|unauthorized|missing/i.test(whoamiText)) {
+const loggedInFlag = parseJson(whoami.stdout)?.loggedIn;
+const authenticated =
+  whoami.ok &&
+  (loggedInFlag === true || (loggedInFlag === undefined && /logged in|api token/i.test(whoamiText) &&
+    !/not authenticated|not logged in/i.test(whoamiText)));
+if (!authenticated) {
   die('wrangler 未登录或令牌已失效', '运行 npx wrangler login 完成浏览器授权后重试');
 }
 const account = whoamiText.match(/[\w.+-]+@[\w-]+\.[\w.-]+/)?.[0];
@@ -191,10 +202,13 @@ if (databaseId) {
   console.log(`· 将创建 D1 "${databaseName}" 并回填 database_id`);
   databaseId = '<将新建的 database_id>';
 } else {
-  const args = ['d1', 'create', databaseName, '--json'];
+  const args = ['d1', 'create', databaseName];
   if (LOCATION_ARG) args.push(LOCATION_ARG);
+  console.log(`· 正在创建 D1 "${databaseName}"（若 wrangler 询问是否写入配置文件，请选 No，本脚本负责回填）`);
   const created = wrangler(args);
-  databaseId = rows(parseJson(created.stdout)).map(uuidOf).find(Boolean);
+  // d1 create 不支持 --json：先尝试按 JSON 解析，失败则从文本中抓 UUID
+  databaseId =
+    rows(parseJson(created.stdout)).map(uuidOf).find(Boolean) ?? created.stdout.match(UUID_IN_TEXT)?.[0] ?? null;
   // list 漏查或并发创建时，create 会报“已存在”：改用按名查询取回 uuid
   if (!databaseId && alreadyExists(created.stdout + created.stderr)) {
     databaseId = findDatabaseId(databaseName);
@@ -241,12 +255,28 @@ if (next === src) {
   console.log(`✓ 已写入 wrangler.jsonc: "database_id": "${databaseId}"`);
 }
 
+// ---- 6. 建表 ----
+if (!existsSync(SCHEMA_PATH)) {
+  console.warn(`! 未找到 schema.sql，跳过建表（Cron 每 30 分钟会幂等补建）`);
+} else if (DRY_RUN) {
+  console.log(`· 将对 D1 "${databaseName}" 执行 schema.sql 建表`);
+} else {
+  const applied = wrangler(['d1', 'execute', databaseName, '--remote', '--file', SCHEMA_PATH, '--yes']);
+  if (applied.ok) {
+    console.log(`✓ 已对 "${databaseName}" 执行 schema.sql，表结构就绪`);
+  } else {
+    console.warn(
+      `! schema.sql 执行失败，稍后可手动重试：npx wrangler d1 execute ${databaseName} --remote --file=./schema.sql --yes\n  ${applied.stderr.trim().slice(0, 300)}`,
+    );
+  }
+}
+
 console.log(`
 下一步：
   1. 设置管理员密码（未设置时后台登录会被拒绝）
        npx wrangler secret put ADMIN_PASSWORD
   2. 部署
        npm run deploy
-  3. 建表（可选：Cron 每 30 分钟会幂等自动建表）
-       登录后台后访问 https://<你的域名>/api/init
+
+表结构已由 schema.sql 建好，无需再访问 /api/init；Cron 每 30 分钟仍会幂等校验一次。
 `);
