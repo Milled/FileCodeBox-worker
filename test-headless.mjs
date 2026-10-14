@@ -4,9 +4,15 @@
  */
 import { chromium } from 'playwright';
 
-const BASE_URL = process.env.BASE_URL || 'https://filebox.994613.xyz';
+// 默认打本地 wrangler dev（另开终端运行 npm run dev，默认端口 8787）。
+// 测线上部署请显式指定：BASE_URL=https://你的域名 npm test
+const BASE_URL = process.env.BASE_URL || 'http://localhost:8787';
 
 async function test() {
+  console.log(`测试目标: ${BASE_URL}`);
+  if (!/(localhost|127\.0\.0\.1)/.test(BASE_URL)) {
+    console.log('⚠️ 目标为远端部署，测试会向其 D1 / R2 真实写入文件（可事后到 /admin 删除）');
+  }
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 

@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "provision": "node scripts/provision.mjs",
     "test": "node test-headless.mjs",
     "typecheck": "tsc --noEmit"
   },

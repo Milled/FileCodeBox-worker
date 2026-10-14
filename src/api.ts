@@ -12,7 +12,7 @@ import type { Env } from './types';
 import { formatFileSize } from './utils';
 import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
-import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile } from './shared';
+import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits } from './shared';
 
 type Bindings = { Bindings: Env };
 
@@ -24,6 +24,19 @@ function ok(c: Context<Bindings>, detail: unknown, msg = 'success') {
 
 function fail(c: Context<Bindings>, status: ContentfulStatusCode, msg: string) {
   return c.json({ code: status, msg }, status);
+}
+
+/**
+ * 当前实际生效的配置。maxFileSize / defaultExpireDays 走 resolveLimits，
+ * 保证接口回报的值与上传时真正使用的值一致（DB 设置优先于 wrangler vars）。
+ */
+async function effectiveConfig(c: Context<Bindings>) {
+  const limits = await resolveLimits(c.env);
+  return {
+    openUpload: (await getSetting(c.env.DB, 'open_upload')) ?? '1',
+    maxFileSize: String(limits.maxSize),
+    defaultExpireDays: String(limits.defaultExpireDays),
+  };
 }
 
 // ===================== 上传门控 =====================
@@ -187,12 +200,7 @@ adminApi.delete('/file/delete', async (c) => {
 });
 
 adminApi.get('/config/get', async (c) => {
-  const env = c.env;
-  return ok(c, {
-    openUpload: (await getSetting(env.DB, 'open_upload')) ?? '1',
-    maxFileSize: (await getSetting(env.DB, 'max_file_size')) ?? env.MAX_FILE_SIZE,
-    defaultExpireDays: (await getSetting(env.DB, 'default_expire_days')) ?? env.DEFAULT_EXPIRE_DAYS,
-  });
+  return ok(c, await effectiveConfig(c));
 });
 
 adminApi.patch('/config/update', async (c) => {
@@ -204,11 +212,7 @@ adminApi.patch('/config/update', async (c) => {
   if (body.maxFileSize !== undefined) await setSetting(env.DB, 'max_file_size', String(body.maxFileSize));
   if (body.defaultExpireDays !== undefined) await setSetting(env.DB, 'default_expire_days', String(body.defaultExpireDays));
 
-  return ok(c, {
-    openUpload: (await getSetting(env.DB, 'open_upload')) ?? '1',
-    maxFileSize: (await getSetting(env.DB, 'max_file_size')) ?? env.MAX_FILE_SIZE,
-    defaultExpireDays: (await getSetting(env.DB, 'default_expire_days')) ?? env.DEFAULT_EXPIRE_DAYS,
-  });
+  return ok(c, await effectiveConfig(c));
 });
 
 api.route('/admin', adminApi);

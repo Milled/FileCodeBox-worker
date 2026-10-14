@@ -14,7 +14,36 @@ import {
   incrementDownload,
   releaseCode,
   checkRateLimit,
+  getSetting,
 } from './db';
+
+// ===================== 运行时上限 =====================
+
+/** 25MB，与 wrangler.jsonc 的 MAX_FILE_SIZE 默认值一致 */
+const FALLBACK_MAX_FILE_SIZE = 26214400;
+const FALLBACK_EXPIRE_DAYS = 7;
+
+/**
+ * 解析当前生效的文件大小上限与默认过期天数。
+ * 管理员后台 PATCH /api/admin/config/update 写入 fc_settings 的值优先于 wrangler vars，
+ * 两者都缺失或非法（非正整数）时回退到内置默认，避免 NaN 导致校验被绕过。
+ */
+export async function resolveLimits(env: Env): Promise<{ maxSize: number; defaultExpireDays: number }> {
+  const positiveInt = (v: string | null | undefined): number => {
+    const n = parseInt(v ?? '', 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+
+  const [dbMaxSize, dbExpireDays] = await Promise.all([
+    getSetting(env.DB, 'max_file_size'),
+    getSetting(env.DB, 'default_expire_days'),
+  ]);
+
+  return {
+    maxSize: positiveInt(dbMaxSize) || positiveInt(env.MAX_FILE_SIZE) || FALLBACK_MAX_FILE_SIZE,
+    defaultExpireDays: positiveInt(dbExpireDays) || positiveInt(env.DEFAULT_EXPIRE_DAYS) || FALLBACK_EXPIRE_DAYS,
+  };
+}
 
 // ===================== 过期策略 =====================
 
@@ -80,11 +109,12 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   }
 
   const rawCode = (c.req.query('code') || '').trim();
+  const limits = await resolveLimits(env);
   // 兼容旧参数名 (expire_days/max_downloads) 和新参数名 (expire_value/expire_style)
-  const expireValueRaw = c.req.query('expire_value') || c.req.query('expire_days') || env.DEFAULT_EXPIRE_DAYS || '7';
+  const expireValueRaw = c.req.query('expire_value') || c.req.query('expire_days') || String(limits.defaultExpireDays);
   const expireStyleRaw = c.req.query('expire_style') || 'day';
   const maxDownloadsRaw = c.req.query('max_downloads') || '-1';
-  const safeExpireValue = Number.isFinite(parseInt(expireValueRaw)) ? parseInt(expireValueRaw) : parseInt(env.DEFAULT_EXPIRE_DAYS || '7');
+  const safeExpireValue = Number.isFinite(parseInt(expireValueRaw)) ? parseInt(expireValueRaw) : limits.defaultExpireDays;
   const safeMaxDownloads = Number.isFinite(parseInt(maxDownloadsRaw)) ? parseInt(maxDownloadsRaw) : -1;
   // decodeURIComponent 可能因非法 URI 编码抛 URIError，失败时回退到原始头值；
   // 先解码再截断，避免截断处切开多字节转义序列导致解码失败
@@ -97,7 +127,7 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   filename = filename.slice(0, 200);
   const mimeType = c.req.header('Content-Type') || 'application/octet-stream';
 
-  const maxSize = parseInt(env.MAX_FILE_SIZE || '104857600');
+  const maxSize = limits.maxSize;
 
   // Content-Length 预检：超限直接拒绝，避免读入大请求体占用内存；
   // 头部缺失时（如 chunked）回退到读取后校验
@@ -190,11 +220,13 @@ export async function uploadText(
   if (textSize > 512 * 1024) throw { status: 400 as const, message: '文本过长，最大支持 512KB' };
 
   const rawCode = typeof body['code'] === 'string' ? body['code'] : '';
+  const limits = await resolveLimits(env);
+  const expireDefault = String(limits.defaultExpireDays);
   const expireValueRaw = typeof body['expire_value'] === 'string' ? body['expire_value'] :
-                         typeof body['expire_days'] === 'string' ? body['expire_days'] : env.DEFAULT_EXPIRE_DAYS || '7';
+                         typeof body['expire_days'] === 'string' ? body['expire_days'] : expireDefault;
   const expireStyleRaw = typeof body['expire_style'] === 'string' ? body['expire_style'] : 'day';
   const maxDownloadsRaw = typeof body['max_downloads'] === 'string' ? body['max_downloads'] : '-1';
-  const safeExpireValue = Number.isFinite(parseInt(expireValueRaw)) ? parseInt(expireValueRaw) : parseInt(env.DEFAULT_EXPIRE_DAYS || '7');
+  const safeExpireValue = Number.isFinite(parseInt(expireValueRaw)) ? parseInt(expireValueRaw) : limits.defaultExpireDays;
   const safeMaxDownloads = Number.isFinite(parseInt(maxDownloadsRaw)) ? parseInt(maxDownloadsRaw) : -1;
 
   const code = await ensureCodeAvailable(rawCode, env);

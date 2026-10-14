@@ -6,7 +6,7 @@
 
 ## ✨ 功能
 
-- 📤 **上传文件** — 获取 4 位纯数字取件码，存入 R2 对象存储（最大 100MB）
+- 📤 **上传文件** — 获取 4 位纯数字取件码，存入 R2 对象存储（上限可配置，见[上传大小与过期配置](#上传大小与过期配置)）
 - 📝 **文本分享** — 粘贴文本即可生成分享链接，页面内直接查看
 - 📥 **取件下载** — 输入取件码下载文件或查看文本
 - 🔐 **管理面板** — 查看/删除/清理文件，登录速率限制
@@ -45,59 +45,76 @@ wrangler login
 #### 3. 克隆项目 & 安装依赖
 
 ```bash
-git clone https://github.com/jeio258/FileCodeBox-worker.git
+git clone https://github.com/Milled/FileCodeBox-worker.git
 cd FileCodeBox-worker
 npm install
 ```
 
-#### 4. 创建云资源
+#### 4. 自动开通 D1 与 R2
+
+`wrangler deploy` 本身不会创建云资源，本仓库提供 `npm run provision` 幂等地完成创建与绑定：
 
 ```bash
-# 创建 R2 存储桶
-wrangler r2 bucket create filecodebox
-
-# 创建 D1 数据库
-wrangler d1 create filecodebox-db
-# 返回类似: database_id = "def456..."  ← 记下来
+npm run provision
 ```
 
-#### 5. 配置 wrangler.jsonc
+脚本按 `wrangler.jsonc` 里声明的资源名执行：
 
-将上一步获得的 D1 ID 填入 `wrangler.jsonc`：
+1. 检查 `wrangler whoami` 登录状态（未登录会提示先 `wrangler login`）
+2. 存在 `filecodebox-db` 就复用，不存在则 `wrangler d1 create`
+3. 存在 `filecodebox-file` 就复用，不存在则 `wrangler r2 bucket create`
+4. 把返回的 `database_id` 回填进 `wrangler.jsonc`（正则改写，保留注释）
+
+可选参数：
+
+```bash
+npm run provision -- --dry-run        # 只报告将要执行的动作，不创建、不写文件
+npm run provision -- --location=apac  # 指定 D1 主位置，跳过 wrangler 的位置询问
+```
+
+想换资源名或 Worker 名，直接改 `wrangler.jsonc` 后重跑 `npm run provision`：
 
 ```jsonc
 {
-  "r2_buckets": [
-    { "binding": "FILE_STORE", "bucket_name": "filecodebox" }
-  ],
-  "d1_databases": [
-    { "binding": "DB", "database_name": "filecodebox-db", "database_id": "你的D1_ID" }
-  ],
-  "vars": {
-    "MAX_FILE_SIZE": "104857600",
-    "DEFAULT_EXPIRE_DAYS": "7"
-  }
+  "name": "filecodebox",              // 同一账号内必须唯一，冲突时改名
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "filecodebox-db",
+    "database_id": ""                 // 留空即可，由 provision 回填
+  }],
+  "r2_buckets": [{
+    "binding": "FILE_STORE",
+    "bucket_name": "filecodebox-file"
+  }]
 }
 ```
 
-#### 6. 设置管理员密码（Secret，不写入配置）
+> - 配置中**不写 `account_id`**，wrangler 会使用 `wrangler login` 的当前账号（多账号时交互式选择）。
+> - 若 wrangler 创建 D1 后询问「是否写入配置文件」，请选 **No**：由脚本回填，否则会追加一条重复的 `binding = DB` 导致部署失败。
+> - R2 需在 Cloudflare 控制台首次接受服务条款后才能通过 API 创建，否则创建存储桶这一步会失败并给出提示。
+
+#### 5. 设置管理员密码（Secret，不写入配置）
 
 ```bash
 wrangler secret put ADMIN_PASSWORD
 # 输入你的管理员密码
 ```
 
-#### 7. 部署
+未设置该 Secret 时，后台登录会被拒绝并提示「未配置管理员密码」。
+
+#### 6. 部署
 
 ```bash
 npm run deploy
 ```
 
-首次部署后访问 `/api/init` 初始化数据库表。
+表结构会在首次 Cron 触发（每 30 分钟）时自动幂等创建；如需立即建表，登录后台后访问 `/api/init`。
 
 ---
 
-### 方式二：Cloudflare Dashboard Git 集成（自动部署）
+### 方式二：Cloudflare Dashboard Git 集成（推送自动部署）
+
+> Git 集成只负责构建和发布，**同样不会创建 D1 / R2**。请先在本地跑一次 `npm run provision`（方式一第 4 步）把资源和 `database_id` 准备好，再连接仓库。
 
 #### 1. Fork 本项目到自己的 GitHub
 
@@ -114,16 +131,26 @@ npm run deploy
 部署后进入项目 **Settings** → **Bindings**：
 
 **R2 存储桶绑定：**
+
 | Binding | 说明 |
 |---------|------|
-| `FILE_STORE` | 新建一个 R2 存储桶，命名为 `filecodebox` |
+| `FILE_STORE` | 选择已有的 R2 存储桶，默认名称 `filecodebox-file` |
 
 **D1 数据库绑定：**
+
 | Binding | 数据库 |
 |---------|--------|
-| `DB` | 新建一个 D1 数据库（命名为 `filecodebox-db`）|
+| `DB` | 选择已有的 D1 数据库，默认名称 `filecodebox-db` |
+
+**Vars（非 Secret）：**
+
+| 变量 | 说明 |
+|------|------|
+| `MAX_FILE_SIZE` | 单文件上限（字节），默认 `26214400` |
+| `DEFAULT_EXPIRE_DAYS` | 默认过期天数，默认 `7` |
 
 **Secret（管理员密码）：**
+
 | Secret | 说明 |
 |--------|------|
 | `ADMIN_PASSWORD` | 你的管理员密码 |
@@ -134,7 +161,7 @@ npm run deploy
 
 #### 5. 初始化数据库
 
-部署成功后，访问 `https://你的域名/api/init` 初始化数据库表，返回 `{"ok":true}` 即成功。
+登录后台后访问 `https://你的域名/api/init`，返回 `{"ok":true}` 即成功；该接口需要管理员身份，未登录会返回 401。若不主动调用，Cron 也会在 30 分钟内自动建表。
 
 ---
 
@@ -160,25 +187,25 @@ Pages 项目 → **Custom domains** → 添加你的域名（需 DNS 已托管�
 
 ### FileCodeBox 兼容 API（v2.1.0）
 
-兼容 [FileCodeBox API v2.1.0](https://fcb-docs.aiuo.net/api/)，统一响应格式 `{ code, msg, detail }`。
+兼容 [FileCodeBox API v2.1.0](https://fcb-docs.aiuo.net/api/)，统一响应格式 `{ code, msg, detail }`。整套兼容 API 挂载在 `/api` 前缀下（`src/api.ts` 注册、`src/index.ts` 中 `app.route('/api', api)`），因此实际路径是 `/api/share/file`、`/api/admin/dashboard` 等；带与不带结尾斜杠两种写法都已注册。
 
 #### 分享接口（默认免登录，可配置关闭）
 
 ```bash
 # 上传文件
-curl -X POST "https://你的域名/share/file/?expire_value=1&expire_style=day" \
+curl -X POST "https://你的域名/api/share/file/?expire_value=1&expire_style=day" \
   -H "X-Filename: example.txt" \
   --data-binary @example.txt
 
 # 分享文本（表单）
-curl -X POST "https://你的域名/share/text/" \
+curl -X POST "https://你的域名/api/share/text/" \
   -F "text=要分享的内容" -F "expire_value=1" -F "expire_style=day"
 
 # 获取文件信息
-curl "https://你的域名/share/select/?code=1234"
+curl "https://你的域名/api/share/select/?code=1234"
 
 # 下载文件
-curl "https://你的域名/share/download?code=1234"
+curl "https://你的域名/api/share/download?code=1234"
 ```
 
 **expire_style** 支持：`day` / `hour` / `minute` / `count`（限下载次数）/ `forever`
@@ -187,32 +214,32 @@ curl "https://你的域名/share/download?code=1234"
 
 ```bash
 # 登录获取 token（JSON 响应）
-curl -X POST "https://你的域名/admin/login" \
+curl -X POST "https://你的域名/api/admin/login" \
   -H "Content-Type: application/json" \
   -d '{"password":"你的密码"}'
 # 返回 { code: 200, msg: "success", detail: { token: "xxx", token_type: "Bearer" } }
 
 # 仪表盘
-curl "https://你的域名/admin/dashboard" \
+curl "https://你的域名/api/admin/dashboard" \
   -H "Authorization: Bearer <token>"
 
 # 文件列表（分页 + 关键词搜索）
-curl "https://你的域名/admin/file/list?page=1&size=10&keyword=xxx" \
+curl "https://你的域名/api/admin/file/list?page=1&size=10&keyword=xxx" \
   -H "Authorization: Bearer <token>"
 
 # 删除文件
-curl -X DELETE "https://你的域名/admin/file/delete?id=123" \
+curl -X DELETE "https://你的域名/api/admin/file/delete?id=123" \
   -H "Authorization: Bearer <token>"
 
-# 获取配置
-curl "https://你的域名/admin/config/get" \
+# 获取配置（返回当前实际生效的值）
+curl "https://你的域名/api/admin/config/get" \
   -H "Authorization: Bearer <token>"
 
 # 更新配置（PATCH）
-curl -X PATCH "https://你的域名/admin/config/update" \
+curl -X PATCH "https://你的域名/api/admin/config/update" \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"openUpload":"1","maxFileSize":"104857600","defaultExpireDays":"7"}'
+  -d '{"openUpload":"1","maxFileSize":"26214400","defaultExpireDays":"7"}'
 ```
 
 ---
@@ -222,20 +249,28 @@ curl -X PATCH "https://你的域名/admin/config/update" \
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/` | 首页（上传 + 取件）|
-| GET | `/r/:code` | 取件页（文件详情/文本查看）|
+| GET | `/r` | 取件页；带 `?code=1234` 时 302 跳到 `/r/1234` |
+| GET | `/r/:code` | 取件页（文件详情 / 文本查看）|
 | POST | `/api/upload` | 文件上传（XHR，返回 JSON `{code, filename, size}`）|
 | POST | `/api/upload/text` | 文本上传（表单，返回 HTML 结果页）|
-| GET | `/api/text/:code` | 获取文本内容 |
-| GET | `/api/download/:code` | 下载文件（带 Content-Disposition）|
+| GET | `/api/text/:code` | 获取文本内容（纯文本）|
+| GET / HEAD | `/api/download/:code` | 下载文件（带 Content-Disposition）|
 | GET | `/api/info/:code` | 文件信息（JSON）|
+| GET | `/qrcode/:code` | 取件链接二维码（GIF）|
+| GET | `/static/style.css` | 样式表（immutable 长缓存）|
+| GET | `/static/bg.webp` | 背景图，需自行上传到 R2 根目录，否则 404 |
 | GET | `/admin` | 管理面板（受保护）|
-| POST | `/api/admin/login` | 管理员登录（表单，302 重定向）|
-| GET | `/api/admin/logout` | 管理员登出 |
-| POST | `/api/admin/delete/:id` | 删除文件（表单）|
-| POST | `/api/admin/cleanup` | 手动清理过期文件 |
-| GET | `/api/init` | 初始化数据库表 |
+| POST | `/admin/login` | 管理员登录（HTML 表单，成功后 302 到 `/admin`）|
+| GET | `/admin/logout` | 管理员登出（清除 Cookie 与 DB token）|
+| POST | `/admin/delete/:id` | 删除文件（表单，按数据库 id）|
+| POST | `/admin/cleanup` | 手动清理过期文件 |
+| GET | `/api/init` | 幂等建表（需管理员身份，未登录返回 401）|
+| GET | `/console` | 兼容旧路径，302 到 `/admin` |
+| GET | `/api/console/logout` | 兼容旧路径，302 到 `/admin/logout` |
 
-> **注意**：`/api/admin/login`（表单）与 `/admin/login`（JSON API）是两套不同的登录入口，分别用于浏览器页面和程序调用。
+> - 登录入口有两套：`/admin/login` 是浏览器表单（302 重定向），`/api/admin/login` 是 JSON API（返回 Bearer token）。
+> - 未匹配的 `/api/*` 返回 `{"code":404,"msg":"Not Found"}`，其余任意路径兜底渲染首页。
+> - `openUpload` 开关只拦截 `/api/share/*` 兼容接口，首页的 `/api/upload`、`/api/upload/text` 不受该开关限制。
 
 ---
 
@@ -246,6 +281,25 @@ curl -X PATCH "https://你的域名/admin/config/update" \
 | 首页 | `/` | 上传文件 + 文本分享 + 取件码输入 |
 | 取件 | `/r/1234` | 文件详情 / 文本查看 + 下载 |
 | 管理 | `/admin` | 管理员登录 |
+
+### 本地开发与测试
+
+```bash
+npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
+npm test             # Playwright 无头浏览器跑完整取件流程，默认打本地
+npm run typecheck    # tsc --noEmit
+```
+
+- 本地测试线上环境：`BASE_URL=https://你的域名 npm test`（会真实写入该环境的 D1 / R2）
+- 若 `wrangler dev` 因 `database_id` 为空报错，先跑一次 `npm run provision` 完成回填
+
+### 背景图（可选）
+
+页面背景由 Worker 从 R2 根目录读取 `bg.webp`，未上传时 `/static/bg.webp` 返回 404（页面仍可用）。自定义背景：
+
+```bash
+npx wrangler r2 object put filecodebox-file/bg.webp --file=./bg.webp --content-type=image/webp
+```
 
 ### Cron 定时清理
 
@@ -259,27 +313,54 @@ curl -X PATCH "https://你的域名/admin/config/update" \
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `ADMIN_PASSWORD` | - | 管理员密码（**Secret**，`wrangler secret put` 设置） |
-| `MAX_FILE_SIZE` | `104857600` | 最大文件大小 (100MB) |
-| `DEFAULT_EXPIRE_DAYS` | `7` | 默认过期天数 |
+| `ADMIN_PASSWORD` | - | 管理员密码（**Secret**，`wrangler secret put` 设置；未设置时无法登录后台） |
+| `MAX_FILE_SIZE` | `26214400` | 单文件上限（字节），即 25MB；写在 `wrangler.jsonc` 的 `vars` 中 |
+| `DEFAULT_EXPIRE_DAYS` | `7` | 未指定过期参数时的默认天数 |
+
+## 上传大小与过期配置
+
+上限**不写死在代码里**，按以下优先级解析（见 `src/shared.ts` 的 `resolveLimits()`）：
+
+1. 数据库 `fc_settings` 中管理员后台写入的值 —— `PATCH /api/admin/config/update`
+   ```json
+   { "maxFileSize": "52428800", "defaultExpireDays": "30", "openUpload": "1" }
+   ```
+2. `wrangler.jsonc` 的 `vars`（或 Dashboard 里的 Vars）—— `MAX_FILE_SIZE` / `DEFAULT_EXPIRE_DAYS`
+3. 内置兜底 —— 25MB / 7 天
+
+非正整数或无法解析的值会被忽略并落到下一级，避免出现 `NaN` 绕过校验。`GET /api/admin/config/get` 返回的是**实际生效值**，不是原始配置。
+
+修改方式：
+
+| 场景 | 做法 |
+|------|------|
+| 长期默认值 | 改 `wrangler.jsonc` 的 `vars.MAX_FILE_SIZE` 后 `npm run deploy` |
+| 部署后随时调整 | `PATCH /api/admin/config/update`（需 Bearer token，立即生效，无需重新部署） |
+
+直接改数据库也可以：`npx wrangler d1 execute filecodebox-db --remote --command "INSERT OR REPLACE INTO fc_settings(key,value) VALUES('max_file_size','52428800')"`。
+
+另外两处独立限制：文本分享正文最大 512KB（`src/shared.ts`），单 IP 上传限流 10 次 / 60 秒（`checkRateLimit`）。
 
 ## 📁 项目结构
 
 ```
 FileCodeBox-worker/
 ├── src/
-│   ├── index.ts               # 主程序 — Web UI 路由
+│   ├── index.ts               # 主程序 — Web UI 路由 + Cron 清理
 │   ├── api.ts                 # FileCodeBox v2.1.0 兼容 API
-│   ├── shared.ts              # 共享业务逻辑（上传/下载/过期/取件码，单一数据源）
+│   ├── shared.ts              # 共享业务逻辑（上传/下载/过期/取件码/生效上限，单一数据源）
 │   ├── auth.ts                # 认证: 登录/登出/速率限制
-│   ├── db.ts                  # 数据库: 增删改查 + 限流
+│   ├── db.ts                  # 数据库: 增删改查 + 取件码抢占 + 限流 + 清理
+│   ├── qr.ts                  # 二维码 GIF 封装
 │   ├── types.ts               # 类型定义
-│   ├── utils.ts               # 工具: 取件码/哈希/IP 提取
+│   ├── utils.ts               # 工具: 取件码/哈希/IP 提取/HTML 转义
 │   └── templates/
 │       ├── layout.ts          # HTML 布局
 │       ├── style.ts           # 暖纸墨色设计系统 CSS
 │       └── pages.ts           # 页面模板
-├── wrangler.jsonc             # Cloudflare 配置
+├── scripts/
+│   └── provision.mjs          # 自动创建 D1 / R2 并回填 database_id
+├── wrangler.jsonc             # Cloudflare 配置（资源名在此声明）
 ├── tsconfig.json
 └── package.json
 ```
@@ -291,6 +372,8 @@ FileCodeBox-worker/
 - **上传实现**：`arrayBuffer()` 一次性读取请求体（body 只能消费一次），计算大小后转 `Blob` 流写入 R2
 - **下载计数**：`incrementDownload` 原子更新，避免并发超限
 - **过期清理**：Cron 每 30 分钟触发 `cleanupExpired`，并发删除 R2 + DB 记录
+- **配置生效层**：后台 DB 设置 > wrangler vars > 内置兜底，由 `resolveLimits()` 统一解析，避免接口回报值与实际执行值不一致
+- **资源绑定**：`wrangler.jsonc` 只声明资源名称，`database_id` 由 `npm run provision` 创建后回填，配置里不含任何账号 ID
 
 ## 🔧 技术栈
 
