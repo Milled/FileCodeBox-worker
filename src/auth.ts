@@ -2,7 +2,7 @@ import type { Context } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from './types';
 import { hashPassword } from './utils';
-import { getSetting, setSetting, checkLoginRateLimit } from './db';
+import { getSetting, setSetting, checkRateLimit } from './db';
 
 /** 启动时计算一次管理员密码哈希，避免每次登录重复 PBKDF2 */
 let cachedSecretHash: string | null = null;
@@ -71,7 +71,7 @@ export async function handleAdminLogin(
     c.req.header('x-real-ip') ||
     c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
     'unknown';
-  if (!(await checkLoginRateLimit(env.DB, ip))) {
+  if (!(await checkRateLimit(env.DB, 'login_ratelimit', ip, 5))) {
     return { success: false, error: '尝试次数过多，请稍后再试' };
   }
 
@@ -96,10 +96,8 @@ export async function handleAdminLogin(
 }
 
 /** 管理员登出 */
-export function handleAdminLogout(c: Context, env: Env): void {
+export async function handleAdminLogout(c: Context, env: Env): Promise<void> {
   deleteCookie(c, 'admin_token', { path: '/' });
   // 同时清除 DB 中的 token，防止已泄露的 token 仍可登录
-  try {
-    setSetting(env.DB, 'admin_token', '');
-  } catch { /* ignore */ }
+  await setSetting(env.DB, 'admin_token', '').catch(() => {});
 }

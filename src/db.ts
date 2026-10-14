@@ -148,14 +148,13 @@ export async function deleteFileRecord(
   const file = await getFileById(db, id);
   if (file) {
     await db.prepare('DELETE FROM fc_files WHERE id = ?').bind(id).run();
-    // 释放取件码，允许复用
     await releaseCode(db, file.code);
   }
   return file;
 }
 
 /**
- * 清理 fc_used_codes 中已无对应活跃文件的记录。
+ * 清理 fc_used_codes 中已无对应文件的记录（含已过期未清理的）。
  * 作为防御性清理：若某次删除中途失败导致 releaseCode 未执行，
  * 此函数可在下次 scheduled 时补清，防止取件码被永久占用。
  */
@@ -165,9 +164,6 @@ export async function cleanupUsedCodes(db: D1Database): Promise<number> {
       DELETE FROM fc_used_codes
       WHERE code NOT IN (
         SELECT code FROM fc_files
-        UNION
-        SELECT code FROM fc_files
-          WHERE datetime(expire_at) <= datetime('now')
       )
     `)
     .run();
@@ -175,47 +171,6 @@ export async function cleanupUsedCodes(db: D1Database): Promise<number> {
 }
 
 // ---- 分页 ----
-
-const PAGE_SIZE = 50;
-
-export async function listFiles(
-  db: D1Database,
-  page: number,
-): Promise<{ files: FileRecord[]; total: number }> {
-  const offset = (page - 1) * PAGE_SIZE;
-  const [rows, countRow] = await Promise.all([
-    db
-      .prepare('SELECT * FROM fc_files ORDER BY id DESC LIMIT ? OFFSET ?')
-      .bind(PAGE_SIZE, offset)
-      .all<FileRecord>(),
-    db.prepare('SELECT COUNT(*) as count FROM fc_files').first<{ count: number }>(),
-  ]);
-  return { files: rows.results ?? [], total: countRow?.count ?? 0 };
-}
-
-/** API 用：分页 + 关键词搜索 */
-export async function listFilesWithSearch(
-  db: D1Database,
-  page: number,
-  size: number,
-  keyword: string,
-): Promise<{ files: FileRecord[]; total: number }> {
-  const offset = (page - 1) * size;
-  const kw = keyword.trim();
-  const where = kw ? 'WHERE filename LIKE ?' : '';
-  const bindArgs: string[] = kw ? [`%${kw}%`] : [];
-  const [rows, countRow] = await Promise.all([
-    db
-      .prepare(`SELECT * FROM fc_files ${where} ORDER BY id DESC LIMIT ? OFFSET ?`)
-      .bind(...bindArgs, size, offset)
-      .all<FileRecord>(),
-    db
-      .prepare(`SELECT COUNT(*) as count FROM fc_files ${where}`)
-      .bind(...bindArgs)
-      .first<{ count: number }>(),
-  ]);
-  return { files: rows.results ?? [], total: countRow?.count ?? 0 };
-}
 
 /**
  * 分页 + 高级筛选（关键词 / 日期范围 / 排序）
@@ -314,14 +269,16 @@ export async function cleanupExpired(
   const files = expired.results ?? [];
   if (files.length === 0) return { expiredCount: 0, cleanedCodes: 0 };
 
-  // 并发删除 R2 对象，避免串行等待
-  await Promise.all(files.map((f) => bucket.delete(`file:${f.code}`)));
+  // 批量删除 R2 对象（每批最多 1000 键），避免逐个请求的 RTT
+  const keys = files.map((f) => `file:${f.code}`);
+  for (let i = 0; i < keys.length; i += 1000) {
+    await bucket.delete(keys.slice(i, i + 1000));
+  }
 
   // 先删记录，再释放取件码（并行执行，释放顺序不影响结果）
   await db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')").run();
   await Promise.all(files.map((f) => releaseCode(db, f.code)));
 
-  // 防御性清理：删除 fc_used_codes 中所有无对应文件（含已过期）的记录
   const cleanedCodes = await cleanupUsedCodes(db);
 
   return { expiredCount: files.length, cleanedCodes };
@@ -351,24 +308,22 @@ export async function setSetting(
     .run();
 }
 
-// ---- 登录速率限制（D1 存储） ----
+// ---- 速率限制（D1 存储） ----
 
-const LOGIN_RATE_WINDOW = 60_000; // 60 秒窗口
-const LOGIN_RATE_MAX = 5;          // 窗口内最大尝试次数
-
-const UPLOAD_RATE_WINDOW = 60_000; // 60 秒窗口
-const UPLOAD_RATE_MAX = 10;        // 窗口内最大上传次数
+const RATE_WINDOW = 60_000; // 60 秒窗口
 
 /**
- * 检查并记录登录尝试。返回 true 表示允许继续，false 表示已限流。
- * 关键：无论是否通过，只要窗口未过期都会递增计数并刷新时间戳，
+ * 检查并记录某类限流计数（登录/上传共用）。返回 true 表示允许继续，false 表示已限流。
+ * 关键：无论是否通过，只要窗口未过期都会递增计数，
  *       防止攻击者在窗口重置后获得额外尝试次数。
  */
-export async function checkLoginRateLimit(
+export async function checkRateLimit(
   db: D1Database,
+  keyPrefix: string,
   ip: string,
+  max: number,
 ): Promise<boolean> {
-  const key = `login_ratelimit:${ip}`;
+  const key = `${keyPrefix}:${ip}`;
   const now = Date.now();
   const raw = await getSetting(db, key);
 
@@ -377,50 +332,44 @@ export async function checkLoginRateLimit(
   if (raw) {
     try {
       const parsed = JSON.parse(raw) as { count: number; windowStart: number };
-      if (now - parsed.windowStart < LOGIN_RATE_WINDOW) {
+      if (now - parsed.windowStart < RATE_WINDOW) {
         count = parsed.count;
         windowStart = parsed.windowStart;
       }
     } catch { /* 损坏则重置 */ }
   }
 
-  // 始终写入（含超限情况），防止窗口被绕过
   const newCount = count + 1;
   await setSetting(db, key, JSON.stringify({ count: newCount, windowStart }));
 
-  return newCount <= LOGIN_RATE_MAX;
+  return newCount <= max;
 }
 
-// ---- 上传速率限制（D1 存储） ----
-
 /**
- * 检查并记录上传尝试。返回 true 表示允许继续，false 表示已限流。
- * 无论是否通过均写入计数，防止窗口被绕过。
+ * 清理已过窗口的限流键，防止 fc_settings 表随访问 IP 无限增长。
+ * 由 scheduled 定期调用；损坏记录一并清除。
  */
-export async function checkUploadRateLimit(
-  db: D1Database,
-  ip: string,
-): Promise<boolean> {
-  const key = `upload_ratelimit:${ip}`;
+export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
+  const rows = await db
+    .prepare(
+      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%'",
+    )
+    .all<{ key: string; value: string }>();
   const now = Date.now();
-  const raw = await getSetting(db, key);
-
-  let count = 0;
-  let windowStart = now;
-  if (raw) {
+  let removed = 0;
+  for (const row of rows.results ?? []) {
     try {
-      const parsed = JSON.parse(raw) as { count: number; windowStart: number };
-      if (now - parsed.windowStart < UPLOAD_RATE_WINDOW) {
-        count = parsed.count;
-        windowStart = parsed.windowStart;
+      const parsed = JSON.parse(row.value) as { windowStart: number };
+      if (now - parsed.windowStart > RATE_WINDOW) {
+        await db.prepare('DELETE FROM fc_settings WHERE key = ?').bind(row.key).run();
+        removed++;
       }
-    } catch { /* 损坏则重置 */ }
+    } catch {
+      await db.prepare('DELETE FROM fc_settings WHERE key = ?').bind(row.key).run();
+      removed++;
+    }
   }
-
-  const newCount = count + 1;
-  await setSetting(db, key, JSON.stringify({ count: newCount, windowStart }));
-
-  return newCount <= UPLOAD_RATE_MAX;
+  return removed;
 }
 
 // ---- 孤儿 R2 对象清理 ----

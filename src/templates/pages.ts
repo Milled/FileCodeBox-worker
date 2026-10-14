@@ -30,8 +30,8 @@ export function homePage(): string {
     <div style="font-size:13px;font-weight:500;color:var(--color-ink-2);margin-bottom:10px">上传新内容</div>
 
     <div class="tabs">
-      <button class="tab active" onclick="switchTab('file')">文件</button>
-      <button class="tab" onclick="switchTab('text')">文本</button>
+      <button class="tab active" data-tab="file" onclick="switchTab('file')">文件</button>
+      <button class="tab" data-tab="text" onclick="switchTab('text')">文本</button>
     </div>
 
     <!-- 文件上传面板 -->
@@ -64,7 +64,7 @@ export function homePage(): string {
 
     <script>
     function switchTab(name) {
-      document.querySelectorAll('.tab').forEach(function(t){ t.classList.toggle('active', t.textContent.trim().toLowerCase().includes(name)) });
+      document.querySelectorAll('.tab').forEach(function(t){ t.classList.toggle('active', t.getAttribute('data-tab') === name) });
       document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active') });
       document.getElementById('tab-' + name).classList.add('active');
     }
@@ -205,7 +205,7 @@ function shareRightPanel(code: string, shareUrl: string): string {
         <div class="click-hint">点击复制</div>
       </div>
       <div class="share-divider"></div>
-      <img src="/qrcode/${code}?v=${Date.now()}" alt="QR Code" class="qr-img" loading="lazy">
+      <img src="/qrcode/${code}" alt="QR Code" class="qr-img" loading="lazy">
       <div class="qr-title">扫码快速分享</div>
       <button class="btn btn-secondary share-link-btn" onclick="navigator.clipboard.writeText('${escapeHtml(shareUrl)}')">复制分享链接</button>
     </div>`;
@@ -342,7 +342,7 @@ export function adminLoginPage(error?: string): string {
   const content = `
     <div class="header"><h1>管理员登录</h1><p>FileCodeBox 后台管理</p></div>
     ${error ? `<div style="color:var(--color-danger);text-align:center;margin-bottom:16px;font-size:14px">${error}</div>` : ''}
-    <form action="/api/admin/login" method="post">
+    <form action="/admin/login" method="post">
       <div class="input-group"><label>密码</label><input type="password" name="password" class="input" placeholder="输入管理员密码" required autofocus></div>
       <button type="submit" class="btn btn-primary">登录</button>
     </form>
@@ -386,7 +386,7 @@ export function adminPanel(
         <span class="fmeta">${size}</span>
         <span class="fmeta">${f.download_count}次</span>
         <span class="fmeta">${f.expire_at.slice(0, 10)}</span>
-        <form method="post" action="/api/admin/delete/${f.id}" style="display:inline;margin-left:6px" onsubmit="return confirm('\u786e\u8ba4\u5220\u9664\uff1f')">
+        <form method="post" action="/admin/delete/${f.id}" style="display:inline;margin-left:6px" onsubmit="return confirm('\u786e\u8ba4\u5220\u9664\uff1f')">
           <button type="submit" class="btn-danger" style="background:none;border:none;cursor:pointer">删除</button>
         </form>
       </div>`;
@@ -416,7 +416,7 @@ export function adminPanel(
       </div>
       <div class="header-actions">
         <a href="/">首页</a>
-        <a href="/api/admin/logout">退出</a>
+        <a href="/admin/logout">退出</a>
       </div>
     </div>
     ${error ? `<div style="color:var(--color-danger);text-align:center;margin-bottom:14px;font-size:14px">${error}</div>` : ''}
@@ -444,7 +444,7 @@ export function adminPanel(
     </form>
 
     <div style="margin-bottom:14px">
-      <form method="post" action="/api/admin/cleanup" style="display:inline" onsubmit="return confirm('\u786e\u8ba4\u6e05\u7406\u6240\u6709\u8fc7\u671f\u6587\u4ef6\uff1f')">
+      <form method="post" action="/admin/cleanup" style="display:inline" onsubmit="return confirm('\u786e\u8ba4\u6e05\u7406\u6240\u6709\u8fc7\u671f\u6587\u4ef6\uff1f')">
         <button type="submit" class="btn btn-secondary btn-sm" style="text-decoration:none">清理过期文件</button>
       </form>
     </div>

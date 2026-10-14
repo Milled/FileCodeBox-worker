@@ -17,7 +17,8 @@ export interface FileRecord {
 export interface Env {
   DB: D1Database;
   FILE_STORE: R2Bucket;
-  ADMIN_PASSWORD: string;
+  /** 未配置时登录被拒绝（auth.ts 中已防御） */
+  ADMIN_PASSWORD?: string;
   MAX_FILE_SIZE: string;
   DEFAULT_EXPIRE_DAYS: string;
 }

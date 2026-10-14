@@ -10,7 +10,7 @@ import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env } from './types';
 import { formatFileSize } from './utils';
-import { getFileById, deleteFileRecord, listFilesWithSearch, listFilesAdvanced, getDashboardStats, getSetting, setSetting } from './db';
+import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
 import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile } from './shared';
 
@@ -112,8 +112,8 @@ api.get('/share/download', async (c) => {
 
     return new Response(result.isHead ? null : result.obj?.body, {
       headers: {
-        'Content-Type': result.file.mime_type || 'application/octet-stream',
-        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file.filename)}`,
+        'Content-Type': result.file!.mime_type || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file!.filename)}`,
         'Content-Length': String(result.obj?.size ?? 0),
       },
     });
