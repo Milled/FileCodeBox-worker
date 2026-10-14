@@ -103,7 +103,8 @@ export async function uploadInteractionsSuite(browser) {
 
   // ---- 自定义取件码作用域（历史 bug：会误读页顶取件框） ----
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
-  await fillCodeBoxes(page, '9999');
+  // 页顶取件框只填三位：不足四位不会自动跳转，才能继续验证后面的发件表单
+  await fillCodeBoxes(page, '999');
   await dropFile(page, { name: 'custom.txt', content: '自定义码' });
   await expandExtra(page, '#tab-file');
   const want = randomCode();

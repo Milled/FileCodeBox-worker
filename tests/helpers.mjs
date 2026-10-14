@@ -150,7 +150,8 @@ export async function expandExtra(page, tab = '#tab-file') {
 export async function fillCodeBoxes(page, code, groupId = 'pickupBoxes') {
   const hiddenId = await page.evaluate((g) => document.getElementById(g)?.dataset.codeTarget, groupId);
   const boxes = page.locator(`#${groupId} .code-box`);
-  for (let i = 0; i < 4; i++) await boxes.nth(i).fill(code[i]);
+  const n = await boxes.count();
+  for (let i = 0; i < n; i++) await boxes.nth(i).fill(code[i] ?? '');
   await page.waitForFunction(
     ([id, c]) => document.getElementById(id)?.value === c,
     [hiddenId, code],

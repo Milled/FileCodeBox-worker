@@ -89,9 +89,14 @@ export async function publicUiSuite(browser) {
   s.ok('有效期与最大下载次数各带一个悬浮提示', home.tips.length >= 3 && home.tips.every(Boolean), home.tips.join(' / '));
 
   // 四格输入 → 提交应带出 ?code= 并跳到 /r/码
-  await fillCodeBoxes(light, '9999');
-  await Promise.all([light.waitForNavigation({ url: /\/r\/9999$/, timeout: 15000 }), light.click('.pickup-form button[type="submit"]')]);
-  s.ok('四格取件码可提交并跳转到取件页', light.url().endsWith('/r/9999'), light.url());
+  // 只填码、不点按钮：四位填满即应自动跳转
+  await Promise.all([
+    light.waitForNavigation({ url: /\/r\/9999$/, timeout: 15000 }),
+    fillCodeBoxes(light, '9999'),
+  ]);
+  s.ok('四位填满后自动触发取件（未点按钮）', light.url().endsWith('/r/9999'), light.url());
+  const stillHome = await light.evaluate(() => !!document.querySelector('.pickup-form'));
+  s.ok('取件页不误渲染首页取件表单', !stillHome);
   const boxesAfter = await light.evaluate(() => document.querySelectorAll('#pickupBoxes .code-box').length);
   s.ok('取件页（/r/码）仍可用', boxesAfter === 0, `首页四格在 /r 页不存在：${boxesAfter}`);
 

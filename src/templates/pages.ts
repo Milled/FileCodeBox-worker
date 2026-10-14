@@ -51,6 +51,8 @@ function codeBoxes(o: {
   /** 原生提交的表单需要 name（文本分享）；JS 驱动的文件表单留空 */
   name?: string;
   autofocus?: boolean;
+  /** 填满四位后自动提交所在表单（只给取件组用，发件表单不能自动提交） */
+  autosubmit?: boolean;
   ariaPrefix?: string;
 }): string {
   const aria = o.ariaPrefix || '取件码';
@@ -64,7 +66,7 @@ function codeBoxes(o: {
     )
     .join('\n');
   return `
-      <div class="code-boxes" id="${o.groupId}" data-code-target="${o.hiddenId}">
+      <div class="code-boxes" id="${o.groupId}" data-code-target="${o.hiddenId}"${o.autosubmit ? ' data-autosubmit' : ''}>
 ${boxes}
       </div>
       <input type="hidden"${nameAttr} id="${o.hiddenId}">`;
@@ -91,7 +93,7 @@ export function homePage(opts: HomeOptions = {}): string {
       </div>
     </div>
     <form action="/r" method="get" class="pickup-form" onsubmit="return submitPickup(event)">
-${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', autofocus: true })}
+${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', autofocus: true, autosubmit: true })}
       <button type="submit" class="btn btn-warm btn-auto">取件</button>
     </form>`;
 
@@ -121,6 +123,20 @@ function codeGroupsScript(): string {
       if (!hidden) return;
       hidden.value = boxes.map(function (b) { return b.value; }).join('');
       boxes.forEach(function (b) { b.classList.toggle('filled', !!b.value); });
+      autoSubmitPickup(group, hidden.value);
+    }
+
+    // 四位填满即取件；只认带 data-autosubmit 的那组，发件表单的自定义码不会误触发
+    function autoSubmitPickup(group, value) {
+      if (!group.hasAttribute('data-autosubmit') || !/^\\d{4}$/.test(value)) return;
+      var form = group.closest('form');
+      if (!form || form.dataset.submitting === '1') return;
+      form.dataset.submitting = '1';
+      // 让最后一位数字先渲染出来再跳转
+      setTimeout(function () {
+        if (typeof form.requestSubmit === 'function') form.requestSubmit();
+        else form.submit();
+      }, 120);
     }
 
     function initCodeGroups() {
