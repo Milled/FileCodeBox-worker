@@ -143,11 +143,37 @@ export async function expandExtra(page, tab = '#tab-file') {
   await page.waitForFunction((s) => !!document.querySelector(s)?.open, sel, { timeout: 5000 });
 }
 
-/** 逐位写入四格取件码，并等待其同步进隐藏的 name="code" 字段 */
-export async function fillCodeBoxes(page, code) {
-  const boxes = page.locator('#pickupBoxes .code-box');
+/**
+ * 逐位写入某一组四格取件码，并等待其同步进对应的隐藏字段。
+ * groupId 默认取件那组；发件表单里是 fileCodeBoxes / textCodeBoxes。
+ */
+export async function fillCodeBoxes(page, code, groupId = 'pickupBoxes') {
+  const hiddenId = await page.evaluate((g) => document.getElementById(g)?.dataset.codeTarget, groupId);
+  const boxes = page.locator(`#${groupId} .code-box`);
   for (let i = 0; i < 4; i++) await boxes.nth(i).fill(code[i]);
-  await page.waitForFunction((c) => document.getElementById('pickupCode')?.value === c, code, { timeout: 5000 });
+  await page.waitForFunction(
+    ([id, c]) => document.getElementById(id)?.value === c,
+    [hiddenId, code],
+    { timeout: 5000 },
+  );
+}
+
+/** 悬浮圆圈问号，返回提示气泡是否可见 */
+export async function hoverTip(page, label) {
+  const tip = page.locator(`label:has-text("${label}") .tip`).first();
+  await tip.hover();
+  await page.waitForTimeout(250);
+  return page.evaluate(
+    (l) => {
+      const el = [...document.querySelectorAll('label')]
+        .find((x) => x.textContent.includes(l))
+        ?.querySelector('.tip-bubble');
+      if (!el) return { found: false };
+      const st = getComputedStyle(el);
+      return { found: true, visible: st.visibility === 'visible' && Number(st.opacity) > 0.5, text: el.textContent };
+    },
+    label,
+  );
 }
 
 /** 在页面上下文里请求 JSON（必须走页面，admin_token 是 httpOnly，外部 request 上下文不带） */

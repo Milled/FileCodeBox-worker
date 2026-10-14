@@ -41,85 +41,114 @@ function expireControl(o: {
         </div>`;
 }
 
+/**
+ * 四格分离输入。真实表单字段是末尾那个隐藏 input（name 可选），
+ * 四格只负责输入体验，值由 codeGroupsScript() 同步进去。
+ */
+function codeBoxes(o: {
+  groupId: string;
+  hiddenId: string;
+  /** 原生提交的表单需要 name（文本分享）；JS 驱动的文件表单留空 */
+  name?: string;
+  autofocus?: boolean;
+  ariaPrefix?: string;
+}): string {
+  const aria = o.ariaPrefix || '取件码';
+  const nameAttr = o.name ? ` name="${o.name}"` : '';
+  const boxes = [1, 2, 3, 4]
+    .map(
+      (n) =>
+        `        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off"${
+          o.autofocus && n === 1 ? ' autofocus' : ''
+        } aria-label="${aria}第 ${n} 位">`,
+    )
+    .join('\n');
+  return `
+      <div class="code-boxes" id="${o.groupId}" data-code-target="${o.hiddenId}">
+${boxes}
+      </div>
+      <input type="hidden"${nameAttr} id="${o.hiddenId}">`;
+}
+
+/** 悬浮提示：纯 CSS + tabindex，无需 JS，也不受 CSP 影响 */
+function tip(text: string): string {
+  return `<span class="tip" tabindex="0" role="note" aria-label="${text}">?<span class="tip-bubble" role="tooltip">${text}</span></span>`;
+}
+
 export function homePage(opts: HomeOptions = {}): string {
   const uploadAllowed = opts.uploadAllowed !== false;
   const days = typeof opts.defaultExpireDays === 'number' && opts.defaultExpireDays > 0 ? opts.defaultExpireDays : 7;
 
-  // ① 标题 + 管理入口
-  const titleCard = `
+  // ① 标题 + 管理入口 + 取件
+  const pickupCard = `
     <div class="header">
       <div>
         <h1>FileCodeBox</h1>
-        <p>像取快递一样取文件</p>
+        <p>输入四位取件码取件</p>
       </div>
       <div class="header-actions">
         <a href="/admin">管理</a>
       </div>
-    </div>`;
-
-  // ② 取件：四个分离的取件码格 + 取件按钮
-  const pickupCard = `
+    </div>
     <form action="/r" method="get" class="pickup-form" onsubmit="return submitPickup(event)">
-      <div class="code-boxes" id="pickupBoxes">
-        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" autofocus aria-label="取件码第 1 位">
-        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" aria-label="取件码第 2 位">
-        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" aria-label="取件码第 3 位">
-        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" aria-label="取件码第 4 位">
-      </div>
-      <input type="hidden" name="code" id="pickupCode">
+${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', autofocus: true })}
       <button type="submit" class="btn btn-warm btn-auto">取件</button>
     </form>`;
 
-  // ③ 发件
+  // ② 发件
   const sendCard = `
     ${uploadAllowed ? uploadUi(days) : guestBlockedUi()}
     ${uploadAllowed ? homeScript() : ''}
-    ${pickupScript()}`;
+    ${codeGroupsScript()}`;
 
-  return layout('FileCodeBox', card(titleCard) + card(pickupCard) + card(sendCard));
+  return layout('FileCodeBox', card(pickupCard) + card(sendCard));
 }
 
-/** 四格取件码：自动前进、退格回退、方向键、粘贴分发，合并写入隐藏 name="code" 字段 */
-function pickupScript(): string {
+/**
+ * 四格取件码通用逻辑：自动前进、退格回退、方向键、粘贴分发，
+ * 并把合并值同步进各自的隐藏字段（页面里可能有多组：取件 / 文件 / 文本）。
+ */
+function codeGroupsScript(): string {
   return `
     <script>
-    function pickupBoxes() {
-      return Array.prototype.slice.call(document.querySelectorAll('#pickupBoxes .code-box'));
+    function codeGroupBoxes(group) {
+      return Array.prototype.slice.call(group.querySelectorAll('.code-box'));
     }
 
-    function syncPickup() {
-      var boxes = pickupBoxes();
-      var hidden = document.getElementById('pickupCode');
+    function syncCodeGroup(group) {
+      var boxes = codeGroupBoxes(group);
+      var hidden = document.getElementById(group.getAttribute('data-code-target'));
       if (!hidden) return;
       hidden.value = boxes.map(function (b) { return b.value; }).join('');
       boxes.forEach(function (b) { b.classList.toggle('filled', !!b.value); });
     }
 
-    function initPickup() {
-      var boxes = pickupBoxes();
-      if (!boxes.length) return;
-      boxes.forEach(function (b, i) {
-        b.addEventListener('input', function () {
-          b.value = (b.value || '').replace(/\\D/g, '').slice(-1);
-          if (b.value && i < boxes.length - 1) boxes[i + 1].focus();
-          syncPickup();
-        });
-        b.addEventListener('keydown', function (e) {
-          if (e.key === 'Backspace' && !b.value && i > 0) {
+    function initCodeGroups() {
+      document.querySelectorAll('.code-boxes[data-code-target]').forEach(function (group) {
+        var boxes = codeGroupBoxes(group);
+        boxes.forEach(function (b, i) {
+          b.addEventListener('input', function () {
+            b.value = (b.value || '').replace(/\\D/g, '').slice(-1);
+            if (b.value && i < boxes.length - 1) boxes[i + 1].focus();
+            syncCodeGroup(group);
+          });
+          b.addEventListener('keydown', function (e) {
+            if (e.key === 'Backspace' && !b.value && i > 0) {
+              e.preventDefault();
+              boxes[i - 1].value = '';
+              boxes[i - 1].focus();
+              syncCodeGroup(group);
+            } else if (e.key === 'ArrowLeft' && i > 0) boxes[i - 1].focus();
+            else if (e.key === 'ArrowRight' && i < boxes.length - 1) boxes[i + 1].focus();
+          });
+          b.addEventListener('paste', function (e) {
+            var text = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(/\\D/g, '').slice(0, 4);
+            if (!text) return;
             e.preventDefault();
-            boxes[i - 1].value = '';
-            boxes[i - 1].focus();
-            syncPickup();
-          } else if (e.key === 'ArrowLeft' && i > 0) boxes[i - 1].focus();
-          else if (e.key === 'ArrowRight' && i < boxes.length - 1) boxes[i + 1].focus();
-        });
-        b.addEventListener('paste', function (e) {
-          var text = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(/\\D/g, '').slice(0, 4);
-          if (!text) return;
-          e.preventDefault();
-          text.split('').forEach(function (ch, j) { if (boxes[j]) boxes[j].value = ch; });
-          boxes[Math.min(text.length, boxes.length - 1)].focus();
-          syncPickup();
+            text.split('').forEach(function (ch, j) { if (boxes[j]) boxes[j].value = ch; });
+            boxes[Math.min(text.length, boxes.length - 1)].focus();
+            syncCodeGroup(group);
+          });
         });
       });
     }
@@ -128,7 +157,7 @@ function pickupScript(): string {
       var hidden = document.getElementById('pickupCode');
       if (!hidden || !/^\\d{4}$/.test(hidden.value)) {
         e.preventDefault();
-        var boxes = pickupBoxes();
+        var boxes = document.querySelectorAll('#pickupBoxes .code-box');
         for (var i = 0; i < boxes.length; i++) {
           if (!boxes[i].value) { boxes[i].focus(); break; }
         }
@@ -137,7 +166,7 @@ function pickupScript(): string {
       return true;
     }
 
-    document.addEventListener('DOMContentLoaded', initPickup);
+    document.addEventListener('DOMContentLoaded', initCodeGroups);
     </script>`;
 }
 
@@ -166,17 +195,17 @@ function uploadUi(days: number): string {
           <div class="extra-body">
             <div class="field-row">
               <div class="input-group">
-                <label>有效期</label>
+                <label>有效期 ${tip('有效期后文件将被销毁')}</label>
 ${expireControl({ valueId: 'fileExpireValue', styleId: 'fileExpireStyle', days })}
               </div>
               <div class="input-group">
-                <label>最大下载次数</label>
+                <label>最大下载次数 ${tip('设置为 -1 则不限制次数')}</label>
                 <input type="number" id="fileMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
               </div>
             </div>
             <div class="input-group">
               <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
-              <input type="text" id="fileCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
+${codeBoxes({ groupId: 'fileCodeBoxes', hiddenId: 'fileCode' })}
             </div>
           </div>
         </details>
@@ -192,7 +221,6 @@ ${expireControl({ valueId: 'fileExpireValue', styleId: 'fileExpireStyle', days }
     <div id="tab-text" class="tab-panel">
       <form action="/api/upload/text" method="post" onsubmit="return prepareTextSubmit(event)">
         <div class="input-group">
-          <label>文本内容</label>
           <textarea name="text" id="textInput" class="input" placeholder="粘贴或输入要分享的文本内容…" required oninput="updateTextBytes(this)"></textarea>
           <div class="progress-meta"><span id="textBytes">0 B</span><span>上限 512 KB</span></div>
         </div>
@@ -201,17 +229,17 @@ ${expireControl({ valueId: 'fileExpireValue', styleId: 'fileExpireStyle', days }
           <div class="extra-body">
             <div class="field-row">
               <div class="input-group">
-                <label>有效期</label>
+                <label>有效期 ${tip('有效期后文件将被销毁')}</label>
 ${expireControl({ valueId: 'textExpireValue', styleId: 'textExpireStyle', names: { value: 'expire_value', style: 'expire_style' }, days })}
               </div>
               <div class="input-group">
-                <label>最大查看次数</label>
+                <label>最大查看次数 ${tip('设置为 -1 则不限制次数')}</label>
                 <input type="number" id="textMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
               </div>
             </div>
             <div class="input-group">
               <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
-              <input type="text" id="textCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
+${codeBoxes({ groupId: 'textCodeBoxes', hiddenId: 'textCode', name: 'code' })}
             </div>
           </div>
         </details>

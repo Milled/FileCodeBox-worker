@@ -32,13 +32,6 @@ async function test() {
 
   const results = {};
 
-  // 「额外发件设置」默认折叠，折叠时 Playwright 无法 fill 其中的字段
-  const expandExtra = async (tab) => {
-    const sel = tab + ' details.extra';
-    const open = await page.evaluate((x) => !!document.querySelector(x)?.open, sel);
-    if (!open) await page.click(sel + ' > summary');
-  };
-
   // ===== 1. 首页加载 =====
   console.log('=== 测试 1: 首页加载 ===');
   try {
@@ -70,8 +63,6 @@ async function test() {
     await page.waitForTimeout(500);
     const textContent = '无头浏览器测试文本内容 ' + Date.now();
     await page.fill('#tab-text textarea', textContent);
-    await expandExtra('#tab-text');
-    await page.fill('#tab-text input[name="code"]', '');
     await page.click('#textSubmitBtn');
     await page.waitForLoadState('networkidle', { timeout: 30000 });
     // 等待跳转或结果
@@ -122,8 +113,6 @@ async function test() {
       mimeType: 'text/plain',
       buffer: Buffer.from(testFileContent, 'utf-8'),
     });
-    await expandExtra('#tab-file');
-    await page.fill('#tab-file input[name="code"]', '');
     await page.click('#submitBtn');
     // 等待上传完成（可能有跳转）
     await page.waitForTimeout(5000);

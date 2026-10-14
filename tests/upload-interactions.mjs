@@ -107,7 +107,7 @@ export async function uploadInteractionsSuite(browser) {
   await dropFile(page, { name: 'custom.txt', content: '自定义码' });
   await expandExtra(page, '#tab-file');
   const want = randomCode();
-  await page.fill('#fileCode', want);
+  await fillCodeBoxes(page, want, 'fileCodeBoxes');
   const [navC] = await Promise.all([page.waitForNavigation({ url: /\/r\/\d{4}/ }), page.click('#submitBtn')]);
   s.ok('自定义取件码取自上传表单而非页顶取件框', navC.url().endsWith(`/r/${want}`), navC.url());
 

@@ -1,7 +1,7 @@
 /**
  * 公开页视觉与结构回归：设计 token、深色模式、取件链路、响应式、CSP
  */
-import { BASE, SHOT_DIR, newPage, Suite, dropFile, fillCodeBoxes, rateLimitBreather } from './helpers.mjs';
+import { BASE, SHOT_DIR, newPage, Suite, dropFile, fillCodeBoxes, rateLimitBreather, hoverTip, expandExtra } from './helpers.mjs';
 
 export async function publicUiSuite(browser) {
   const s = new Suite('公开页视觉 / 结构回归');
@@ -52,33 +52,41 @@ export async function publicUiSuite(browser) {
   const html = await light.content();
   s.ok('页面无上游作者署名与个人图床残留', !/jeio258|qlogo|alcy/i.test(html));
 
-  // ---- 首页三卡分区 ----
+  // ---- 首页卡片分区 ----
   const home = await light.evaluate(() => {
     const cards = [...document.querySelectorAll('.container > .card')];
     const mgmt = cards[0]?.querySelector('a[href="/admin"]');
     return {
       cardCount: cards.length,
       gap: cards[1] ? getComputedStyle(cards[1]).marginTop : null,
-      pickupText: (cards[1]?.textContent || '').replace(/\s+/g, '').trim(),
-      pickupLabels: cards[1]?.querySelectorAll('label').length ?? -1,
-      boxes: cards[1]?.querySelectorAll('#pickupBoxes .code-box').length ?? 0,
-      hidden: !!cards[1]?.querySelector('input[name="code"][type="hidden"]'),
+      titleAndPickupTogether: !!cards[0]?.querySelector('.header h1') && !!cards[0]?.querySelector('.pickup-form'),
+      subtitle: cards[0]?.querySelector('.header p')?.textContent?.trim(),
+      pickupLabels: cards[0]?.querySelectorAll('label').length ?? -1,
+      pickupBoxes: cards[0]?.querySelectorAll('#pickupBoxes .code-box').length ?? 0,
       mgmtIsPlainLink: !!mgmt && !/\bbtn\b/.test(mgmt.className || '') && !!mgmt.closest('.header-actions'),
-      sendChooseLabel: [...(cards[2]?.querySelectorAll('label') || [])].some((l) => l.textContent.includes('选择文件')),
+      tabWeight: cards[1] ? getComputedStyle(cards[1].querySelector('.tab')).fontWeight : null,
+      textHasContentLabel: [...(cards[1]?.querySelectorAll('#tab-text label') || [])].some((l) => l.textContent.includes('文本内容')),
+      fileCodeBoxes: cards[1]?.querySelectorAll('#fileCodeBoxes .code-box').length ?? 0,
+      textCodeBoxes: cards[1]?.querySelectorAll('#textCodeBoxes .code-box').length ?? 0,
+      tips: [...(cards[1]?.querySelectorAll('.tip') || [])].map((x) => x.querySelector('.tip-bubble')?.textContent),
+      sendChooseLabel: [...(cards[1]?.querySelectorAll('label') || [])].some((l) => l.textContent.includes('选择文件')),
+      sendSubtitle: cards[1]?.querySelector('.header p')?.textContent?.trim(),
       sendBtnText: document.getElementById('submitBtn')?.textContent?.trim(),
       textBtnText: document.getElementById('textSubmitBtn')?.textContent?.trim(),
       extraClosed: document.querySelector('#tab-file details.extra')?.open === false,
     };
   });
-  s.ok('首页拆成三张卡片且有间距', home.cardCount === 3 && parseFloat(home.gap) > 0, `${home.cardCount} 张，间距 ${home.gap}`);
-  s.ok('取件卡只剩四格与按钮', home.pickupLabels === 0 && home.pickupText === '取件', `文本="${home.pickupText}" label=${home.pickupLabels}`);
-  s.ok('取件码为四个分离输入格且同步到隐藏字段', home.boxes === 4 && home.hidden, `格子=${home.boxes} hidden=${home.hidden}`);
-  s.ok('管理入口保持普通文字链接（未改成按钮）', home.mgmtIsPlainLink);
-  s.ok('发件卡去掉「选择文件」描述', !home.sendChooseLabel, `可见 label 命中=${home.sendChooseLabel}`);
-  s.ok('文件与文本两个发件按钮文案一致',
-    home.sendBtnText === '发件并获取取件码' && home.textBtnText === '发件并获取取件码',
-    `文件=${home.sendBtnText} 文本=${home.textBtnText}`);
-  s.ok('额外发件设置默认折叠', home.extraClosed);
+  s.ok('首页为两张卡片且有间距', home.cardCount === 2 && parseFloat(home.gap) > 0, `${home.cardCount} 张，间距 ${home.gap}`);
+  s.ok('标题、管理与取件同在一张卡', home.titleAndPickupTogether && home.pickupLabels === 0, `label=${home.pickupLabels}`);
+  s.ok('取件卡副标题为「输入四位取件码取件」', home.subtitle === '输入四位取件码取件', home.subtitle);
+  s.ok('发件卡没有副标题', home.sendSubtitle === undefined, String(home.sendSubtitle));
+  s.ok('取件为四个分离输入格', home.pickupBoxes === 4, `格子=${home.pickupBoxes}`);
+  s.ok('文件/文本切换按钮为加粗', Number(home.tabWeight) >= 600, `font-weight=${home.tabWeight}`);
+  s.ok('文本面板无「文本内容」描述', !home.textHasContentLabel);
+  s.ok('发件卡去掉「选择文件」描述', !home.sendChooseLabel);
+  s.ok('文件与文本表单的自定义取件码都是四格', home.fileCodeBoxes === 4 && home.textCodeBoxes === 4,
+    `文件=${home.fileCodeBoxes} 文本=${home.textCodeBoxes}`);
+  s.ok('有效期与最大下载次数各带一个悬浮提示', home.tips.length >= 3 && home.tips.every(Boolean), home.tips.join(' / '));
 
   // 四格输入 → 提交应带出 ?code= 并跳到 /r/码
   await fillCodeBoxes(light, '9999');

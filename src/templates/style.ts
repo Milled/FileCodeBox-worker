@@ -287,7 +287,7 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   text-align: center;
   padding: 9px 0;
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--color-ink-2);
   cursor: pointer;
   border-bottom: 2px solid transparent;
@@ -708,6 +708,8 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
 /* ---- 取件：四格分离输入 ---- */
 .pickup-form { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .code-boxes { display: flex; gap: 10px; flex: 1; min-width: 0; }
+/* 发件表单里的自定义取件码：跟在 label 下方，不撑满整行 */
+.input-group .code-boxes { flex: 0 1 auto; margin-top: 4px; }
 .code-box {
   width: 52px; height: 60px; flex: 0 0 auto;
   text-align: center;
@@ -725,6 +727,55 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
 .code-box:hover { border-color: var(--color-rule-strong); }
 .code-box:focus { border-color: var(--color-focus); box-shadow: 0 0 0 3px var(--color-accent-soft); }
 .code-box.filled { border-color: var(--color-rule-strong); }
+
+/* ---- 悬浮提示（圆圈问号，纯 CSS） ---- */
+.tip {
+  position: relative;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px;
+  margin-left: 3px;
+  border: 1px solid var(--color-rule-strong);
+  border-radius: 50%;
+  font-size: 10px; font-weight: 600; line-height: 1;
+  color: var(--color-ink-2);
+  cursor: help;
+  vertical-align: middle;
+  transition: color var(--dur-short) var(--ease-out), background var(--dur-short) var(--ease-out),
+              border-color var(--dur-short) var(--ease-out);
+}
+.tip:hover, .tip:focus, .tip:focus-visible {
+  color: var(--color-ink);
+  border-color: var(--color-ink);
+  background: var(--color-paper-3);
+  outline: none;
+}
+.tip-bubble {
+  position: absolute; bottom: calc(100% + 8px); left: 50%;
+  transform: translateX(-50%) translateY(3px);
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-size: 12px; font-weight: 400; line-height: 1.4;
+  letter-spacing: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+  opacity: 0; visibility: hidden; pointer-events: none;
+  transition: opacity var(--dur-short) var(--ease-out), transform var(--dur-short) var(--ease-out),
+              visibility var(--dur-short);
+  z-index: 20;
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.2);
+}
+.tip-bubble::after {
+  content: "";
+  position: absolute; top: 100%; left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: var(--color-ink);
+}
+.tip:hover .tip-bubble, .tip:focus .tip-bubble, .tip:focus-visible .tip-bubble {
+  opacity: 1; visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
 
 /* ---- 额外发件设置（默认折叠） ---- */
 .extra {
@@ -776,6 +827,7 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
   .code-boxes { gap: 8px; width: 100%; justify-content: space-between; }
   .code-box { width: 100%; max-width: 56px; height: 54px; font-size: 21px; }
   .pickup-form .btn-auto { width: 100%; justify-content: center; }
+  .tip-bubble { max-width: 210px; white-space: normal; text-align: center; }
   .setting-row { flex-direction: column; align-items: stretch; gap: 8px; }
   .setting-control { min-width: 0; width: 100%; }
 }
@@ -790,7 +842,8 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   body { transition: none; }
   .card { animation: none; }
-  .btn, .header-actions a, .input, .file-list-item, .btn-danger, .btn-copy-cmd, .code-card {
+  .btn, .header-actions a, .input, .file-list-item, .btn-danger, .btn-copy-cmd, .code-card,
+  .code-box, .extra > summary, .extra > summary::after, .tip, .tip-bubble {
     transition: none;
   }
 }
