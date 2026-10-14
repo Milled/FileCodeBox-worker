@@ -297,7 +297,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
 npm test             # Playwright 无头浏览器跑取件主流程（test-headless.mjs）
-npm run test:ui      # UI 套件：视觉 token / 上传交互 / 后台设置，共 48 项断言
+npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置，共 58 项断言
 ```
 
 `npm run test:ui` 由 `tests/` 下三个套件组成，复用同一个 Chromium：
@@ -308,7 +308,7 @@ npm run test:ui      # UI 套件：视觉 token / 上传交互 / 后台设置，
 | `tests/upload-interactions.mjs` | 拖拽 / 粘贴 / 多选 chip 增删、多文件顺序上传出多个码、字节与速率明细、五种有效期真实落库（`count`→`max_downloads`、`hour`→2.000h、`forever`→100 年）、512KB 前端拦截、自定义取件码作用域 |
 | `tests/admin-settings.mjs` | 统计卡与列表总数一致、文件行标签与链接、设置页保存/回显、**openUpload 关闭后首页与兼容 API 同时 401 而管理员会话仍 200**、上限改 1MB 立即生效、清空后回退 vars |
 
-环境变量：`BASE_URL`（默认 `http://127.0.0.1:8790`）、`ADMIN_PASSWORD`（默认 `test-admin-pw`，对应 `.dev.vars`）、`SHOT_DIR`（设置后输出全页截图）。
+环境变量：`BASE_URL`（默认 `http://127.0.0.1:8790`）、`ADMIN_PASSWORD`（默认 `test-admin-pw`，对应 `.dev.vars`）、`SHOT_DIR`（设置后输出全页截图）、`SKIP_RATE_WAIT=1`（跳过限流等待，快速跑一轮）。
 
 > 这些用例会**真实上传文件并修改后台设置**，所以默认只允许本机地址；打自己的线上环境需显式加 `ALLOW_REMOTE=1`。历史上这套测试的默认地址曾指向别人的生产站点，别重蹈覆辙。
 >
@@ -324,6 +324,8 @@ npm run test:ui      # UI 套件：视觉 token / 上传交互 / 后台设置，
 - **有 Cloudflare 账号**：跑一次 `npm run provision` 回填真实 ID，本地依旧用模拟存储，不产生线上写入。
 - **完全离线**：复制一份 `wrangler.localtest.jsonc`（已被 gitignore），把 `database_id` 填成任意合法 UUID，用 `npx wrangler dev -c wrangler.localtest.jsonc` 启动。
 - 测线上环境：`BASE_URL=https://你的域名 ALLOW_REMOTE=1 npm run test:ui`
+
+> **已知问题**：本机 `wrangler dev`（4.114）在连续多轮 Playwright 跑测后会偶发整体退出，日志里只有一条空 `ERROR`，而此前所有请求都是 200。这是 wrangler 本地 proxy 的问题，不是应用缺陷 —— 重启 dev 后同一套用例必过。上传限流（10 次/60 秒/IP）由 `tests/helpers.mjs` 的 `rateLimitBreather()` 在每个套件前等窗口滚新来规避（因此整套约需 3 分钟，其中约 170s 是等待），`postWithinRateLimit()` 负责单次重试。
 
 ### 背景与站点图标
 

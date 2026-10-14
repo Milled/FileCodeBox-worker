@@ -1,7 +1,7 @@
 /**
  * 公开页视觉与结构回归：设计 token、深色模式、取件链路、响应式、CSP
  */
-import { BASE, SHOT_DIR, newPage, Suite, dropFile } from './helpers.mjs';
+import { BASE, SHOT_DIR, newPage, Suite, dropFile, fillCodeBoxes, rateLimitBreather } from './helpers.mjs';
 
 export async function publicUiSuite(browser) {
   const s = new Suite('公开页视觉 / 结构回归');
@@ -10,6 +10,7 @@ export async function publicUiSuite(browser) {
 
   await light.goto(`${BASE}/`, { waitUntil: 'networkidle' });
   await dark.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await rateLimitBreather();
 
   const fav = await light.evaluate(async () => {
     const href = document.querySelector('link[rel="icon"]')?.href || null;
@@ -51,6 +52,42 @@ export async function publicUiSuite(browser) {
   const html = await light.content();
   s.ok('页面无上游作者署名与个人图床残留', !/jeio258|qlogo|alcy/i.test(html));
 
+  // ---- 首页三卡分区 ----
+  const home = await light.evaluate(() => {
+    const cards = [...document.querySelectorAll('.container > .card')];
+    const mgmt = cards[0]?.querySelector('a[href="/admin"]');
+    return {
+      cardCount: cards.length,
+      gap: cards[1] ? getComputedStyle(cards[1]).marginTop : null,
+      pickupText: (cards[1]?.textContent || '').replace(/\s+/g, '').trim(),
+      pickupLabels: cards[1]?.querySelectorAll('label').length ?? -1,
+      boxes: cards[1]?.querySelectorAll('#pickupBoxes .code-box').length ?? 0,
+      hidden: !!cards[1]?.querySelector('input[name="code"][type="hidden"]'),
+      mgmtIsPlainLink: !!mgmt && !/\bbtn\b/.test(mgmt.className || '') && !!mgmt.closest('.header-actions'),
+      sendChooseLabel: [...(cards[2]?.querySelectorAll('label') || [])].some((l) => l.textContent.includes('选择文件')),
+      sendBtnText: document.getElementById('submitBtn')?.textContent?.trim(),
+      textBtnText: document.getElementById('textSubmitBtn')?.textContent?.trim(),
+      extraClosed: document.querySelector('#tab-file details.extra')?.open === false,
+    };
+  });
+  s.ok('首页拆成三张卡片且有间距', home.cardCount === 3 && parseFloat(home.gap) > 0, `${home.cardCount} 张，间距 ${home.gap}`);
+  s.ok('取件卡只剩四格与按钮', home.pickupLabels === 0 && home.pickupText === '取件', `文本="${home.pickupText}" label=${home.pickupLabels}`);
+  s.ok('取件码为四个分离输入格且同步到隐藏字段', home.boxes === 4 && home.hidden, `格子=${home.boxes} hidden=${home.hidden}`);
+  s.ok('管理入口保持普通文字链接（未改成按钮）', home.mgmtIsPlainLink);
+  s.ok('发件卡去掉「选择文件」描述', !home.sendChooseLabel, `可见 label 命中=${home.sendChooseLabel}`);
+  s.ok('文件与文本两个发件按钮文案一致',
+    home.sendBtnText === '发件并获取取件码' && home.textBtnText === '发件并获取取件码',
+    `文件=${home.sendBtnText} 文本=${home.textBtnText}`);
+  s.ok('额外发件设置默认折叠', home.extraClosed);
+
+  // 四格输入 → 提交应带出 ?code= 并跳到 /r/码
+  await fillCodeBoxes(light, '9999');
+  await Promise.all([light.waitForNavigation({ url: /\/r\/9999$/, timeout: 15000 }), light.click('.pickup-form button[type="submit"]')]);
+  s.ok('四格取件码可提交并跳转到取件页', light.url().endsWith('/r/9999'), light.url());
+  const boxesAfter = await light.evaluate(() => document.querySelectorAll('#pickupBoxes .code-box').length);
+  s.ok('取件页（/r/码）仍可用', boxesAfter === 0, `首页四格在 /r 页不存在：${boxesAfter}`);
+
+  await light.goto(`${BASE}/`, { waitUntil: 'networkidle' });
   await light.click('.tab[data-tab="text"]');
   const tabs = await light.evaluate(() => ({
     textActive: document.getElementById('tab-text').classList.contains('active'),

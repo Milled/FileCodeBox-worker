@@ -132,6 +132,24 @@ export async function pasteFile(page, { name, type = 'text/plain', content = 'pa
   );
 }
 
+/**
+ * 展开「额外发件设置」。这些字段默认折叠，折叠状态下 Playwright 无法 fill / select，
+ * 但表单值仍会正常提交，所以折叠只影响测试操作路径，不影响功能。
+ */
+export async function expandExtra(page, tab = '#tab-file') {
+  const sel = `${tab} details.extra`;
+  const open = await page.evaluate((s) => !!document.querySelector(s)?.open, sel);
+  if (!open) await page.click(`${sel} > summary`);
+  await page.waitForFunction((s) => !!document.querySelector(s)?.open, sel, { timeout: 5000 });
+}
+
+/** 逐位写入四格取件码，并等待其同步进隐藏的 name="code" 字段 */
+export async function fillCodeBoxes(page, code) {
+  const boxes = page.locator('#pickupBoxes .code-box');
+  for (let i = 0; i < 4; i++) await boxes.nth(i).fill(code[i]);
+  await page.waitForFunction((c) => document.getElementById('pickupCode')?.value === c, code, { timeout: 5000 });
+}
+
 /** 在页面上下文里请求 JSON（必须走页面，admin_token 是 httpOnly，外部 request 上下文不带） */
 export async function apiJson(page, path, init) {
   const res = await page.evaluate(
@@ -149,3 +167,38 @@ export async function apiJson(page, path, init) {
 }
 
 export const randomCode = () => String(1000 + Math.floor(Math.random() * 8999));
+
+const RATE_WINDOW_MS = 60_000;
+let lastBreatherAt = 0;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 上传接口有 10 次 / 60 秒 / IP 的限流（src/shared.ts checkRateLimit），
+ * 而每个套件最多用 6 次额度。为保证整段用例都在一个干净窗口里跑：
+ *   · 首个套件无条件等满一个窗口（可能是紧接 npm test 之后跑的，预算已被吃掉一部分）
+ *   · 后续套件只补齐「距上次开跑不足一个窗口」的差额
+ * 只想快速跑一轮且确认额度充足时，用 SKIP_RATE_WAIT=1 跳过。
+ */
+export async function rateLimitBreather() {
+  if (process.env.SKIP_RATE_WAIT === '1') return;
+  const wait = lastBreatherAt === 0 ? RATE_WINDOW_MS : RATE_WINDOW_MS - (Date.now() - lastBreatherAt);
+  if (wait > 0) {
+    console.log(`  · 等待 ${Math.ceil(wait / 1000)}s 让上传限流窗口滚新（SKIP_RATE_WAIT=1 可跳过）`);
+    await sleep(wait + 1000);
+  }
+  lastBreatherAt = Date.now();
+}
+
+/**
+ * 撞限流时等窗口滚过再重试一次，避免把应用自身的正确限流行为判成用例失败。
+ */
+export async function postWithinRateLimit(request, url, options, { waitMs = 61_000 } = {}) {
+  let res = await request.post(url, options);
+  if (res.status() === 429) {
+    console.log(`  · 命中上传限流，等待 ${waitMs / 1000}s 后重试`);
+    await new Promise((r) => setTimeout(r, waitMs));
+    res = await request.post(url, options);
+  }
+  return res;
+}

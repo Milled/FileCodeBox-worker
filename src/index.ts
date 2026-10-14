@@ -351,6 +351,11 @@ app.route('/api', api);
 // 未知 API 路径返回 404 JSON，不落入首页兜底
 app.all('/api/*', (c) => c.json({ code: 404, msg: 'Not Found' }, 404));
 
+// wrangler dev 的 live-reload WebSocket 端点：兜底路由会把它当未知页面返回整张首页 HTML，
+// 对开发者是误导。生产环境不存在该路径，直接 404。
+// （注：dev 进程偶发整体退出是 wrangler 4.114 本地 proxy 的问题，与此无关，见 README 已知问题）
+app.all('/signal', (c) => new Response(null, { status: 404 }));
+
 // ===================== 兜底 =====================
 
 app.all('*', async (c) => c.html(homePage(await homeOptions(c.env))));

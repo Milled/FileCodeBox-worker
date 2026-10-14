@@ -1,7 +1,7 @@
 /**
  * 上传交互回归：拖拽 / 粘贴 / 多文件 / 进度明细 / 有效期方式 / 前端限额 / 取件码作用域
  */
-import { BASE, newPage, Suite, dropFile, pasteFile, apiJson, randomCode } from './helpers.mjs';
+import { BASE, newPage, Suite, dropFile, pasteFile, apiJson, randomCode, expandExtra, fillCodeBoxes, rateLimitBreather } from './helpers.mjs';
 
 export async function uploadInteractionsSuite(browser) {
   const s = new Suite('上传交互回归');
@@ -10,6 +10,7 @@ export async function uploadInteractionsSuite(browser) {
 
   // ---- 文件选择 ----
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await rateLimitBreather();
   await dropFile(page, { name: 'dropped-a.txt', content: '拖拽上传的内容' });
   s.ok('拖拽 drop 生成文件 chip', (await page.locator('.file-chip').count()) === 1,
     (await page.locator('.chip-name').first().textContent()) || '');
@@ -23,7 +24,11 @@ export async function uploadInteractionsSuite(browser) {
   await dropFile(page, { name: 'second-c.txt', content: '第二个文件' });
   s.ok('重复文件名不会互相吞掉', (await page.locator('.file-chip').count()) === 2);
 
-  // ---- 有效期：按次数 ----
+  s.ok('额外发件设置默认折叠',
+    await page.evaluate(() => document.querySelector('#tab-file details.extra')?.open === false));
+
+  // ---- 有效期：按次数（字段在「额外发件设置」里，默认折叠） ----
+  await expandExtra(page, '#tab-file');
   await page.selectOption('#fileExpireStyle', 'count');
   await page.fill('#fileExpireValue', '3');
   await page.dispatchEvent('#fileExpireValue', 'input');
@@ -60,6 +65,7 @@ export async function uploadInteractionsSuite(browser) {
 
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
   await dropFile(page, { name: 'hour.txt', content: '小时有效期' });
+  await expandExtra(page, '#tab-file');
   await page.selectOption('#fileExpireStyle', 'hour');
   await page.fill('#fileExpireValue', '2');
   await page.dispatchEvent('#fileExpireValue', 'input');
@@ -70,6 +76,7 @@ export async function uploadInteractionsSuite(browser) {
 
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
   await dropFile(page, { name: 'forever.txt', content: '永久有效期' });
+  await expandExtra(page, '#tab-file');
   await page.selectOption('#fileExpireStyle', 'forever');
   s.ok('选「永久」时数值输入被禁用', await page.evaluate(() => document.getElementById('fileExpireValue').disabled));
   const [navF] = await Promise.all([page.waitForNavigation({ url: /\/r\/\d{4}/ }), page.click('#submitBtn')]);
@@ -96,8 +103,9 @@ export async function uploadInteractionsSuite(browser) {
 
   // ---- 自定义取件码作用域（历史 bug：会误读页顶取件框） ----
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
-  await page.fill('form[action="/r"] input[name="code"]', '9999');
+  await fillCodeBoxes(page, '9999');
   await dropFile(page, { name: 'custom.txt', content: '自定义码' });
+  await expandExtra(page, '#tab-file');
   const want = randomCode();
   await page.fill('#fileCode', want);
   const [navC] = await Promise.all([page.waitForNavigation({ url: /\/r\/\d{4}/ }), page.click('#submitBtn')]);

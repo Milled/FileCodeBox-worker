@@ -2,6 +2,9 @@ import type { FileRecord } from '../types';
 import { formatFileSize, escapeHtml } from '../utils';
 import { layout } from './layout';
 
+/** layout 不再包卡片，页面自行决定卡片数量（首页三张，其余一张） */
+const card = (inner: string) => `<div class="card">${inner}</div>`;
+
 // ---- 首页 ----
 
 export interface HomeOptions {
@@ -41,7 +44,9 @@ function expireControl(o: {
 export function homePage(opts: HomeOptions = {}): string {
   const uploadAllowed = opts.uploadAllowed !== false;
   const days = typeof opts.defaultExpireDays === 'number' && opts.defaultExpireDays > 0 ? opts.defaultExpireDays : 7;
-  const content = `
+
+  // ① 标题 + 管理入口
+  const titleCard = `
     <div class="header">
       <div>
         <h1>FileCodeBox</h1>
@@ -50,24 +55,90 @@ export function homePage(opts: HomeOptions = {}): string {
       <div class="header-actions">
         <a href="/admin">管理</a>
       </div>
-    </div>
+    </div>`;
 
-    <!-- 取件区 -->
-    <form action="/r" method="get" style="margin-bottom:24px;padding-bottom:24px;border-bottom:1px solid var(--color-rule)">
-      <div style="font-size:13px;font-weight:500;color:var(--color-ink-2);margin-bottom:10px">取件</div>
-      <div style="display:flex;gap:8px">
-        <input type="text" name="code" class="input" placeholder="输入 4 位取件码" maxlength="4" required
-          style="text-align:center;font-size:20px;letter-spacing:6px;flex:1" autocomplete="off" inputmode="numeric" pattern="[0-9]{4}">
-        <button type="submit" class="btn btn-warm" style="width:auto;padding:10px 20px">取件</button>
+  // ② 取件：四个分离的取件码格 + 取件按钮
+  const pickupCard = `
+    <form action="/r" method="get" class="pickup-form" onsubmit="return submitPickup(event)">
+      <div class="code-boxes" id="pickupBoxes">
+        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" autofocus aria-label="取件码第 1 位">
+        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" aria-label="取件码第 2 位">
+        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" aria-label="取件码第 3 位">
+        <input class="code-box" type="text" maxlength="1" inputmode="numeric" pattern="[0-9]" autocomplete="off" aria-label="取件码第 4 位">
       </div>
-    </form>
+      <input type="hidden" name="code" id="pickupCode">
+      <button type="submit" class="btn btn-warm btn-auto">取件</button>
+    </form>`;
 
-    <!-- 上传区 -->
-    <div style="font-size:13px;font-weight:500;color:var(--color-ink-2);margin-bottom:10px">上传新内容</div>
-
+  // ③ 发件
+  const sendCard = `
     ${uploadAllowed ? uploadUi(days) : guestBlockedUi()}
-    ${uploadAllowed ? homeScript() : ''}`;
-  return layout('FileCodeBox', content);
+    ${uploadAllowed ? homeScript() : ''}
+    ${pickupScript()}`;
+
+  return layout('FileCodeBox', card(titleCard) + card(pickupCard) + card(sendCard));
+}
+
+/** 四格取件码：自动前进、退格回退、方向键、粘贴分发，合并写入隐藏 name="code" 字段 */
+function pickupScript(): string {
+  return `
+    <script>
+    function pickupBoxes() {
+      return Array.prototype.slice.call(document.querySelectorAll('#pickupBoxes .code-box'));
+    }
+
+    function syncPickup() {
+      var boxes = pickupBoxes();
+      var hidden = document.getElementById('pickupCode');
+      if (!hidden) return;
+      hidden.value = boxes.map(function (b) { return b.value; }).join('');
+      boxes.forEach(function (b) { b.classList.toggle('filled', !!b.value); });
+    }
+
+    function initPickup() {
+      var boxes = pickupBoxes();
+      if (!boxes.length) return;
+      boxes.forEach(function (b, i) {
+        b.addEventListener('input', function () {
+          b.value = (b.value || '').replace(/\\D/g, '').slice(-1);
+          if (b.value && i < boxes.length - 1) boxes[i + 1].focus();
+          syncPickup();
+        });
+        b.addEventListener('keydown', function (e) {
+          if (e.key === 'Backspace' && !b.value && i > 0) {
+            e.preventDefault();
+            boxes[i - 1].value = '';
+            boxes[i - 1].focus();
+            syncPickup();
+          } else if (e.key === 'ArrowLeft' && i > 0) boxes[i - 1].focus();
+          else if (e.key === 'ArrowRight' && i < boxes.length - 1) boxes[i + 1].focus();
+        });
+        b.addEventListener('paste', function (e) {
+          var text = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(/\\D/g, '').slice(0, 4);
+          if (!text) return;
+          e.preventDefault();
+          text.split('').forEach(function (ch, j) { if (boxes[j]) boxes[j].value = ch; });
+          boxes[Math.min(text.length, boxes.length - 1)].focus();
+          syncPickup();
+        });
+      });
+    }
+
+    function submitPickup(e) {
+      var hidden = document.getElementById('pickupCode');
+      if (!hidden || !/^\\d{4}$/.test(hidden.value)) {
+        e.preventDefault();
+        var boxes = pickupBoxes();
+        for (var i = 0; i < boxes.length; i++) {
+          if (!boxes[i].value) { boxes[i].focus(); break; }
+        }
+        return false;
+      }
+      return true;
+    }
+
+    document.addEventListener('DOMContentLoaded', initPickup);
+    </script>`;
 }
 
 /** 上传面板（文件 + 文本），仅在允许游客上传时渲染 */
@@ -82,7 +153,6 @@ function uploadUi(days: number): string {
     <div id="tab-file" class="tab-panel active">
       <form id="uploadForm" onsubmit="return handleUpload(event)">
         <div class="input-group">
-          <label>选择文件</label>
           <div class="dz" id="dropZone" tabindex="0" role="button" aria-label="点击或拖拽文件上传">
             <span class="dz-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V5"/><path d="m7 10 5-5 5 5"/><path d="M5 19h14"/></svg></span>
             <span class="dz-title">点击选择，或拖拽文件到此处</span>
@@ -91,24 +161,29 @@ function uploadUi(days: number): string {
           </div>
           <div class="file-chips" id="fileList"></div>
         </div>
-        <div class="field-row">
-          <div class="input-group">
-            <label>有效期</label>
+        <details class="extra">
+          <summary>额外发件设置</summary>
+          <div class="extra-body">
+            <div class="field-row">
+              <div class="input-group">
+                <label>有效期</label>
 ${expireControl({ valueId: 'fileExpireValue', styleId: 'fileExpireStyle', days })}
+              </div>
+              <div class="input-group">
+                <label>最大下载次数</label>
+                <input type="number" id="fileMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
+              </div>
+            </div>
+            <div class="input-group">
+              <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
+              <input type="text" id="fileCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
+            </div>
           </div>
-          <div class="input-group">
-            <label>最大下载次数</label>
-            <input type="number" id="fileMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
-          </div>
-        </div>
-        <div class="input-group">
-          <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
-          <input type="text" id="fileCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
-        </div>
+        </details>
         <div class="upload-progress" id="uploadProgress"><div class="upload-progress-bar" id="uploadProgressBar"></div></div>
         <div class="upload-status" id="uploadStatus"></div>
         <div class="progress-meta" id="uploadMeta" hidden></div>
-        <button type="submit" id="submitBtn" class="btn btn-primary">上传并获取取件码</button>
+        <button type="submit" id="submitBtn" class="btn btn-primary">发件并获取取件码</button>
         <div class="result-list" id="uploadResults"></div>
       </form>
     </div>
@@ -121,21 +196,26 @@ ${expireControl({ valueId: 'fileExpireValue', styleId: 'fileExpireStyle', days }
           <textarea name="text" id="textInput" class="input" placeholder="粘贴或输入要分享的文本内容…" required oninput="updateTextBytes(this)"></textarea>
           <div class="progress-meta"><span id="textBytes">0 B</span><span>上限 512 KB</span></div>
         </div>
-        <div class="field-row">
-          <div class="input-group">
-            <label>有效期</label>
+        <details class="extra">
+          <summary>额外发件设置</summary>
+          <div class="extra-body">
+            <div class="field-row">
+              <div class="input-group">
+                <label>有效期</label>
 ${expireControl({ valueId: 'textExpireValue', styleId: 'textExpireStyle', names: { value: 'expire_value', style: 'expire_style' }, days })}
+              </div>
+              <div class="input-group">
+                <label>最大查看次数</label>
+                <input type="number" id="textMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
+              </div>
+            </div>
+            <div class="input-group">
+              <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
+              <input type="text" id="textCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
+            </div>
           </div>
-          <div class="input-group">
-            <label>最大查看次数</label>
-            <input type="number" id="textMaxDownloads" name="max_downloads" value="-1" min="-1" class="input" placeholder="不限">
-          </div>
-        </div>
-        <div class="input-group">
-          <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
-          <input type="text" id="textCode" name="code" class="input" placeholder="4 位数字取件码" maxlength="4" inputmode="numeric" pattern="[0-9]{0,4}">
-        </div>
-        <button type="submit" id="textSubmitBtn" class="btn btn-primary">保存并获取取件码</button>
+        </details>
+        <button type="submit" id="textSubmitBtn" class="btn btn-primary">发件并获取取件码</button>
       </form>
     </div>`;
 }
@@ -374,7 +454,7 @@ function homeScript(): string {
           return;
         }
         btn.disabled = false;
-        btn.textContent = '上传并获取取件码';
+        btn.textContent = '发件并获取取件码';
         status.textContent = '全部完成 · ' + collected.length + ' 个文件 · ' + (elapsed / 1000).toFixed(1) + 's';
         // 小文件走不到采样窗口，收尾用平均速率，避免显示 0 B/s
         meta.textContent = fmtBytes(totalBytes) + ' / ' + fmtBytes(totalBytes) + ' · 平均 ' + fmtBytes((totalBytes / elapsed) * 1000) + '/s';
@@ -398,7 +478,7 @@ function homeScript(): string {
       }).catch(function (err) {
         alert(err.message || '上传失败');
         btn.disabled = false;
-        btn.textContent = '上传并获取取件码';
+        btn.textContent = '发件并获取取件码';
         status.textContent = '上传中断';
         wrap.style.display = 'none';
         meta.hidden = true;
@@ -428,7 +508,7 @@ function homeScript(): string {
     // 浏览器后退会恢复表单页，需要把按钮还原
     window.addEventListener('pageshow', function () {
       var b = document.getElementById('textSubmitBtn');
-      if (b) { b.disabled = false; b.textContent = '保存并获取取件码'; }
+      if (b) { b.disabled = false; b.textContent = '发件并获取取件码'; }
     });
 
     document.addEventListener('DOMContentLoaded', function () {
@@ -460,7 +540,7 @@ export function retrievePage(code?: string): string {
       </div>
       <button type="submit" class="btn btn-primary">取件</button>
     </form>`;
-  return layout('取件', content);
+  return layout('取件', card(content));
 }
 
 // ---- 上传成功页 ----
@@ -489,7 +569,7 @@ export function resultPage(code: string, filename: string, size: number, baseUrl
       </div>
       ${shareRightPanel(code, shareUrl)}
     </div>`;
-  return layout('上传成功', content, true, true);
+  return layout('上传成功', card(content), true, true);
 }
 
 // ---- 文件详情页 ----
@@ -588,7 +668,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
             });
         })();
       </script>`;
-    return layout('取件', content, true, true);
+    return layout('取件', card(content), true, true);
   }
 
   // 文件下载页 — 双栏：左侧文件信息/下载，右侧取件码/二维码
@@ -622,7 +702,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
       </div>
       ${shareRightPanel(file.code, shareUrl)}
     </div>`;
-  return layout('取件', content, true, true);
+  return layout('取件', card(content), true, true);
 }
 
 // ---- 错误页 ----
@@ -635,7 +715,7 @@ export function errorPage(title: string, message: string): string {
     <div class="header"><h1>${safeTitle}</h1></div>
     <p style="text-align:center">${safeMessage}</p>
     <a href="/" class="btn btn-secondary" style="margin-top:16px">返回</a>`;
-  return layout(safeTitle, content);
+  return layout(safeTitle, card(content));
 }
 
 // ---- 管理员登录页 ----
@@ -649,7 +729,7 @@ export function adminLoginPage(error?: string): string {
       <button type="submit" class="btn btn-primary">登录</button>
     </form>
     <div style="text-align:center;margin-top:16px"><a href="/" style="font-size:13px;color:var(--color-ink-2);text-decoration:none">&larr; 返回首页</a></div>`;
-  return layout('管理员登录', content);
+  return layout('管理员登录', card(content));
 }
 
 // ---- 管理面板 ----
@@ -780,7 +860,7 @@ export function adminPanel(
       ${page > 1 ? `<a href="${pageUrl(page - 1)}" style="font-size:13px;margin-right:10px;color:var(--color-accent);text-decoration:none">&larr; 上一页</a>` : ''}
       ${page < totalPages ? `<a href="${pageUrl(page + 1)}" style="font-size:13px;color:var(--color-accent);text-decoration:none">下一页 &rarr;</a>` : ''}
     </div>`;
-  return layout('管理面板', content, true, true);
+  return layout('管理面板', card(content), true, true);
 }
 
 // ---- 后台设置页 ----
@@ -840,5 +920,5 @@ export function adminSettingsPage(config: AdminConfig, saved?: string): string {
       <button type="submit" class="btn btn-primary">保存设置</button>
     </form>
     <div style="text-align:center;margin-top:16px"><a href="/admin" style="font-size:13px;color:var(--color-ink-2);text-decoration:none">&larr; 返回文件列表</a></div>`;
-  return layout('系统设置', content, true, true);
+  return layout('系统设置', card(content), true, true);
 }

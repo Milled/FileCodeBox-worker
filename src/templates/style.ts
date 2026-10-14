@@ -587,6 +587,8 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
 /* ---- 字段行 / 有效期控件 ---- */
 .field-row { display: flex; gap: 12px; }
 .field-row > .input-group { flex: 1; min-width: 0; }
+/* 有效期是「数值 + 单位 + 步进」复合控件，给它更多宽度，否则数值格被挤到只剩几像素 */
+.field-row > .input-group:has(.expire-control) { flex: 1.6; }
 .expire-control { position: relative; display: flex; }
 .expire-control .expire-value {
   flex: 1 1 auto; width: auto; min-width: 0;
@@ -597,12 +599,12 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
 .expire-control .expire-value::-webkit-outer-spin-button,
 .expire-control .expire-value::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .expire-control .expire-unit {
-  flex: 0 0 7rem; width: 7rem;
+  flex: 0 0 6.25rem; width: 6.25rem;
   border-top-left-radius: 0; border-bottom-left-radius: 0;
   border-left: 1px solid var(--color-rule);
 }
 .stepper {
-  position: absolute; right: calc(7rem + 1px); top: 1px; bottom: 1px;
+  position: absolute; right: calc(6.25rem + 1px); top: 1px; bottom: 1px;
   display: flex; flex-direction: column; width: 28px;
   border-left: 1px solid var(--color-rule);
 }
@@ -697,6 +699,66 @@ form[action="/admin/settings"] > .btn { margin-top: 20px; }
 a.fname { color: inherit; text-decoration: none; }
 a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
 
+/* ---- 多卡片页面（首页：标题 / 取件 / 发件 三张） ---- */
+.card + .card { margin-top: 16px; }
+
+/* 宽度随内容的按钮（管理、取件） */
+.btn-auto { width: auto; padding: 10px 20px; white-space: nowrap; }
+
+/* ---- 取件：四格分离输入 ---- */
+.pickup-form { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.code-boxes { display: flex; gap: 10px; flex: 1; min-width: 0; }
+.code-box {
+  width: 52px; height: 60px; flex: 0 0 auto;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 24px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-ink);
+  background: var(--color-paper-2);
+  border: 1px solid var(--color-rule);
+  border-radius: var(--radius-control);
+  outline: none;
+  padding: 0;
+  transition: border-color var(--dur-short) var(--ease-out), box-shadow var(--dur-short) var(--ease-out);
+}
+.code-box:hover { border-color: var(--color-rule-strong); }
+.code-box:focus { border-color: var(--color-focus); box-shadow: 0 0 0 3px var(--color-accent-soft); }
+.code-box.filled { border-color: var(--color-rule-strong); }
+
+/* ---- 额外发件设置（默认折叠） ---- */
+.extra {
+  border: 1px solid var(--color-rule);
+  border-radius: var(--radius-control);
+  background: var(--color-paper-2);
+  margin-bottom: 14px;
+}
+.extra > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 11px 14px;
+  font-size: 13px; font-weight: 500;
+  color: var(--color-ink-2);
+  border-radius: var(--radius-control);
+  transition: color var(--dur-short) var(--ease-out), background var(--dur-short) var(--ease-out);
+}
+.extra > summary::-webkit-details-marker { display: none; }
+.extra > summary:hover { color: var(--color-ink); background: var(--color-paper-3); }
+.extra > summary:focus-visible { outline: 3px solid var(--color-focus); outline-offset: 2px; }
+.extra > summary::after {
+  content: "";
+  width: 7px; height: 7px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform var(--dur-short) var(--ease-out);
+  flex-shrink: 0;
+}
+.extra[open] > summary { border-bottom: 1px solid var(--color-rule); border-radius: var(--radius-control) var(--radius-control) 0 0; color: var(--color-ink); }
+.extra[open] > summary::after { transform: rotate(-135deg); }
+.extra-body { padding: 14px 14px 0; }
+
 /* ---- responsive ---- */
 @media (min-width: 640px) {
   :root { --radius-card: 2.5rem; }
@@ -707,9 +769,13 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
   .card { padding: 24px 18px; }
   .field-row { flex-direction: column; gap: 0; }
   .stepper { display: none; }
-  .expire-control .expire-unit { flex-basis: 6.5rem; width: 6.5rem; }
+  .expire-control .expire-unit { flex-basis: 5.5rem; width: 5.5rem; }
   .expire-control .expire-value { padding-right: 12px; }
   .dz { padding: 22px 14px; }
+  .pickup-form { flex-wrap: wrap; }
+  .code-boxes { gap: 8px; width: 100%; justify-content: space-between; }
+  .code-box { width: 100%; max-width: 56px; height: 54px; font-size: 21px; }
+  .pickup-form .btn-auto { width: 100%; justify-content: center; }
   .setting-row { flex-direction: column; align-items: stretch; gap: 8px; }
   .setting-control { min-width: 0; width: 100%; }
 }

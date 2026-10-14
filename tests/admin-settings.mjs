@@ -3,7 +3,7 @@
  *
  * 注意：本套件会修改 fc_settings（结束时恢复默认值），只应对本地或你自己的环境运行。
  */
-import { BASE, ADMIN_PASSWORD, SHOT_DIR, newPage, Suite, apiJson } from './helpers.mjs';
+import { BASE, ADMIN_PASSWORD, SHOT_DIR, newPage, Suite, apiJson, postWithinRateLimit, rateLimitBreather } from './helpers.mjs';
 
 const TWO_MB = Buffer.alloc(2 * 1024 * 1024, 'x');
 const shot = async (page, name) => {
@@ -24,6 +24,7 @@ export async function adminSettingsSuite(browser) {
 
   try {
     await page.goto(`${BASE}/admin`, { waitUntil: 'networkidle' });
+    await rateLimitBreather();
     await page.fill('input[name="password"]', ADMIN_PASSWORD);
     await Promise.all([page.waitForNavigation(), page.click('button[type="submit"]')]);
     s.ok('表单登录进入面板', page.url().endsWith('/admin'), page.url());
@@ -73,14 +74,14 @@ export async function adminSettingsSuite(browser) {
     await page.selectOption('select[name="openUpload"]', '1');
     await page.fill('input[name="maxFileSize"]', '1048576');
     await save();
-    const rBig = await anon.request.post(`${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m.bin' } });
+    const rBig = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m.bin' } });
     const bigText = await rBig.text();
     s.ok('上限改 1MB 后 2MB 立即被拒（无需重新部署）', rBig.status() === 413 && /最大 1MB/.test(bigText), `${rBig.status()} ${bigText}`);
 
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
     await page.fill('input[name="maxFileSize"]', '');
     await save();
-    const rBack = await anon.request.post(`${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m-again.bin' } });
+    const rBack = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m-again.bin' } });
     s.ok('清空设置后回退到 wrangler vars', rBack.status() === 200, await rBack.text());
 
     const after = await apiJson(page, '/api/admin/config/get');
