@@ -758,7 +758,11 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
   letter-spacing: 0;
   padding: 6px 10px;
   border-radius: 8px;
-  white-space: nowrap;
+  /* 包含块只有 15px 宽，不给 max-content 的话收缩宽度会塌成一个汉字一行 */
+  width: max-content;
+  max-width: min(210px, 72vw);
+  white-space: normal;
+  text-align: center;
   opacity: 0; visibility: hidden; pointer-events: none;
   transition: opacity var(--dur-short) var(--ease-out), transform var(--dur-short) var(--ease-out),
               visibility var(--dur-short);
@@ -827,7 +831,7 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
   .code-boxes { gap: 8px; width: 100%; justify-content: space-between; }
   .code-box { width: 100%; max-width: 56px; height: 54px; font-size: 21px; }
   .pickup-form .btn-auto { width: 100%; justify-content: center; }
-  .tip-bubble { max-width: 210px; white-space: normal; text-align: center; }
+  .tip-bubble { max-width: 78vw; }
   .setting-row { flex-direction: column; align-items: stretch; gap: 8px; }
   .setting-control { min-width: 0; width: 100%; }
 }

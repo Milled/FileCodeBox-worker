@@ -170,7 +170,13 @@ export async function hoverTip(page, label) {
         ?.querySelector('.tip-bubble');
       if (!el) return { found: false };
       const st = getComputedStyle(el);
-      return { found: true, visible: st.visibility === 'visible' && Number(st.opacity) > 0.5, text: el.textContent };
+      return {
+        found: true,
+        visible: st.visibility === 'visible' && Number(st.opacity) > 0.5,
+        text: el.textContent,
+        width: Math.round(el.getBoundingClientRect().width),
+        lineHeight: parseFloat(st.lineHeight) || Number(st.fontSize),
+      };
     },
     label,
   );

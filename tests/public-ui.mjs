@@ -148,6 +148,13 @@ export async function publicUiSuite(browser) {
   await mobile.goto(`${BASE}/`, { waitUntil: 'networkidle' });
   const overflow = await mobile.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
   s.ok('移动端无横向溢出', !overflow);
+
+  // 回归：气泡的包含块只有 15px，缺 width: max-content 时会塌成一个汉字一列
+  await expandExtra(mobile, '#tab-file');
+  const tipMobile = await hoverTip(mobile, '有效期');
+  s.ok('移动端悬浮提示横向排布（未塌成一列）',
+    tipMobile.visible && tipMobile.width > tipMobile.lineHeight * 4,
+    `宽 ${tipMobile.width}px，行高 ${tipMobile.lineHeight}px`);
   await mobile.shot('public-home-mobile');
 
   await light.shot('public-home-light');
