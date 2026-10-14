@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .dev.vars
+wrangler.local*.jsonc
 .DS_Store
 *.log
 .wrangler/

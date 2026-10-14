@@ -7,6 +7,7 @@
     "deploy": "wrangler deploy",
     "provision": "node scripts/provision.mjs",
     "test": "node test-headless.mjs",
+    "test:ui": "node tests/index.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

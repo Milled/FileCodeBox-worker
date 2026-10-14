@@ -296,18 +296,34 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 ```bash
 npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
-npm test             # Playwright 无头浏览器跑完整取件流程，默认打本地
+npm test             # Playwright 无头浏览器跑取件主流程（test-headless.mjs）
+npm run test:ui      # UI 套件：视觉 token / 上传交互 / 后台设置，共 48 项断言
 ```
+
+`npm run test:ui` 由 `tests/` 下三个套件组成，复用同一个 Chromium：
+
+| 文件 | 覆盖 |
+|------|------|
+| `tests/public-ui.mjs` | 设计 token（背景无外部依赖、卡片圆角、主按钮明暗反转）、深色模式、内联 SVG 图标可解码、tab 切换不被 CSP 拦、上传→取件→复制→文本回读、移动端无横向溢出 |
+| `tests/upload-interactions.mjs` | 拖拽 / 粘贴 / 多选 chip 增删、多文件顺序上传出多个码、字节与速率明细、五种有效期真实落库（`count`→`max_downloads`、`hour`→2.000h、`forever`→100 年）、512KB 前端拦截、自定义取件码作用域 |
+| `tests/admin-settings.mjs` | 统计卡与列表总数一致、文件行标签与链接、设置页保存/回显、**openUpload 关闭后首页与兼容 API 同时 401 而管理员会话仍 200**、上限改 1MB 立即生效、清空后回退 vars |
+
+环境变量：`BASE_URL`（默认 `http://127.0.0.1:8790`）、`ADMIN_PASSWORD`（默认 `test-admin-pw`，对应 `.dev.vars`）、`SHOT_DIR`（设置后输出全页截图）。
+
+> 这些用例会**真实上传文件并修改后台设置**，所以默认只允许本机地址；打自己的线上环境需显式加 `ALLOW_REMOTE=1`。历史上这套测试的默认地址曾指向别人的生产站点，别重蹈覆辙。
+>
+> 三个套件假设本地服务已启动且表已建好：
+> ```bash
+> npx wrangler d1 execute filecodebox-db --local --file=./schema.sql --yes
+> printf 'ADMIN_PASSWORD=test-admin-pw\n' > .dev.vars
+> npx wrangler dev --port 8790
+> ```
 
 `wrangler dev` 要求 `database_id` 非空，配置留空会直接崩溃，实测报 `The expression evaluated to a falsy value: (databaseId)`。两种解法：
 
 - **有 Cloudflare 账号**：跑一次 `npm run provision` 回填真实 ID，本地依旧用模拟存储，不产生线上写入。
-- **完全离线**：临时把 `database_id` 填成任意合法 UUID（**不要提交**），再建本地表并准备密码：
-  ```bash
-  npx wrangler d1 execute filecodebox-db --local --file=./schema.sql --yes
-  echo 'ADMIN_PASSWORD=你的本地密码' > .dev.vars   # 已在 .gitignore 中
-  ```
-- 测线上环境：`BASE_URL=https://你的域名 npm test`（会真实写入该环境的 D1 / R2）
+- **完全离线**：复制一份 `wrangler.localtest.jsonc`（已被 gitignore），把 `database_id` 填成任意合法 UUID，用 `npx wrangler dev -c wrangler.localtest.jsonc` 启动。
+- 测线上环境：`BASE_URL=https://你的域名 ALLOW_REMOTE=1 npm run test:ui`
 
 ### 背景与站点图标
 
@@ -388,6 +404,12 @@ FileCodeBox-worker/
 │       └── pages.ts           # 页面模板
 ├── scripts/
 │   └── provision.mjs          # 自动创建 D1 / R2、回填 database_id 并执行 schema.sql
+├── tests/
+│   ├── index.mjs              # npm run test:ui 入口（三个套件共用一个 Chromium）
+│   ├── helpers.mjs            # 浏览器夹具、断言器、远端目标保护
+│   ├── public-ui.mjs          # 视觉 token / 深色模式 / CSP / 响应式
+│   ├── upload-interactions.mjs# 拖拽、粘贴、多文件、有效期方式、前端限额
+│   └── admin-settings.mjs     # 统计卡、设置页、openUpload 全局生效
 ├── schema.sql                 # 表结构（全语句幂等，可重复执行）
 ├── wrangler.jsonc             # Cloudflare 配置（资源名在此声明）
 ├── tsconfig.json
