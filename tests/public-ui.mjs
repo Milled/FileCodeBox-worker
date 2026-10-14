@@ -95,10 +95,30 @@ export async function publicUiSuite(browser) {
     fillCodeBoxes(light, '9999'),
   ]);
   s.ok('四位填满后自动触发取件（未点按钮）', light.url().endsWith('/r/9999'), light.url());
-  const stillHome = await light.evaluate(() => !!document.querySelector('.pickup-form'));
-  s.ok('取件页不误渲染首页取件表单', !stillHome);
-  const boxesAfter = await light.evaluate(() => document.querySelectorAll('#pickupBoxes .code-box').length);
-  s.ok('取件页（/r/码）仍可用', boxesAfter === 0, `首页四格在 /r 页不存在：${boxesAfter}`);
+
+  // 查无此码落地的取件页：四格 + 放大居中的空码提示，且同样自动提交
+  const retrieve = await light.evaluate(() => {
+    const tip = document.querySelector('.code-empty-tip');
+    const st = tip ? getComputedStyle(tip) : null;
+    return {
+      boxes: document.querySelectorAll('#pickupBoxes .code-box').length,
+      form: !!document.querySelector('form[action="/r"]'),
+      tipText: tip?.textContent?.trim(),
+      align: st?.textAlign,
+      size: st ? parseFloat(st.fontSize) : 0,
+      prefilled: document.getElementById('pickupCode')?.value,
+    };
+  });
+  s.ok('取件页同样是四格分离输入', retrieve.boxes === 4 && retrieve.form, `格子=${retrieve.boxes}`);
+  s.ok('失败的码不回填，四格保持为空', retrieve.prefilled === '', `hidden="${retrieve.prefilled}"`);
+  s.ok('空码提示文案正确且居中放大',
+    retrieve.tipText === '此取件码为空，请检查后重新输入' && retrieve.align === 'center' && retrieve.size >= 16,
+    `${retrieve.tipText}（${retrieve.align} ${retrieve.size}px）`);
+  await Promise.all([
+    light.waitForNavigation({ url: /\/r\/9998$/, timeout: 15000 }),
+    fillCodeBoxes(light, '9998'),
+  ]);
+  s.ok('取件页重新输入四位后同样自动取件', light.url().endsWith('/r/9998'), light.url());
 
   await light.goto(`${BASE}/`, { waitUntil: 'networkidle' });
   await light.click('.tab[data-tab="text"]');

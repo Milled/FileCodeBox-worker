@@ -565,7 +565,11 @@ function homeScript(): string {
 
 // ---- 取件页 ----
 
-export function retrievePage(code?: string): string {
+/**
+ * 取件页：查无此码 / 码为空时的落地页。
+ * 不回填失败的码 —— 四格留空并提示重新输入，语义与提示文案一致。
+ */
+export function retrievePage(): string {
   const content = `
     <div class="header">
       <div>
@@ -577,13 +581,12 @@ export function retrievePage(code?: string): string {
         <a href="/admin">管理</a>
       </div>
     </div>
-    <form action="/r" method="get">
-      <div class="input-group"><label>取件码</label>
-        <input type="text" name="code" value="${escapeHtml(code ?? '')}" class="input" placeholder="输入 4 位数字取件码"
-          maxlength="4" required style="text-align:center;font-size:22px;letter-spacing:8px" inputmode="numeric" pattern="[0-9]{4}" autofocus>
-      </div>
+    <div class="code-empty-tip">此取件码为空，请检查后重新输入</div>
+    <form action="/r" method="get" class="pickup-form pickup-form--stack" onsubmit="return submitPickup(event)">
+${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', autofocus: true, autosubmit: true })}
       <button type="submit" class="btn btn-primary">取件</button>
-    </form>`;
+    </form>
+    ${codeGroupsScript()}`;
   return layout('取件', card(content));
 }
 

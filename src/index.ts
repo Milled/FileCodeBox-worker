@@ -140,7 +140,7 @@ app.get('/r/:code', async (c) => {
   c.header('Cache-Control', 'no-store');
   const code = c.req.param('code').trim();
   const file = await getFileByCode(c.env.DB, code);
-  if (!file) return c.html(retrievePage(code));
+  if (!file) return c.html(retrievePage());
   return c.html(filePage(file, getBaseUrl(c)));
 });
 

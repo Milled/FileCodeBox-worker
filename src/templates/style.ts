@@ -781,6 +781,18 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
   transform: translateX(-50%) translateY(0);
 }
 
+/* ---- 取件页：空码提示与竖排表单 ---- */
+.code-empty-tip {
+  text-align: center;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  color: var(--color-ink);
+  margin: 2px 0 20px;
+}
+.pickup-form--stack { flex-direction: column; align-items: center; gap: 18px; }
+.pickup-form--stack .code-boxes { flex: 0 1 auto; width: 100%; justify-content: center; }
+
 /* ---- 额外发件设置（默认折叠） ---- */
 .extra {
   border: 1px solid var(--color-rule);
