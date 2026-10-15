@@ -99,6 +99,18 @@ export async function publicUiSuite(browser) {
   await light.locator('#pickupBoxes .code-box').first().focus();
   const ring = await light.evaluate(() => getComputedStyle(document.activeElement).boxShadow);
   s.ok('聚焦态有明显外环', ring !== 'none' && /rgba?\(/.test(ring), ring);
+
+  // 覆盖输入：maxlength=1 会让浏览器拒绝在已填格中再输入，必须由 keydown 接管
+  await light.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  const boxes = light.locator('#pickupBoxes .code-box');
+  await boxes.nth(0).fill('1');
+  await boxes.nth(1).fill('2');
+  await boxes.nth(0).click();
+  await light.keyboard.press('9');
+  const vals = await light.evaluate(() => [...document.querySelectorAll('#pickupBoxes .code-box')].map((b) => b.value));
+  s.ok('已填格直接输入数字即覆盖（无需先删除）', vals[0] === '9' && vals[1] === '2', vals.join(','));
+  const focusAfter = await light.evaluate(() => document.activeElement?.getAttribute('aria-label'));
+  s.ok('覆盖后焦点继续前进', /第 2 位/.test(focusAfter || ''), focusAfter);
   s.ok('文件/文本切换按钮为加粗', Number(home.tabWeight) >= 600, `font-weight=${home.tabWeight}`);
   s.ok('文本面板无「文本内容」描述', !home.textHasContentLabel);
   s.ok('发件卡去掉「选择文件」描述', !home.sendChooseLabel);

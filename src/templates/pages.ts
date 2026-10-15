@@ -150,6 +150,15 @@ function codeGroupsScript(): string {
             syncCodeGroup(group);
           });
           b.addEventListener('keydown', function (e) {
+            // maxlength=1 会让浏览器直接拒绝在已填格中再输入字符（必须先删），
+            // 这里拦下数字键做「覆盖输入」
+            if (/^[0-9]$/.test(e.key) && b.value) {
+              e.preventDefault();
+              b.value = e.key;
+              if (i < boxes.length - 1) boxes[i + 1].focus();
+              syncCodeGroup(group);
+              return;
+            }
             if (e.key === 'Backspace' && !b.value && i > 0) {
               e.preventDefault();
               boxes[i - 1].value = '';
@@ -648,6 +657,10 @@ export function filePage(file: FileRecord, baseUrl: string): string {
       : `过期: ${expireDate.toLocaleDateString('zh-CN')}`;
   const expired = expireDate.getTime() < Date.now();
   const shareUrl = `${baseUrl}/r/${file.code}`;
+  // 文本分享的标题是正文前 50 字（见 shared.ts 的 title 派生规则）。达到最大查看次数后
+  // 正文已拒绝读取，但标题仍会把内容泄露出来，因此一律遮蔽为 ***
+  const exhausted = file.max_downloads >= 0 && file.download_count >= file.max_downloads;
+  const displayTitle = file.is_text === 1 && exhausted ? '***' : escapeHtml(file.filename);
 
   // 文本内容 — 双栏：左侧内容框，右侧取件码/二维码
   if (file.is_text === 1 && !expired) {
@@ -663,7 +676,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
               <a href="/admin">管理</a>
             </div>
           </div>
-          <div class="share-title">${escapeHtml(file.filename)}</div>
+          <div class="share-title">${displayTitle}</div>
           <div class="command-box">
             <div class="command-text" id="textContent">加载中…</div>
             <button class="btn-copy-cmd" id="copyAllBtn" hidden onclick="var s=this.querySelector('span');navigator.clipboard.writeText(window.__shareText||'').then(function(){s.textContent='已复制';setTimeout(function(){s.textContent='复制全文'},1500)})">
@@ -733,7 +746,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
             <a href="/admin">管理</a>
           </div>
         </div>
-        <div class="share-title">${escapeHtml(file.filename)}</div>
+        <div class="share-title">${displayTitle}</div>
         <div class="command-box" style="align-items:center;justify-content:center">
           <div class="file-icon">
             <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

@@ -112,6 +112,29 @@ export async function uploadInteractionsSuite(browser) {
   const [navC] = await Promise.all([page.waitForNavigation({ url: /\/r\/\d{4}/ }), page.click('#submitBtn')]);
   s.ok('自定义取件码取自上传表单而非页顶取件框', navC.url().endsWith(`/r/${want}`), navC.url());
 
+  // ---- 文本分享达到最大查看次数后，标题必须遮蔽 ----
+  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await page.click('.tab[data-tab="text"]');
+  await expandExtra(page, '#tab-text');
+  const secret = '绝密内容不该出现在标题 ' + Date.now();
+  await page.fill('#textInput', secret);
+  await page.selectOption('#textExpireStyle', 'count');
+  await page.fill('#textExpireValue', '1');
+  await page.dispatchEvent('#textExpireValue', 'input');
+  await Promise.all([page.waitForNavigation({ timeout: 30000 }), page.click('#textSubmitBtn')]);
+  const limitCode = (await page.locator('.code-value').first().textContent() || '').trim();
+  await page.goto(`${BASE}/r/${limitCode}`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(800);
+  const firstTitle = ((await page.textContent('.share-title')) || '').trim();
+  s.ok('未耗尽时标题照常显示', firstTitle.startsWith('绝密内容不该出现在标题'), firstTitle.slice(0, 14));
+
+  await page.goto(`${BASE}/r/${limitCode}`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(800);
+  const secondTitle = ((await page.textContent('.share-title')) || '').trim();
+  const secondBody = ((await page.textContent('#textContent')) || '').trim();
+  s.ok('达到最大查看次数后标题遮蔽为 ***', secondTitle === '***', secondTitle);
+  s.ok('遮蔽后正文提示已达上限', /最大查看次数/.test(secondBody), secondBody.slice(0, 20));
+
   await s.assertClean(page);
   await page.context().close();
   return s;

@@ -54,10 +54,16 @@ export async function newPage(browser, { scheme = 'light', tag = 'page', viewpor
     if (m.type() !== 'error') return;
     const t = m.text();
     if (t.includes('/signal')) return;
+    // 「Failed to load resource: ... 403/401/413」是浏览器对服务端状态码的转述，
+    // 而这些状态码本身就是被测试的预期行为；真正的服务端错误由下面的 5xx 监听兜住
+    if (/^Failed to load resource/.test(t)) return;
     problems.push(`console: ${t}`);
   });
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
   page.on('requestfailed', (r) => problems.push(`requestfailed: ${r.url()} ${r.failure()?.errorText}`));
+  page.on('response', (r) => {
+    if (r.status() >= 500) problems.push(`HTTP ${r.status()} ${r.url()}`);
+  });
 
   page.problems = problems;
   page.tag = tag;
