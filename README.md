@@ -9,6 +9,7 @@
 - 📤 **上传文件** — 点击 / 拖拽 / 粘贴均可，支持多选，每个文件各自生成 4 位取件码（上限可配置，见[上传大小与过期配置](#上传大小与过期配置)）
 - 📝 **文本分享** — 粘贴文本即可生成分享链接，页面内直接查看，实时显示 UTF-8 字节数
 - 📥 **取件下载** — 输入取件码下载文件或查看文本
+- 🖼️ **图片预览** — 上传的是图片时，成功页与取件页直接显示缩略图（详见[图片缩略图](#图片缩略图)）
 - 🔐 **管理后台** — 统计仪表盘、文件筛选/排序/分页/删除、系统设置页、登录速率限制
 - ⏰ **灵活有效期** — 天 / 小时 / 分钟 / 按次数 / 永久，五种方式在上传时直接选择
 - 🎨 **中性 zinc 设计系统** — 对齐上游 2024 主题：纯色底、大圆角玻璃卡、单色强调，深色模式跟随系统
@@ -25,6 +26,7 @@
 - **SQL 注入防护** — 全部使用参数化查询
 - **CSP 安全头** — 限制资源加载来源，降低 XSS 影响面
 - **文件删除顺序** — R2 先删、DB 兜底（try/finally），避免孤儿文件
+- **缩略图不外泄** — 与正文共用同一套额度判断，次数耗尽即 404；随主文件一起删除，过期清理与孤儿扫描都覆盖 `thumb:` 前缀
 
 ## 📦 部署方式
 
@@ -263,6 +265,8 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 | GET | `/api/text/:code` | 获取文本内容（纯文本）|
 | GET / HEAD | `/api/download/:code` | 下载文件（带 Content-Disposition）|
 | GET | `/api/info/:code` | 文件信息（JSON）|
+| POST | `/api/thumb/:code` | 上传浏览器端生成的图片缩略图（WebP/JPEG/PNG，服务端硬上限 128KB）|
+| GET | `/api/thumb/:code` | 取缩略图；额度耗尽、过期、非图片均 404，不计下载次数 |
 | GET | `/qrcode/:code` | 取件链接二维码（GIF）|
 | GET | `/static/style.css` | 样式表（immutable 长缓存）|
 | GET | `/static/bg.webp` | 背景图，需自行上传到 R2 根目录，否则 404 |
@@ -291,22 +295,38 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 | 取件 | `/r/1234` | 文件详情 / 文本查看 + 下载 |
 | 管理 | `/admin` | 管理员登录 |
 
+### 图片缩略图
+
+上传的是图片时，成功页和取件页显示缩略图而不是通用文件图标。
+
+- **生成在浏览器里**：canvas 按长边 480px 缩放，依次尝试 WebP（0.72 / 0.55）与 JPEG（0.7 / 0.5），逐级降尺寸直到 ≤96KB；解码失败（HEIC、损坏文件）就安静回退成图标。
+  之所以不在 Worker 里解码：免费档每个请求只有 5ms CPU，一张几千万像素的照片必然超限；而 Cloudflare Image Resizing 是付费附加产品，`npm run provision` 也开不了它。
+- **单独存一份**：R2 里主文件是 `file:{code}`，缩略图是 `thumb:{code}`，D1 用 `has_thumb` 标记，页面只在标记为 1 时输出 `<img>`，避免每个非图片取件页都白发一个必然 404 的请求。
+- **它是内容的第二份副本，所以按同一套规矩管**：达到最大下载次数或已过期时 `GET /api/thumb/:code` 返回 404（和文本标题遮蔽成 `***` 同理），响应带 `no-store`；删除与过期清理同时删两个 key，孤儿扫描覆盖 `thumb:` 前缀。
+- **不计下载次数**：缩略图只是页面渲染的一部分，计数会让"打开看一眼"悄悄消耗掉收件人的额度。
+- **只有网页端上传会有**：`curl` 和兼容 API 不经过 canvas，这类文件继续显示图标。
+- 服务端不信任客户端：只接受 WebP/JPEG/PNG 的 magic bytes，硬上限 128KB，且只允许挂在 `image/*`（非 SVG）记录上，用独立限流桶（30 次/60 秒/IP）以免一张图片吃掉两次上传额度。
+- **已有部署升级**：新列 `has_thumb` 由 `initDB()` 的 ALTER 补齐，Cron 每 30 分钟会跑一次；想立刻生效就手动执行
+  `npx wrangler d1 execute filecodebox-db --remote --command "ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0"`。
+  补列之前缩略图写入会失败，但前端静默忽略，页面照常回退成图标。
+
 ### 本地开发与测试
 
 ```bash
 npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
 npm test             # Playwright 无头浏览器跑取件主流程（test-headless.mjs）
-npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置，共 58 项断言
+npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 102 项断言
 ```
 
-`npm run test:ui` 由 `tests/` 下三个套件组成，复用同一个 Chromium：
+`npm run test:ui` 由 `tests/` 下四个套件组成，复用同一个 Chromium：
 
 | 文件 | 覆盖 |
 |------|------|
 | `tests/public-ui.mjs` | 设计 token（背景无外部依赖、卡片圆角、主按钮明暗反转）、深色模式、内联 SVG 图标可解码、tab 切换不被 CSP 拦、上传→取件→复制→文本回读、移动端无横向溢出 |
 | `tests/upload-interactions.mjs` | 拖拽 / 粘贴 / 多选 chip 增删、多文件顺序上传出多个码、字节与速率明细、五种有效期真实落库（`count`→`max_downloads`、`hour`→2.000h、`forever`→100 年）、512KB 前端拦截、自定义取件码作用域 |
 | `tests/admin-settings.mjs` | 统计卡与列表总数一致、文件行标签与链接、设置页保存/回显、**openUpload 关闭后首页与兼容 API 同时 401 而管理员会话仍 200**、上限改 1MB 立即生效、清空后回退 vars |
+| `tests/thumbnails.mjs` | 浏览器端确实按 480px 缩放、缩略图 ≤96KB 且 `no-store`、两个落地页都出图、渲染尺寸不超过卡片、取图失败回退图标、非图片不产出且伪造上传被 415/404 拒、**额度耗尽后缩略图一起消失**、多文件各自带图、缩略图写入不占上传额度 |
 
 环境变量：`BASE_URL`（默认 `http://127.0.0.1:8790`）、`ADMIN_PASSWORD`（默认 `test-admin-pw`，对应 `.dev.vars`）、`SHOT_DIR`（设置后输出全页截图）、`SKIP_RATE_WAIT=1`（跳过限流等待，快速跑一轮）。
 
@@ -394,7 +414,7 @@ FileCodeBox-worker/
 ├── src/
 │   ├── index.ts               # 主程序 — Web UI 路由 + Cron 清理
 │   ├── api.ts                 # FileCodeBox v2.1.0 兼容 API
-│   ├── shared.ts              # 共享业务逻辑（上传/下载/过期/取件码/生效上限，单一数据源）
+│   ├── shared.ts              # 共享业务逻辑（上传/下载/缩略图/过期/取件码/生效上限，单一数据源）
 │   ├── auth.ts                # 认证: 登录/登出/速率限制
 │   ├── db.ts                  # 数据库: 增删改查 + 取件码抢占 + 限流 + 清理
 │   ├── qr.ts                  # 二维码 GIF 封装
@@ -407,11 +427,12 @@ FileCodeBox-worker/
 ├── scripts/
 │   └── provision.mjs          # 自动创建 D1 / R2、回填 database_id 并执行 schema.sql
 ├── tests/
-│   ├── index.mjs              # npm run test:ui 入口（三个套件共用一个 Chromium）
+│   ├── index.mjs              # npm run test:ui 入口（四个套件共用一个 Chromium）
 │   ├── helpers.mjs            # 浏览器夹具、断言器、远端目标保护
 │   ├── public-ui.mjs          # 视觉 token / 深色模式 / CSP / 响应式
 │   ├── upload-interactions.mjs# 拖拽、粘贴、多文件、有效期方式、前端限额
-│   └── admin-settings.mjs     # 统计卡、设置页、openUpload 全局生效
+│   ├── admin-settings.mjs     # 统计卡、设置页、openUpload 全局生效
+│   └── thumbnails.mjs         # 图片缩略图：缩放、体积、隐私边界、回退
 ├── schema.sql                 # 表结构（全语句幂等，可重复执行）
 ├── wrangler.jsonc             # Cloudflare 配置（资源名在此声明）
 ├── tsconfig.json

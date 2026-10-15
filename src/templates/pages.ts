@@ -411,6 +411,64 @@ function homeScript(): string {
       sync();
     }
 
+    // ---- 缩略图 ----
+    // 图片在浏览器里缩放后再传：Worker 免费档每请求只有 5ms CPU，解一张大图必然超限。
+    // 长边 480px 对应桌面卡片宽度的 2x，96KB 是自愿上限（服务端另有 128KB 硬上限）。
+    var THUMB_EDGE = 480;
+    var THUMB_MAX_BYTES = 96 * 1024;
+
+    function dataUrlBytes(url) { return Math.floor((url.length - url.indexOf(',') - 1) * 3 / 4); }
+
+    function dataUrlToBlob(url, type) {
+      var bin = atob(url.slice(url.indexOf(',') + 1));
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new Blob([bytes], { type: type });
+    }
+
+    // 前缀必须还是请求的那种格式：浏览器不支持 WebP 编码时会静默退回 PNG，
+    // 那种情况交给 JPEG 兜底（WebP 体积通常小得多）
+    function encodeThumb(canvas, type, quality) {
+      var url = '';
+      try { url = canvas.toDataURL(type, quality); } catch (err) { return null; }
+      if (url.indexOf('data:' + type) !== 0) return null;
+      if (dataUrlBytes(url) > THUMB_MAX_BYTES) return null;
+      return dataUrlToBlob(url, type);
+    }
+
+    function makeThumb(file) {
+      // SVG 是脚本载体且 canvas 栅格化不可靠，直接排除
+      // 注意：这段是模板字符串里的 JS，写 /^image\// 会被模板吃掉反斜杠变成 /^image//
+      if (file.type.slice(0, 6) !== 'image/' || /svg/.test(file.type) || !self.createImageBitmap) {
+        return Promise.resolve(null);
+      }
+      return createImageBitmap(file).then(function (bmp) {
+        var fit = Math.min(1, THUMB_EDGE / Math.max(bmp.width, bmp.height));
+        var blob = null;
+        [1, 0.75, 0.5].some(function (ratio) {
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(bmp.width * fit * ratio));
+          canvas.height = Math.max(1, Math.round(bmp.height * fit * ratio));
+          canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+          blob = [['image/webp', 0.72], ['image/webp', 0.55], ['image/jpeg', 0.7], ['image/jpeg', 0.5]]
+            .map(function (enc) { return encodeThumb(canvas, enc[0], enc[1]); })
+            .filter(Boolean)[0] || null;
+          return !!blob;
+        });
+        if (bmp.close) bmp.close();
+        return blob;
+      }).catch(function () {
+        // 解码失败（HEIC、损坏文件）就安静回退成图标
+        return null;
+      });
+    }
+
+    function uploadThumb(code, blob) {
+      return fetch('/api/thumb/' + encodeURIComponent(code), { method: 'POST', body: blob })
+        .then(function () { return null; })
+        .catch(function () { return null; });
+    }
+
     // ---- 上传 ----
     function uploadParams() {
       var style = document.getElementById('fileExpireStyle');
@@ -496,6 +554,11 @@ function homeScript(): string {
             done += file.size;
             collected.push({ name: file.name, code: data.code, size: file.size });
             paint(done, '已完成 ' + collected.length + '/' + jobs.length);
+            // 缩略图必须在跳转前落库，成功页才知道该不该输出 <img>；
+            // 失败只回退成文件图标，不能拖垮整条上传链
+            return makeThumb(file).then(function (thumb) {
+              return thumb ? uploadThumb(data.code, thumb) : null;
+            });
           });
         });
       });
@@ -603,12 +666,17 @@ ${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', auto
 
 // ---- 上传成功页 ----
 
-/**
- * 上传成功页，文件与文本共用：只给取件码和「继续上传」，不提供下载入口。
- * text 为刚分享的正文，直接渲染出来供发送者确认；
- * 只显大小会让用户以为内容没传上去（正文区之前只有 "4 B" 这种字节数）。
- */
-export function resultPage(code: string, filename: string, size: number, baseUrl: string, text?: string): string {
+export function resultPage(opts: {
+  code: string;
+  title: string;
+  size: number;
+  baseUrl: string;
+  /** 文本分享时把正文原样渲染出来：只显字节数会让用户以为内容没传上去 */
+  text?: string;
+  /** 图片文件在浏览器端生成了缩略图 */
+  hasThumb?: boolean;
+}): string {
+  const { code, title, size, baseUrl, text, hasThumb } = opts;
   const shareUrl = `${baseUrl}/r/${code}`;
   const content = `
     <div class="share-grid">
@@ -622,8 +690,9 @@ export function resultPage(code: string, filename: string, size: number, baseUrl
             <a href="/admin">管理</a>
           </div>
         </div>
-        <div class="share-title">${escapeHtml(filename)}</div>
+        <div class="share-title">${escapeHtml(title)}</div>
         <div class="command-box">
+          ${hasThumb ? thumbPreview(code) : ''}
           ${text !== undefined ? `<div class="command-text">${escapeHtml(text)}</div>` : ''}
           <div class="meta-row" style="font-size:13px">
             <span>${formatFileSize(size)}</span>
@@ -637,6 +706,23 @@ export function resultPage(code: string, filename: string, size: number, baseUrl
 }
 
 // ---- 文件详情页 ----
+
+function fileIconSvg(hidden = false): string {
+  return `<div class="file-icon"${hidden ? ' hidden' : ''}>
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
+          </div>`;
+}
+
+/**
+ * 图片预览。取不到图时退回文件图标而不是留一个破图：
+ * 页面渲染和实际请求之间，额度可能刚好被最后一次下载用完。
+ */
+function thumbPreview(code: string): string {
+  return `<img class="file-thumb" src="/api/thumb/${code}" alt="" onerror="this.hidden=true;this.nextElementSibling.hidden=false">
+          ${fileIconSvg(true)}`;
+}
 
 /** 分享页右栏：取件码卡 + 二维码（取件页文本/文件视图与上传结果页共用） */
 function shareRightPanel(code: string, shareUrl: string): string {
@@ -755,11 +841,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
         </div>
         <div class="share-title">${displayTitle}</div>
         <div class="command-box" style="align-items:center;justify-content:center">
-          <div class="file-icon">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
-            </svg>
-          </div>
+          ${file.has_thumb === 1 && !expired && !exhausted ? thumbPreview(file.code) : fileIconSvg()}
           ${!expired ? `<a href="/api/download/${file.code}" class="btn btn-primary" style="width:auto;padding:12px 40px">下载文件</a>` : ''}
         </div>
         <div class="meta-row">

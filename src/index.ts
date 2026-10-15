@@ -24,7 +24,7 @@ import {
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
-import { uploadFile, uploadText, downloadFile, resolveLimits } from './shared';
+import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, resolveLimits } from './shared';
 import { generateQRCodeGIF } from './qr';
 import { STYLE } from './templates/style';
 import type { HomeOptions } from './templates/pages';
@@ -144,7 +144,7 @@ app.get('/r/:code', async (c) => {
   // 上传成功后的回跳视图：与文本分享一致，只给取件码与「继续上传」，
   // 不提供下载入口。收件人拿到的 /r/{code}（无 sent）仍是下载页。
   if (c.req.query('sent') === '1') {
-    return c.html(resultPage(file.code, file.filename, file.size, getBaseUrl(c)));
+    return c.html(resultPage({ code: file.code, title: file.filename, size: file.size, baseUrl: getBaseUrl(c), hasThumb: file.has_thumb === 1 }));
   }
   return c.html(filePage(file, getBaseUrl(c)));
 });
@@ -168,7 +168,7 @@ app.post('/api/upload/text', async (c) => {
     const result = await uploadText(c, c.env);
     // 结果页现在含分享正文，禁止缓存，避免 CDN 把私密内容留在边缘节点
     c.header('Cache-Control', 'no-store');
-    return c.html(resultPage(result.code, result.title, result.textSize, getBaseUrl(c), result.text));
+    return c.html(resultPage({ code: result.code, title: result.title, size: result.textSize, baseUrl: getBaseUrl(c), text: result.text }));
   } catch (e: any) {
     return c.html(errorPage(e?.message ?? '保存失败', '服务器内部错误'), e?.status ?? 500);
   }
@@ -204,6 +204,30 @@ app.get('/api/download/:code', async (c) => {
   } catch (e: any) {
     return c.html(errorPage(e?.message ?? '未找到文件', ''), e?.status ?? 404);
   }
+});
+
+// ===================== 图片缩略图 =====================
+
+app.post('/api/thumb/:code', async (c) => {
+  try {
+    return c.json(await saveThumb(c, c.env));
+  } catch (e: any) {
+    const status = e?.status ?? 500;
+    return c.json({ error: e?.message ?? '保存失败' }, status);
+  }
+});
+
+app.get('/api/thumb/:code', async (c) => {
+  const thumb = await readThumb(c, c.env);
+  if (!thumb) return c.text('Not found', 404);
+  // no-store：可见性取决于剩余下载次数，缓存会把它留在额度用完之后
+  return new Response(thumb.body, {
+    headers: {
+      'Content-Type': thumb.contentType,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
 });
 
 // ===================== QR 码生成 =====================
@@ -320,9 +344,10 @@ app.post('/admin/delete/:id', async (c) => {
   if (!Number.isInteger(id)) return c.redirect('/admin');
   const file = await getFileById(env.DB, id);
   if (!file) return c.redirect('/admin');
-  // 先删 R2，再删 DB（finally 保证 DB 清理），避免 R2 删除失败产生孤儿文件
+  // 先删 R2，再删 DB（finally 保证 DB 清理），避免 R2 删除失败产生孤儿文件；
+  // 缩略图与主文件一起删（R2 delete 接受键数组，一次批量请求）
   try {
-    await env.FILE_STORE.delete(`file:${file.code}`);
+    await env.FILE_STORE.delete([`file:${file.code}`, `thumb:${file.code}`]);
   } finally {
     await deleteFileRecord(env.DB, id);
   }

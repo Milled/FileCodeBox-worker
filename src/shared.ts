@@ -13,6 +13,7 @@ import {
   claimCode,
   insertFile,
   incrementDownload,
+  markThumb,
   releaseCode,
   checkRateLimit,
   getSetting,
@@ -214,6 +215,90 @@ export async function downloadFile(
   }
 
   return { file, obj, notFound: false, maxExceeded: false, isHead };
+}
+
+// ===================== 图片缩略图 =====================
+
+/**
+ * 缩略图由浏览器 canvas 生成（480px / ≤96KB），Worker 不做图像解码：
+ * 免费档每请求只有 5ms CPU，解码一张几千万像素的照片必然超限。
+ * 这里只负责收下并落 R2，因此校验的是「别拿它当免费图床」。
+ */
+const THUMB_MAX_BYTES = 128 * 1024;
+
+/** 只认这三种容器格式的头，不信任客户端声明的 Content-Type */
+function sniffImageType(buf: ArrayBuffer): string | null {
+  const b = new Uint8Array(buf, 0, Math.min(buf.byteLength, 12));
+  const ascii = (o: number, s: string) => {
+    for (let i = 0; i < s.length; i++) if (b[o + i] !== s.charCodeAt(i)) return false;
+    return true;
+  };
+  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'image/webp';
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+  if (b.length >= 6 && b[0] === 0x89 && ascii(1, 'PNG') && b[4] === 0x0d && b[5] === 0x0a) return 'image/png';
+  return null;
+}
+
+export async function saveThumb(
+  c: Context<{ Bindings: Env }>,
+  env: Env,
+): Promise<{ code: string; size: number }> {
+  await assertUploadAllowed(c, env);
+
+  const code = (c.req.param('code') || '').trim();
+  if (!code) throw { status: 422 as const, message: '缺少取件码' };
+
+  // 单独限流：与上传共用一个桶的话，一张图片会吃掉两次上传配额
+  const ip = getClientIp(c.req.raw.headers);
+  if (!(await checkRateLimit(env.DB, 'thumb_ratelimit', ip, 30))) {
+    throw { status: 429 as const, message: '操作过于频繁，请稍后再试' };
+  }
+
+  const file = await getFileByCode(env.DB, code);
+  if (!file) throw { status: 404 as const, message: '取件码不存在或已过期' };
+  // 只给图片挂缩略图，否则客户端可以把任意记录伪装成图片；
+  // SVG 排除：它是脚本载体，且 canvas 无法可靠栅格化
+  if (!file.mime_type.startsWith('image/') || file.mime_type.includes('svg')) {
+    throw { status: 415 as const, message: '仅图片文件支持缩略图' };
+  }
+
+  const declared = Number(c.req.header('Content-Length'));
+  if (Number.isFinite(declared) && declared > THUMB_MAX_BYTES) {
+    throw { status: 413 as const, message: '缩略图过大' };
+  }
+  const body = await c.req.arrayBuffer();
+  if (body.byteLength === 0) throw { status: 422 as const, message: '缩略图为空' };
+  if (body.byteLength > THUMB_MAX_BYTES) throw { status: 413 as const, message: '缩略图过大' };
+
+  const contentType = sniffImageType(body);
+  if (!contentType) throw { status: 415 as const, message: '缩略图仅支持 WebP/JPEG/PNG' };
+
+  await env.FILE_STORE.put(`thumb:${code}`, body, { httpMetadata: { contentType } });
+  await markThumb(env.DB, code);
+  return { code, size: body.byteLength };
+}
+
+/**
+ * 读取缩略图。不计入下载次数——它只是页面渲染的一部分，
+ * 计数会让「打开看一眼」悄悄消耗掉收件人的下载额度。
+ */
+export async function readThumb(
+  c: Context<{ Bindings: Env }>,
+  env: Env,
+): Promise<{ body: ReadableStream; contentType: string } | null> {
+  const code = (c.req.param('code') || '').trim();
+  if (!code) return null;
+  // getFileByCode 已过滤过期记录
+  const file = await getFileByCode(env.DB, code);
+  if (!file || file.has_thumb !== 1) return null;
+  // 与文本标题遮蔽成 *** 同一套逻辑：内容已被拒读时，缩略图同样不能外泄
+  if (file.max_downloads >= 0 && file.download_count >= file.max_downloads) return null;
+  const obj = await env.FILE_STORE.get(`thumb:${code}`);
+  if (!obj) return null;
+  return {
+    body: obj.body as ReadableStream,
+    contentType: obj.httpMetadata?.contentType || 'application/octet-stream',
+  };
 }
 
 // ===================== 文本分享 =====================

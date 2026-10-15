@@ -14,8 +14,9 @@ import { launchBrowser, BASE } from './helpers.mjs';
 import { publicUiSuite } from './public-ui.mjs';
 import { uploadInteractionsSuite } from './upload-interactions.mjs';
 import { adminSettingsSuite } from './admin-settings.mjs';
+import { thumbnailSuite } from './thumbnails.mjs';
 
-const SUITES = [publicUiSuite, uploadInteractionsSuite, adminSettingsSuite];
+const SUITES = [publicUiSuite, uploadInteractionsSuite, adminSettingsSuite, thumbnailSuite];
 
 const browser = await launchBrowser();
 const results = [];

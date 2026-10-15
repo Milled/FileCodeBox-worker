@@ -126,6 +126,42 @@ export async function dropFile(page, { name, type = 'text/plain', content = 'ui 
   );
 }
 
+/**
+ * 画一张真实可解码的噪声 PNG 再 drop。
+ * 噪声是无损压缩的最坏情况（900x600 约 1.6MB），才能验证缩略图确实被缩小了；
+ * 用字符串喂 dropFile 是造不出图片的。
+ */
+export async function dropImage(page, { name = 'photo.png', width = 900, height = 600 } = {}) {
+  await page.evaluate(
+    ([n, w, h]) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      const img = ctx.createImageData(w, h);
+      let seed = 20261015;
+      for (let i = 0; i < img.data.length; i += 4) {
+        seed = (seed * 16807) % 2147483647; // Lehmer 同余，整数范围内可复现
+        img.data[i] = seed % 256;
+        img.data[i + 1] = (seed >> 8) % 256;
+        img.data[i + 2] = (seed >> 16) % 256;
+        img.data[i + 3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+      const url = canvas.toDataURL('image/png');
+      const bin = atob(url.slice(url.indexOf(',') + 1));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const dt = new DataTransfer();
+      dt.items.add(new File([bytes], n, { type: 'image/png' }));
+      document
+        .getElementById('dropZone')
+        .dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    },
+    [name, width, height],
+  );
+}
+
 /** 触发 window paste 上传（模拟 Ctrl+V 带文件） */
 export async function pasteFile(page, { name, type = 'text/plain', content = 'pasted payload' }) {
   await page.evaluate(

@@ -24,6 +24,7 @@ export async function initDB(db: D1Database): Promise<void> {
   ];
   const migrations = [
     'ALTER TABLE fc_files ADD COLUMN is_text INTEGER DEFAULT 0',
+    'ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0',
   ];
   for (const s of stmts) {
     try { await db.prepare(s).run(); } catch { /* ignore */ }
@@ -137,6 +138,13 @@ export async function incrementDownload(
     .bind(code)
     .run();
   return result.meta.changes > 0;
+}
+
+// ---- 缩略图 ----
+
+/** 缩略图已写入 R2，标记记录以便页面输出 <img>（否则每次开页都会请求一个必然 404 的地址） */
+export async function markThumb(db: D1Database, code: string): Promise<void> {
+  await db.prepare('UPDATE fc_files SET has_thumb = 1 WHERE code = ?').bind(code).run();
 }
 
 // ---- 删除 ----
@@ -269,8 +277,9 @@ export async function cleanupExpired(
   const files = expired.results ?? [];
   if (files.length === 0) return { expiredCount: 0, cleanedCodes: 0 };
 
-  // 批量删除 R2 对象（每批最多 1000 键），避免逐个请求的 RTT
-  const keys = files.map((f) => `file:${f.code}`);
+  // 批量删除 R2 对象（每批最多 1000 键），避免逐个请求的 RTT。
+  // 缩略图是内容的第二份副本，必须与主文件同时销毁，否则过期后仍能看图
+  const keys = files.flatMap((f) => [`file:${f.code}`, `thumb:${f.code}`]);
   for (let i = 0; i < keys.length; i += 1000) {
     await bucket.delete(keys.slice(i, i + 1000));
   }
@@ -352,7 +361,7 @@ export async function checkRateLimit(
 export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
   const rows = await db
     .prepare(
-      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%'",
+      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%' OR key LIKE 'thumb_ratelimit:%'",
     )
     .all<{ key: string; value: string }>();
   const now = Date.now();
@@ -375,31 +384,40 @@ export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
 // ---- 孤儿 R2 对象清理 ----
 
 /**
- * 列出 R2 中所有 file:* 前缀的对象，对比 D1 记录，删除孤儿对象。
+ * 列出 R2 中 file: / thumb: 前缀的对象，对比 D1 记录，删除孤儿对象。
  * 每批最多处理 1000 个键（R2 list 上限），超量时保留到下次 scheduled。
  */
 export async function cleanupOrphanedR2Objects(
   db: D1Database,
   bucket: R2Bucket,
 ): Promise<{ scanned: number; removed: number }> {
-  // cursor 翻页收集全部 file: 对象（4 位码全空间上限约 1 万个 ≈ 11 页），
+  // cursor 翻页收集全部对象（4 位码全空间上限约 1 万个 ≈ 11 页 × 2 前缀），
   // 只扫首页会永久漏扫字典序靠后的 key
-  const objects: R2Object[] = [];
-  let cursor: string | undefined;
-  do {
-    const listed = await bucket.list({ prefix: 'file:', cursor });
-    objects.push(...listed.objects);
-    cursor = listed.truncated ? listed.cursor : undefined;
-  } while (cursor);
-  const keys = objects.map((o) => o.key);
-  if (keys.length === 0) return { scanned: 0, removed: 0 };
+  const objects: Array<{ key: string; code: string; uploaded: Date }> = [];
+  for (const prefix of ['file:', 'thumb:']) {
+    let cursor: string | undefined;
+    do {
+      const listed = await bucket.list({ prefix, cursor });
+      objects.push(
+        ...listed.objects.map((o) => ({
+          key: o.key,
+          // R2 key 带前缀，D1 code 无前缀，查询前必须剥离
+          code: o.key.slice(prefix.length),
+          uploaded: o.uploaded,
+        })),
+      );
+      cursor = listed.truncated ? listed.cursor : undefined;
+    } while (cursor);
+  }
+  if (objects.length === 0) return { scanned: 0, removed: 0 };
 
-  // 批量查询 D1 中存在的取件码（D1 单条查询绑定变量上限 100）
+  // 批量查询 D1 中存在的取件码（D1 单条查询绑定变量上限 100）；
+  // 主文件与缩略图共用一个 code，先去重再查，省掉一半绑定量
   const BATCH = 100;
+  const codes = [...new Set(objects.map((o) => o.code))];
   const activeCodes = new Set<string>();
-  for (let i = 0; i < keys.length; i += BATCH) {
-    // R2 key 带 file: 前缀，D1 code 无前缀，查询前必须剥离
-    const batch = keys.slice(i, i + BATCH).map((k) => k.replace('file:', ''));
+  for (let i = 0; i < codes.length; i += BATCH) {
+    const batch = codes.slice(i, i + BATCH);
     const placeholders = batch.map(() => '?').join(',');
     const rows = await db
       .prepare(`SELECT code FROM fc_files WHERE code IN (${placeholders})`)
@@ -413,10 +431,10 @@ export async function cleanupOrphanedR2Objects(
   const GRACE_MS = 3_600_000;
   const now = Date.now();
   const orphans = objects
-    .filter((o) => !activeCodes.has(o.key.replace('file:', '')) && now - o.uploaded.getTime() > GRACE_MS)
+    .filter((o) => !activeCodes.has(o.code) && now - o.uploaded.getTime() > GRACE_MS)
     .map((o) => o.key);
-  if (orphans.length === 0) return { scanned: keys.length, removed: 0 };
+  if (orphans.length === 0) return { scanned: objects.length, removed: 0 };
 
   await Promise.all(orphans.map((k) => bucket.delete(k)));
-  return { scanned: keys.length, removed: orphans.length };
+  return { scanned: objects.length, removed: orphans.length };
 }

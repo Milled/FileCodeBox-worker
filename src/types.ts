@@ -11,6 +11,8 @@ export interface FileRecord {
   created_at: string;
   ip: string;
   is_text: number;
+  /** R2 中是否存在 thumb:{code}。由浏览器端生成的缩略图写入，缺记录时页面回退文件图标 */
+  has_thumb: number;
 }
 
 /** Cloudflare Worker 环境绑定 */

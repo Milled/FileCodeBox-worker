@@ -78,6 +78,9 @@ export const STYLE = `
 }
 
 *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+/* 作者样式里的 display（例如 .file-icon 的 inline-flex）会盖掉 UA 的 [hidden] 规则，
+   缩略图加载失败时的图标回退全靠这一条兜底 */
+[hidden] { display: none !important; }
 
 body {
   font-family: var(--font-body);
@@ -341,6 +344,17 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  margin-bottom: 14px;
+}
+/* 图片预览：宽度不超过所在卡片，高度封顶 260px；
+   align-self 防止在 flex 纵向容器里被 stretch 拉成整宽 */
+.file-thumb {
+  max-width: 100%;
+  max-height: 260px;
+  align-self: center;
+  border: 1px solid var(--color-rule);
+  border-radius: var(--radius-control);
+  background: var(--color-paper-2);
   margin-bottom: 14px;
 }
 

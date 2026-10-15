@@ -179,9 +179,10 @@ adminApi.delete('/file/delete', async (c) => {
 
   const file = await getFileById(env.DB, id);
   if (!file) return fail(c, 404, '文件不存在');
-  // 先删 R2，再删 DB（finally 保证 DB 清理），避免 R2 删除失败产生孤儿文件
+  // 先删 R2，再删 DB（finally 保证 DB 清理），避免 R2 删除失败产生孤儿文件；
+  // 缩略图是内容的第二份副本，随主文件一起删
   try {
-    await env.FILE_STORE.delete(`file:${file.code}`);
+    await env.FILE_STORE.delete([`file:${file.code}`, `thumb:${file.code}`]);
   } finally {
     await deleteFileRecord(env.DB, id);
   }

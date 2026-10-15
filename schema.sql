@@ -7,7 +7,7 @@
 -- 登录又要读 fc_settings 表 —— 全新数据库因此存在「建表前无法登录、不登录又无法建表」的窗口。
 -- provisioning 阶段先把表建好即可绕开。
 --
--- 注意：旧库若缺少 is_text 列，由 initDB() 的 ALTER 语句补齐（本文件只负责新库一次成型）。
+-- 注意：旧库若缺少 is_text / has_thumb 列，由 initDB() 的 ALTER 语句补齐（本文件只负责新库一次成型）。
 
 CREATE TABLE IF NOT EXISTS fc_files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS fc_files (
   max_downloads INTEGER DEFAULT -1,
   created_at TEXT NOT NULL,
   ip TEXT DEFAULT '',
-  is_text INTEGER DEFAULT 0
+  is_text INTEGER DEFAULT 0,
+  has_thumb INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_fc_code ON fc_files(code);
