@@ -132,11 +132,12 @@ function codeGroupsScript(): string {
       var form = group.closest('form');
       if (!form || form.dataset.submitting === '1') return;
       form.dataset.submitting = '1';
-      // 让最后一位数字先渲染出来再跳转
+      // 先给一次「已填满」的高亮反馈，再跳转，避免看起来像点了没反应
+      group.classList.add('is-complete');
       setTimeout(function () {
         if (typeof form.requestSubmit === 'function') form.requestSubmit();
         else form.submit();
-      }, 120);
+      }, 220);
     }
 
     function initCodeGroups() {

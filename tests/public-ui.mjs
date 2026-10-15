@@ -81,6 +81,24 @@ export async function publicUiSuite(browser) {
   s.ok('取件卡副标题为「输入四位取件码取件」', home.subtitle === '输入四位取件码取件', home.subtitle);
   s.ok('发件卡没有副标题', home.sendSubtitle === undefined, String(home.sendSubtitle));
   s.ok('取件为四个分离输入格', home.pickupBoxes === 4, `格子=${home.pickupBoxes}`);
+
+  // 描边对比度回归：此前 1px + #e4e4e7 压在 #f5f5f7 页面上几乎不可见
+  const boxStyle = await light.evaluate(() => {
+    const st = getComputedStyle(document.querySelector('#pickupBoxes .code-box'));
+    return {
+      width: parseFloat(st.borderTopWidth),
+      color: st.borderTopColor,
+      fill: st.backgroundColor,
+      page: getComputedStyle(document.body).backgroundColor,
+    };
+  });
+  // Chrome 会把 1.5px 之类的非整数边框向下取整为 1px，所以加粗必须是 2px
+  s.ok('四格描边为 2px（加粗已生效）', boxStyle.width >= 2, `${boxStyle.width}px`);
+  s.ok('描边颜色与页面底色明显区分', boxStyle.color !== boxStyle.page, `描边 ${boxStyle.color} / 页面 ${boxStyle.page}`);
+  s.ok('填充色保持卡片白底未改', boxStyle.fill === 'rgb(255, 255, 255)', boxStyle.fill);
+  await light.locator('#pickupBoxes .code-box').first().focus();
+  const ring = await light.evaluate(() => getComputedStyle(document.activeElement).boxShadow);
+  s.ok('聚焦态有明显外环', ring !== 'none' && /rgba?\(/.test(ring), ring);
   s.ok('文件/文本切换按钮为加粗', Number(home.tabWeight) >= 600, `font-weight=${home.tabWeight}`);
   s.ok('文本面板无「文本内容」描述', !home.textHasContentLabel);
   s.ok('发件卡去掉「选择文件」描述', !home.sendChooseLabel);

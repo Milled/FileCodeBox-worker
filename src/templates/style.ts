@@ -21,6 +21,7 @@ export const STYLE = `
   --color-accent-contrast: rgb(255 255 255); /* 主按钮文字 */
   --color-surface:      rgb(255 255 255);
   --color-focus:        rgb(113 113 122);
+  --focus-ring:         rgb(24 24 27 / 0.20);
   --color-success:      rgb(4 120 87);
   --color-warning:      rgb(217 119 6);
   --color-danger:       rgb(220 38 38);
@@ -62,6 +63,7 @@ export const STYLE = `
     --color-accent-contrast: rgb(9 9 11);
     --color-surface:      rgb(24 24 27);
     --color-focus:        rgb(161 161 170);
+    --focus-ring:         rgb(244 244 245 / 0.26);
     --color-success:      rgb(52 211 153);
     --color-warning:      rgb(251 191 36);
     --color-danger:       rgb(248 113 113);
@@ -718,15 +720,19 @@ a.fname:hover { text-decoration: underline; text-underline-offset: 2px; }
   font-variant-numeric: tabular-nums;
   color: var(--color-ink);
   background: var(--color-paper-2);
-  border: 1px solid var(--color-rule);
+  /* 1px + rule(#e4e4e7) 压在 #f5f5f7 页面上几乎不可见。
+     注意 Chrome 会把非整数边框向下取整（1.5px 实测仍渲染为 1px），加粗只能取 2px。 */
+  border: 2px solid var(--color-rule-strong);
   border-radius: var(--radius-control);
   outline: none;
   padding: 0;
   transition: border-color var(--dur-short) var(--ease-out), box-shadow var(--dur-short) var(--ease-out);
 }
-.code-box:hover { border-color: var(--color-rule-strong); }
-.code-box:focus { border-color: var(--color-focus); box-shadow: 0 0 0 3px var(--color-accent-soft); }
-.code-box.filled { border-color: var(--color-rule-strong); }
+.code-box:hover { border-color: var(--color-ink-2); }
+.code-box:focus { border-color: var(--color-ink); box-shadow: 0 0 0 3px var(--focus-ring); }
+.code-box.filled { border-color: var(--color-ink-2); }
+/* 四位填完、跳转前的一次性反馈：只加深描边与外环，不改填充色 */
+.code-boxes.is-complete .code-box { border-color: var(--color-ink); box-shadow: 0 0 0 3px var(--focus-ring); }
 
 /* ---- 悬浮提示（圆圈问号，纯 CSS） ---- */
 .tip {
