@@ -83,6 +83,8 @@ export async function uploadInteractionsSuite(browser) {
   const fCode = navF.url().match(/\/r\/(\d{4})/)[1];
   const years = (new Date((await info(fCode)).expire_at).getTime() - Date.now()) / (365 * 86400000);
   s.ok('expire_style=forever 落到约 100 年后', years > 95 && years < 105, `${years.toFixed(1)} 年`);
+  // 上传后落在成功视图（?sent=1），有效期只在收件人页面呈现
+  await page.goto(`${BASE}/r/${fCode}`, { waitUntil: 'networkidle' });
   s.ok('取件页把永久显示为「永久有效」', /永久有效/.test((await page.textContent('.meta-row')) || ''));
 
   // ---- 文本字节与 512KB 前端拦截 ----
@@ -110,7 +112,9 @@ export async function uploadInteractionsSuite(browser) {
   const want = randomCode();
   await fillCodeBoxes(page, want, 'fileCodeBoxes');
   const [navC] = await Promise.all([page.waitForNavigation({ url: /\/r\/\d{4}/ }), page.click('#submitBtn')]);
-  s.ok('自定义取件码取自上传表单而非页顶取件框', navC.url().endsWith(`/r/${want}`), navC.url());
+  // 回跳带 ?sent=1 成功视图标识，取件码本身仍须来自上传表单
+  s.ok('自定义取件码取自上传表单而非页顶取件框',
+    navC.url().startsWith(`${BASE}/r/${want}?`), navC.url());
 
   // ---- 文本分享达到最大查看次数后，标题必须遮蔽 ----
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });

@@ -222,7 +222,7 @@ export async function downloadFile(
 export async function uploadText(
   c: Context<{ Bindings: Env }>,
   env: Env,
-): Promise<{ code: string; title: string; textSize: number }> {
+): Promise<{ code: string; title: string; textSize: number; text: string }> {
   await assertUploadAllowed(c, env);
 
   const ip = getClientIp(c.req.raw.headers);
@@ -261,7 +261,7 @@ export async function uploadText(
     await insertFile(env.DB, {
       code, filename: title, size: textSize, mimeType: 'text/plain', expireAt, maxDownloads: effectiveMaxDownloads, isText: 1, clientIp: getClientIp(c.req.raw.headers),
     });
-    return { code, title, textSize };
+    return { code, title, textSize, text };
   } catch (e) {
     await releaseCode(env.DB, code);
     throw e;

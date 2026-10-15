@@ -168,10 +168,23 @@ export async function publicUiSuite(browser) {
   ]);
   const fileCode = light.url().match(/\/r\/(\d{4})/)?.[1];
   s.ok('上传后跳转取件页', !!fileCode, `code=${fileCode}`);
+
+  // 上传成功视图应与文本一致：有「继续上传」、无下载入口
+  const sentView = await light.evaluate(() => ({
+    h1: document.querySelector('h1')?.textContent?.trim(),
+    hasContinue: [...document.querySelectorAll('a')].some((a) => a.textContent?.trim() === '继续上传'),
+    hasDownload: !!document.querySelector('a[href^="/api/download/"]'),
+    url: location.href,
+  }));
+  s.ok('文件上传后落在成功视图（与文本一致，无下载入口）',
+    /sent=1$/.test(sentView.url) && sentView.h1 === '上传成功' && sentView.hasContinue && !sentView.hasDownload,
+    `h1=${sentView.h1} 继续上传=${sentView.hasContinue} 下载=${sentView.hasDownload}`);
   await light.shot('public-retrieve-light');
 
   await dark.goto(`${BASE}/r/${fileCode}`, { waitUntil: 'networkidle' });
-  s.ok('深色取件页有下载入口', (await dark.locator('a:has-text("下载文件")').count()) > 0);
+  // 收件人视图（不带 sent）必须仍然可下载
+  const dlHref = await dark.locator('a:has-text("下载文件")').first().getAttribute('href').catch(() => null);
+  s.ok('收件人取件页仍可下载（未被 sent 视图影响）', /^\/api\/download\/\d{4}$/.test(dlHref || ''), String(dlHref));
   await dark.shot('public-retrieve-dark');
 
   // 文本分享 → 结果页 → 取件页
@@ -183,7 +196,37 @@ export async function publicUiSuite(browser) {
     (await light.locator('h1').first().textContent())?.trim() === '上传成功',
     `code=${await light.locator('.code-value').first().textContent()}`);
 
+  // 结果页必须显示所发正文；此前只有字节数（如 "4 B"），会让人以为内容没传上去
+  const shownOnResult = (await light.textContent('.command-text')) || '';
+  s.ok('结果页显示所发文本正文',
+    shownOnResult.includes('公开页回归文本') && shownOnResult.includes('第二行 alpha'),
+    JSON.stringify(shownOnResult.slice(0, 24)));
+  const sizeLine = (await light.textContent('.meta-row')) || '';
+  s.ok('字节数仍作为元信息保留', /\d+(\.\d+)? (B|KB|MB)/.test(sizeLine), sizeLine.trim());
+  // 结果页现在带正文，必须 no-store，否则 CDN 可能把私密内容留在边缘节点
+  const cacheProbe = await light.context().request.post(`${BASE}/api/upload/text`, {
+    form: { text: 'cache header probe', expire_style: 'day', expire_value: '1', max_downloads: '-1' },
+  });
+  const cacheCtl = cacheProbe.headers()['cache-control'];
+  s.ok('文本结果页禁止缓存（含正文）', cacheProbe.status() === 200 && cacheCtl === 'no-store', `${cacheProbe.status()} / ${cacheCtl}`);
+
   const tCode = (await light.locator('.code-value').first().textContent() || '').trim();
+
+  // 正文按纯文本转义，不能执行内联标签
+  await light.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await light.click('.tab[data-tab="text"]');
+  await light.fill('#textInput', '前缀 <img src=x onerror="window.__xss=1"> 后缀');
+  await Promise.all([light.waitForNavigation({ timeout: 30000 }), light.click('#textSubmitBtn')]);
+  const xss = await light.evaluate(() => ({
+    injected: window.__xss === 1,
+    imgCount: document.querySelectorAll('.command-text img').length,
+    text: document.querySelector('.command-text')?.textContent || '',
+  }));
+
+  s.ok('正文转义为纯文本，不执行内联标签',
+    !xss.injected && xss.imgCount === 0 && xss.text.includes('<img src=x'),
+    JSON.stringify(xss.text.slice(0, 30)));
+
   const textPage = await newPage(browser, { scheme: 'dark', tag: 'text' });
   await textPage.goto(`${BASE}/r/${tCode}`, { waitUntil: 'networkidle' });
   await textPage.waitForTimeout(600);

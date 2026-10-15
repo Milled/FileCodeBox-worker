@@ -504,7 +504,8 @@ function homeScript(): string {
         var elapsed = Math.max(1, Date.now() - startedAt);
         if (collected.length === 1) {
           status.textContent = '上传完成，跳转中…';
-          window.location.href = '/r/' + collected[0].code;
+          // sent=1 → 上传成功视图（与文本一致），而非收件人的下载页
+          window.location.href = '/r/' + collected[0].code + '?sent=1';
           return;
         }
         btn.disabled = false;
@@ -602,7 +603,12 @@ ${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', auto
 
 // ---- 上传成功页 ----
 
-export function resultPage(code: string, filename: string, size: number, baseUrl: string): string {
+/**
+ * 上传成功页，文件与文本共用：只给取件码和「继续上传」，不提供下载入口。
+ * text 为刚分享的正文，直接渲染出来供发送者确认；
+ * 只显大小会让用户以为内容没传上去（正文区之前只有 "4 B" 这种字节数）。
+ */
+export function resultPage(code: string, filename: string, size: number, baseUrl: string, text?: string): string {
   const shareUrl = `${baseUrl}/r/${code}`;
   const content = `
     <div class="share-grid">
@@ -617,11 +623,12 @@ export function resultPage(code: string, filename: string, size: number, baseUrl
           </div>
         </div>
         <div class="share-title">${escapeHtml(filename)}</div>
-        <div class="command-box" style="align-items:center;justify-content:center">
+        <div class="command-box">
+          ${text !== undefined ? `<div class="command-text">${escapeHtml(text)}</div>` : ''}
           <div class="meta-row" style="font-size:13px">
             <span>${formatFileSize(size)}</span>
           </div>
-          <a href="/" class="btn btn-secondary" style="width:auto">继续上传</a>
+          <a href="/" class="btn btn-secondary" style="width:auto;align-self:flex-start">继续上传</a>
         </div>
       </div>
       ${shareRightPanel(code, shareUrl)}

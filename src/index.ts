@@ -141,6 +141,11 @@ app.get('/r/:code', async (c) => {
   const code = c.req.param('code').trim();
   const file = await getFileByCode(c.env.DB, code);
   if (!file) return c.html(retrievePage());
+  // 上传成功后的回跳视图：与文本分享一致，只给取件码与「继续上传」，
+  // 不提供下载入口。收件人拿到的 /r/{code}（无 sent）仍是下载页。
+  if (c.req.query('sent') === '1') {
+    return c.html(resultPage(file.code, file.filename, file.size, getBaseUrl(c)));
+  }
   return c.html(filePage(file, getBaseUrl(c)));
 });
 
@@ -161,7 +166,9 @@ app.post('/api/upload', async (c) => {
 app.post('/api/upload/text', async (c) => {
   try {
     const result = await uploadText(c, c.env);
-    return c.html(resultPage(result.code, result.title, result.textSize, getBaseUrl(c)));
+    // 结果页现在含分享正文，禁止缓存，避免 CDN 把私密内容留在边缘节点
+    c.header('Cache-Control', 'no-store');
+    return c.html(resultPage(result.code, result.title, result.textSize, getBaseUrl(c), result.text));
   } catch (e: any) {
     return c.html(errorPage(e?.message ?? '保存失败', '服务器内部错误'), e?.status ?? 500);
   }
