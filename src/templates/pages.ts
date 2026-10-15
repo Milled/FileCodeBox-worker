@@ -633,6 +633,11 @@ function homeScript(): string {
       initDropZone();
       bindExpire('fileExpireValue', 'fileExpireStyle', 'fileMaxDownloads');
       bindExpire('textExpireValue', 'textExpireStyle', 'textMaxDownloads');
+      // 页头「发件」带 ?send=1 回主页：默认焦点在取件框上，这里把视线挪到发件区
+      if (/[?&]send=1/.test(location.search)) {
+        var dz = document.getElementById('dropZone');
+        if (dz) { dz.scrollIntoView({ block: 'center' }); dz.focus(); }
+      }
     });
     </script>`;
 }
@@ -651,8 +656,7 @@ export function retrievePage(): string {
         <p>输入取件码下载文件</p>
       </div>
       <div class="header-actions">
-        <a href="/">上传</a>
-        <a href="/admin">管理</a>
+        ${pageNav()}
       </div>
     </div>
     <div class="code-empty-tip">此取件码为空，请检查后重新输入</div>
@@ -664,45 +668,65 @@ ${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', auto
   return layout('取件', card(content));
 }
 
+/** 页头三件套。发件带 ?send=1 让首页把焦点放到发件区，收件就是回主页 */
+function pageNav(): string {
+  return `<a href="/?send=1">发件</a>
+        <a href="/">收件</a>
+        <a href="/admin">管理</a>`;
+}
+
+/** 元信息行：大小 / 下载次数 / 过期时间。成功页与取件页共用，避免两处格式漂移 */
+function fileMeta(meta: { size: number; download_count: number; max_downloads: number; expire_at: string }): string {
+  const expireDate = new Date(meta.expire_at);
+  const expireStr =
+    expireDate.getTime() - Date.now() > 365 * 86400000
+      ? '永久有效'
+      : `过期: ${expireDate.toLocaleDateString('zh-CN')}`;
+  const dlInfo =
+    meta.max_downloads < 0 ? `已下载 ${meta.download_count} 次` : `已下载 ${meta.download_count}/${meta.max_downloads} 次`;
+  return `<div class="meta-row">
+            <span>${formatFileSize(meta.size)}</span>
+            <span>${dlInfo}</span>
+            <span>${expireStr}</span>
+          </div>`;
+}
+
 // ---- 上传成功页 ----
 
 export function resultPage(opts: {
   code: string;
   title: string;
-  size: number;
   baseUrl: string;
   /** 文本分享时把正文原样渲染出来：只显字节数会让用户以为内容没传上去 */
   text?: string;
   /** 图片文件在浏览器端生成了缩略图 */
   hasThumb?: boolean;
+  meta: { size: number; download_count: number; max_downloads: number; expire_at: string };
 }): string {
-  const { code, title, size, baseUrl, text, hasThumb } = opts;
+  const { code, title, baseUrl, text, hasThumb, meta } = opts;
   const shareUrl = `${baseUrl}/r/${code}`;
   const content = `
     <div class="share-grid">
       <div class="share-left">
         <div class="header">
           <div>
-            <h1>上传成功</h1>
+            <h1>发件成功</h1>
           </div>
           <div class="header-actions">
-            <a href="/">上传</a>
-            <a href="/admin">管理</a>
+            ${pageNav()}
           </div>
         </div>
         <div class="share-title">${escapeHtml(title)}</div>
         <div class="command-box">
           ${hasThumb ? thumbPreview(code) : ''}
           ${text !== undefined ? `<div class="command-text">${escapeHtml(text)}</div>` : ''}
-          <div class="meta-row" style="font-size:13px">
-            <span>${formatFileSize(size)}</span>
-          </div>
-          <a href="/" class="btn btn-secondary" style="width:auto;align-self:flex-start">继续上传</a>
+          <a href="/" class="btn btn-secondary" style="width:auto;align-self:center">继续发件</a>
         </div>
+        ${fileMeta(meta)}
       </div>
       ${shareRightPanel(code, shareUrl)}
     </div>`;
-  return layout('上传成功', card(content), true, true);
+  return layout('发件成功', card(content), true, true);
 }
 
 // ---- 文件详情页 ----
@@ -741,13 +765,7 @@ function shareRightPanel(code: string, shareUrl: string): string {
 }
 
 export function filePage(file: FileRecord, baseUrl: string): string {
-  const sizeStr = formatFileSize(file.size);
-  const dlInfo = file.max_downloads < 0 ? `已下载 ${file.download_count} 次` : `已下载 ${file.download_count}/${file.max_downloads} 次`;
   const expireDate = new Date(file.expire_at);
-  const expireStr =
-    expireDate.getTime() - Date.now() > 365 * 86400000
-      ? '永久有效'
-      : `过期: ${expireDate.toLocaleDateString('zh-CN')}`;
   const expired = expireDate.getTime() < Date.now();
   const shareUrl = `${baseUrl}/r/${file.code}`;
   // 文本分享的标题是正文前 50 字（见 shared.ts 的 title 派生规则）。达到最大查看次数后
@@ -765,8 +783,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
               <h1>取件</h1>
             </div>
             <div class="header-actions">
-              <a href="/">上传</a>
-              <a href="/admin">管理</a>
+              ${pageNav()}
             </div>
           </div>
           <div class="share-title">${displayTitle}</div>
@@ -777,11 +794,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
               <span>复制全文</span>
             </button>
           </div>
-          <div class="meta-row">
-            <span>${sizeStr}</span>
-            <span>${dlInfo}</span>
-            <span>${expireStr}</span>
-          </div>
+          ${fileMeta(file)}
         </div>
         ${shareRightPanel(file.code, shareUrl)}
       </div>
@@ -835,8 +848,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
             <h1>取件</h1>
           </div>
           <div class="header-actions">
-            <a href="/">上传</a>
-            <a href="/admin">管理</a>
+            ${pageNav()}
           </div>
         </div>
         <div class="share-title">${displayTitle}</div>
@@ -844,11 +856,7 @@ export function filePage(file: FileRecord, baseUrl: string): string {
           ${file.has_thumb === 1 && !expired && !exhausted ? thumbPreview(file.code) : fileIconSvg()}
           ${!expired ? `<a href="/api/download/${file.code}" class="btn btn-primary" style="width:auto;padding:12px 40px">下载文件</a>` : ''}
         </div>
-        <div class="meta-row">
-          <span>${sizeStr}</span>
-          <span>${dlInfo}</span>
-          <span>${expireStr}</span>
-        </div>
+        ${fileMeta(file)}
       </div>
       ${shareRightPanel(file.code, shareUrl)}
     </div>`;

@@ -169,22 +169,44 @@ export async function publicUiSuite(browser) {
   const fileCode = light.url().match(/\/r\/(\d{4})/)?.[1];
   s.ok('上传后跳转取件页', !!fileCode, `code=${fileCode}`);
 
-  // 上传成功视图应与文本一致：有「继续上传」、无下载入口
-  const sentView = await light.evaluate(() => ({
-    h1: document.querySelector('h1')?.textContent?.trim(),
-    hasContinue: [...document.querySelectorAll('a')].some((a) => a.textContent?.trim() === '继续上传'),
-    hasDownload: !!document.querySelector('a[href^="/api/download/"]'),
-    url: location.href,
-  }));
+  // 成功视图：与文本一致（有「继续发件」、无下载入口），页头与元信息向取件页对齐
+  const sentView = await light.evaluate(() => {
+    const box = document.querySelector('.command-box');
+    const btn = [...document.querySelectorAll('a')].find((a) => a.textContent?.trim() === '继续发件');
+    const b = btn?.getBoundingClientRect();
+    const c = box?.getBoundingClientRect();
+    const meta = box?.nextElementSibling;
+    return {
+      h1: document.querySelector('h1')?.textContent?.trim(),
+      hasContinue: !!btn,
+      continueCentered: !!b && !!c && Math.abs(b.left + b.width / 2 - (c.left + c.width / 2)) < 2,
+      continueInBox: !!btn && !!box?.contains(btn),
+      nav: [...document.querySelectorAll('.header-actions a')].map((a) => a.textContent?.trim()),
+      metaClass: meta?.className,
+      metaParts: [...(meta?.querySelectorAll('span') || [])].map((x) => x.textContent?.trim()),
+      hasDownload: !!document.querySelector('a[href^="/api/download/"]'),
+      url: location.href,
+    };
+  });
   s.ok('文件上传后落在成功视图（与文本一致，无下载入口）',
-    /sent=1$/.test(sentView.url) && sentView.h1 === '上传成功' && sentView.hasContinue && !sentView.hasDownload,
-    `h1=${sentView.h1} 继续上传=${sentView.hasContinue} 下载=${sentView.hasDownload}`);
+    /sent=1$/.test(sentView.url) && sentView.h1 === '发件成功' && sentView.hasContinue && !sentView.hasDownload,
+    `h1=${sentView.h1} 继续发件=${sentView.hasContinue} 下载=${sentView.hasDownload}`);
+  s.ok('「继续发件」在内容框内水平居中', sentView.continueInBox && sentView.continueCentered);
+  s.ok('成功页页头为发件 / 收件 / 管理',
+    JSON.stringify(sentView.nav) === JSON.stringify(['发件', '收件', '管理']), sentView.nav.join(' / '));
+  s.ok('成功页元信息与取件页一致（大小 / 下载次数 / 过期时间）',
+    sentView.metaClass === 'meta-row' && sentView.metaParts.length === 3
+      && /B|KB|MB/.test(sentView.metaParts[0]) && /已下载/.test(sentView.metaParts[1]) && /过期|永久/.test(sentView.metaParts[2]),
+    sentView.metaParts.join(' · '));
   await light.shot('public-retrieve-light');
 
   await dark.goto(`${BASE}/r/${fileCode}`, { waitUntil: 'networkidle' });
   // 收件人视图（不带 sent）必须仍然可下载
   const dlHref = await dark.locator('a:has-text("下载文件")').first().getAttribute('href').catch(() => null);
   s.ok('收件人取件页仍可下载（未被 sent 视图影响）', /^\/api\/download\/\d{4}$/.test(dlHref || ''), String(dlHref));
+  const recvNav = await dark.evaluate(() => [...document.querySelectorAll('.header-actions a')].map((a) => a.textContent?.trim()));
+  s.ok('取件页页头同样为发件 / 收件 / 管理',
+    JSON.stringify(recvNav) === JSON.stringify(['发件', '收件', '管理']), recvNav.join(' / '));
   await dark.shot('public-retrieve-dark');
 
   // 文本分享 → 结果页 → 取件页
@@ -193,7 +215,7 @@ export async function publicUiSuite(browser) {
   await light.fill('#textInput', '公开页回归文本\n第二行 alpha');
   await Promise.all([light.waitForNavigation({ timeout: 30000 }), light.click('#textSubmitBtn')]);
   s.ok('文本分享渲染结果页且取件码合法',
-    (await light.locator('h1').first().textContent())?.trim() === '上传成功',
+    (await light.locator('h1').first().textContent())?.trim() === '发件成功',
     `code=${await light.locator('.code-value').first().textContent()}`);
 
   // 结果页必须显示所发正文；此前只有字节数（如 "4 B"），会让人以为内容没传上去

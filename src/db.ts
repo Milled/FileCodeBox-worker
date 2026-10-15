@@ -144,7 +144,15 @@ export async function incrementDownload(
 
 /** 缩略图已写入 R2，标记记录以便页面输出 <img>（否则每次开页都会请求一个必然 404 的地址） */
 export async function markThumb(db: D1Database, code: string): Promise<void> {
-  await db.prepare('UPDATE fc_files SET has_thumb = 1 WHERE code = ?').bind(code).run();
+  const sql = 'UPDATE fc_files SET has_thumb = 1 WHERE code = ?';
+  try {
+    await db.prepare(sql).bind(code).run();
+  } catch {
+    // 老库还没补上 has_thumb 列（initDB 只由 Cron 触发，最长要等 30 分钟）。
+    // 不就地补列的话缩略图会静默丢失，表现成「图片就是不显示预览」
+    await db.prepare('ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0').run();
+    await db.prepare(sql).bind(code).run();
+  }
 }
 
 // ---- 删除 ----

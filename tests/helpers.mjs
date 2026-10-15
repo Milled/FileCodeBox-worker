@@ -131,9 +131,9 @@ export async function dropFile(page, { name, type = 'text/plain', content = 'ui 
  * 噪声是无损压缩的最坏情况（900x600 约 1.6MB），才能验证缩略图确实被缩小了；
  * 用字符串喂 dropFile 是造不出图片的。
  */
-export async function dropImage(page, { name = 'photo.png', width = 900, height = 600 } = {}) {
+export async function dropImage(page, { name = 'photo.png', type = 'image/png', width = 900, height = 600 } = {}) {
   await page.evaluate(
-    ([n, w, h]) => {
+    ([n, mime, w, h]) => {
       const canvas = document.createElement('canvas');
       canvas.width = w;
       canvas.height = h;
@@ -148,17 +148,17 @@ export async function dropImage(page, { name = 'photo.png', width = 900, height 
         img.data[i + 3] = 255;
       }
       ctx.putImageData(img, 0, 0);
-      const url = canvas.toDataURL('image/png');
+      const url = canvas.toDataURL(mime, 0.9);
       const bin = atob(url.slice(url.indexOf(',') + 1));
       const bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
       const dt = new DataTransfer();
-      dt.items.add(new File([bytes], n, { type: 'image/png' }));
+      dt.items.add(new File([bytes], n, { type: mime }));
       document
         .getElementById('dropZone')
         .dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
     },
-    [name, width, height],
+    [name, type, width, height],
   );
 }
 

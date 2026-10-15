@@ -259,7 +259,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 |------|------|------|
 | GET | `/` | 首页（上传 + 取件）|
 | GET | `/r` | 取件页；带 `?code=1234` 时 302 跳到 `/r/1234` |
-| GET | `/r/:code` | 取件页（文件详情 / 文本查看）|
+| GET | `/r/:code` | 取件页（文件详情 / 文本查看）；带 `?sent=1` 是上传者落地页 |
 | POST | `/api/upload` | 文件上传（XHR，返回 JSON `{code, filename, size}`）|
 | POST | `/api/upload/text` | 文本上传（表单，返回 HTML 结果页）|
 | GET | `/api/text/:code` | 获取文本内容（纯文本）|
@@ -293,6 +293,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 |------|------|------|
 | 首页 | `/` | 上传文件 + 文本分享 + 取件码输入 |
 | 取件 | `/r/1234` | 文件详情 / 文本查看 + 下载 |
+| 发件成功 | `/r/1234?sent=1` | 上传者落地页：取件码 + 预览，无下载入口 |
 | 管理 | `/admin` | 管理员登录 |
 
 ### 图片缩略图
@@ -306,9 +307,10 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 - **不计下载次数**：缩略图只是页面渲染的一部分，计数会让"打开看一眼"悄悄消耗掉收件人的额度。
 - **只有网页端上传会有**：`curl` 和兼容 API 不经过 canvas，这类文件继续显示图标。
 - 服务端不信任客户端：只接受 WebP/JPEG/PNG 的 magic bytes，硬上限 128KB，且只允许挂在 `image/*`（非 SVG）记录上，用独立限流桶（30 次/60 秒/IP）以免一张图片吃掉两次上传额度。
-- **已有部署升级**：新列 `has_thumb` 由 `initDB()` 的 ALTER 补齐，Cron 每 30 分钟会跑一次；想立刻生效就手动执行
-  `npx wrangler d1 execute filecodebox-db --remote --command "ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0"`。
-  补列之前缩略图写入会失败，但前端静默忽略，页面照常回退成图标。
+- **已有部署不用手动补列**：`has_thumb` 缺失时 `markThumb` 会就地 ALTER 补列再重试一次，Cron 里的 `initDB()` 也会兜底。
+  补列之前的表现是「图片就是不显示预览」而不是报错，因为缩略图全程按可有可无处理。
+- **没出预览时怎么查**：直接访问 `/api/thumb/{取件码}`。404 = 压根没生成（非网页端上传、浏览器解码失败如 HEIC、或额度已用完），
+  500 = 写库失败；页面不会报错，只会安静回退图标。
 
 ### 本地开发与测试
 
@@ -316,7 +318,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
 npm test             # Playwright 无头浏览器跑取件主流程（test-headless.mjs）
-npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 102 项断言
+npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 107 项断言
 ```
 
 `npm run test:ui` 由 `tests/` 下四个套件组成，复用同一个 Chromium：

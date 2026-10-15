@@ -15,7 +15,7 @@ export async function thumbnailSuite(browser) {
   const info = async (code) => (await apiJson(page, `/api/info/${code}`)).json;
   const codeOf = (url) => url.match(/\/r\/(\d{4})/)[1];
 
-  // 上传桶 10 次/60s，本套件共 8 次上传 + 7 次缩略图写入；
+  // 上传桶 10 次/60s，本套件共 9 次上传 + 8 次缩略图写入；
   // 若两者共用一个桶，中途必然 429，因此后面的「全部成功」本身就是分离限流的证据
   await rateLimitBreather();
 
@@ -28,7 +28,7 @@ export async function thumbnailSuite(browser) {
   ]);
   const photo = codeOf(navPhoto.url());
 
-  s.ok('上传成功页显示图片缩略图', (await page.locator('img.file-thumb').count()) === 1, `code=${photo}`);
+  s.ok('发件成功页显示图片缩略图', (await page.locator('img.file-thumb').count()) === 1, `code=${photo}`);
   await page.waitForFunction(() => {
     const i = document.querySelector('img.file-thumb');
     return !!i && i.complete && i.naturalWidth > 0;
@@ -80,6 +80,20 @@ export async function thumbnailSuite(browser) {
       && await page.locator('img.file-thumb').isHidden()
       && await page.locator('.file-icon').first().isVisible());
   await page.unroute('**/api/thumb/*');
+
+  // ---- jpg：报障的是 jpg 和 png 都不出图，两种编码路径都要走一遍 ----
+  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await dropImage(page, { name: 'photo.jpg', type: 'image/jpeg', width: 1000, height: 700 });
+  const [navJpg] = await Promise.all([
+    page.waitForNavigation({ url: /\/r\/\d{4}/, timeout: 60000 }),
+    page.click('#submitBtn'),
+  ]);
+  const jpg = codeOf(navJpg.url());
+  const jpgThumb = await page.request.get(`${BASE}/api/thumb/${jpg}`);
+  const jpgBytes = await jpgThumb.body();
+  s.ok('jpg 同样生成缩略图',
+    (await page.locator('img.file-thumb').count()) === 1 && jpgThumb.status() === 200,
+    `code=${jpg} ${jpgThumb.headers()['content-type']} / ${fmtBytes(jpgBytes.length)}`);
 
   // ---- 非图片：不产出、不渲染、不可伪造 ----
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
@@ -149,7 +163,7 @@ export async function thumbnailSuite(browser) {
     ]);
     if (nav[0].url().indexOf('/r/') < 0) break;
   }
-  s.ok('8 次上传 + 7 次缩略图写入未被限流（两桶独立）',
+  s.ok('9 次上传 + 8 次缩略图写入未被限流（两桶独立）',
     page.url().includes('?sent=1'), page.url());
 
   await s.assertClean(page);

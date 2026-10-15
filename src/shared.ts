@@ -307,7 +307,15 @@ export async function readThumb(
 export async function uploadText(
   c: Context<{ Bindings: Env }>,
   env: Env,
-): Promise<{ code: string; title: string; textSize: number; text: string }> {
+): Promise<{
+  code: string;
+  title: string;
+  textSize: number;
+  text: string;
+  /** 结果页要显示与取件页同一条元信息，把过期与额度一并带回，省一次查库 */
+  expireAt: string;
+  maxDownloads: number;
+}> {
   await assertUploadAllowed(c, env);
 
   const ip = getClientIp(c.req.raw.headers);
@@ -346,7 +354,7 @@ export async function uploadText(
     await insertFile(env.DB, {
       code, filename: title, size: textSize, mimeType: 'text/plain', expireAt, maxDownloads: effectiveMaxDownloads, isText: 1, clientIp: getClientIp(c.req.raw.headers),
     });
-    return { code, title, textSize, text };
+    return { code, title, textSize, text, expireAt, maxDownloads: effectiveMaxDownloads };
   } catch (e) {
     await releaseCode(env.DB, code);
     throw e;
