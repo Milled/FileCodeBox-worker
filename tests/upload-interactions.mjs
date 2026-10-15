@@ -103,6 +103,57 @@ export async function uploadInteractionsSuite(browser) {
   await page.waitForTimeout(500);
   s.ok('超过 512KB 时前端拦截提交', /512KB/.test(dialogText) && page.url() === `${BASE}/`, dialogText);
 
+  // ---- 发件体积上限的前端拦截 ----
+  // 上限值由服务端渲染进 data-max-bytes；这里改小该属性来模拟小上限，
+  // 避免为了造一个 25MB 文件而真上传一次（服务端 413 由后台套件覆盖）
+  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await page.evaluate(() => document.getElementById('dropZone').setAttribute('data-max-bytes', '100'));
+  await dropFile(page, { name: 'big.bin', content: 'x'.repeat(200) });
+  await dropFile(page, { name: 'small.txt', content: 'tiny' });
+  const over = await page.evaluate(() => ({
+    chips: [...document.querySelectorAll('.file-chip')].map((c) => ({
+      n: c.querySelector('.chip-name').textContent,
+      over: c.classList.contains('chip-over'),
+    })),
+    notice: document.getElementById('uploadNotice').hidden ? '' : document.getElementById('uploadNotice').textContent,
+  }));
+  s.ok('超限文件仍进列表但被标红，正常文件不受影响',
+    over.chips.length === 2 && over.chips[0].over && !over.chips[1].over, JSON.stringify(over.chips));
+  s.ok('行内提示条点名超限文件（不用 alert 阻断）', /big\.bin/.test(over.notice) && /100 B/.test(over.notice), over.notice);
+
+  await page.click('#submitBtn');
+  await page.waitForTimeout(1200);
+  const blocked = await page.evaluate(() => ({
+    url: location.href,
+    status: document.getElementById('uploadStatus').textContent,
+    shown: getComputedStyle(document.getElementById('uploadStatus')).display !== 'none',
+    disabled: document.getElementById('submitBtn').disabled,
+  }));
+  s.ok('存在超限文件时提交被整批拦下',
+    blocked.url === `${BASE}/` && blocked.shown && /未开始上传/.test(blocked.status) && !blocked.disabled, blocked.status);
+
+  // ---- 多文件批次：单个失败不中断其余 ----
+  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await dropFile(page, { name: 'first.txt', content: '第一个文件' });
+  await dropFile(page, { name: 'second.txt', content: '第二个文件' });
+  await expandExtra(page, '#tab-file');
+  // 两个文件共用一个自定义取件码：第二个必然撞码，正好验证批次不被中断
+  await fillCodeBoxes(page, randomCode(), 'fileCodeBoxes');
+  await Promise.all([
+    page.waitForFunction(() => document.querySelectorAll('.result-item').length === 2, null, { timeout: 30000 }),
+    page.click('#submitBtn'),
+  ]);
+  const batch = await page.evaluate(() => ({
+    status: document.getElementById('uploadStatus').textContent,
+    ok: document.querySelectorAll('.result-item:not(.result-failed) .rcode').length,
+    fail: [...document.querySelectorAll('.result-failed .rfail')].map((e) => e.textContent),
+    kept: [...document.querySelectorAll('.file-chip .chip-name')].map((e) => e.textContent),
+  }));
+  s.ok('单个文件失败不中断整批，并汇总成败',
+    /成功 1 个 · 失败 1 个/.test(batch.status) && batch.ok === 1 && batch.fail.length === 1 && /已被占用/.test(batch.fail[0]),
+    `${batch.status} | ${batch.fail.join(',')}`);
+  s.ok('失败的那个保留在待传列表里', batch.kept.length === 1 && batch.kept[0] === 'second.txt', batch.kept.join(','));
+
   // ---- 自定义取件码作用域（历史 bug：会误读页顶取件框） ----
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
   // 页顶取件框只填三位：不足四位不会自动跳转，才能继续验证后面的发件表单

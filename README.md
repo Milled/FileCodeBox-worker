@@ -12,6 +12,7 @@
 - 🖼️ **图片预览** — 上传的是图片时，成功页与取件页直接显示缩略图（详见[图片缩略图](#图片缩略图)）
 - 🔐 **管理后台** — 统计仪表盘、文件筛选/排序/分页/删除、系统设置页、登录速率限制
 - ⏰ **灵活有效期** — 天 / 小时 / 分钟 / 按次数 / 永久，五种方式在上传时直接选择
+- 🚧 **超限前置拦截** — 超过当前大小上限的文件在列表里标红，提交时整批不发；多文件某个失败也不中断其余，收尾汇总成败
 - 🎨 **中性 zinc 设计系统** — 对齐上游 2024 主题：纯色底、大圆角玻璃卡、单色强调，深色模式跟随系统
 - 🔌 **开放 API** — 兼容 FileCodeBox v2.1.0，游客上传可在后台一键关闭
 
@@ -318,7 +319,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
 npm test             # Playwright 无头浏览器跑取件主流程（test-headless.mjs）
-npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 109 项断言
+npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 114 项断言
 ```
 
 `npm run test:ui` 由 `tests/` 下四个套件组成，复用同一个 Chromium：
@@ -326,7 +327,7 @@ npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 
 | 文件 | 覆盖 |
 |------|------|
 | `tests/public-ui.mjs` | 设计 token（背景无外部依赖、卡片圆角、主按钮明暗反转）、深色模式、内联 SVG 图标可解码、tab 切换不被 CSP 拦、上传→取件→复制→文本回读、移动端无横向溢出 |
-| `tests/upload-interactions.mjs` | 拖拽 / 粘贴 / 多选 chip 增删、多文件顺序上传出多个码、字节与速率明细、五种有效期真实落库（`count`→`max_downloads`、`hour`→2.000h、`forever`→100 年）、512KB 前端拦截、自定义取件码作用域 |
+| `tests/upload-interactions.mjs` | 拖拽 / 粘贴 / 多选 chip 增删、多文件顺序上传出多个码、字节与速率明细、五种有效期真实落库（`count`→`max_downloads`、`hour`→2.000h、`forever`→100 年）、512KB 前端拦截、**体积超限 chip 标红 + 整批拦下**、**单个失败不中断批次且失败项留在列表**、自定义取件码作用域 |
 | `tests/admin-settings.mjs` | 统计卡与列表总数一致、文件行标签与链接、设置页保存/回显、**openUpload 关闭后首页与兼容 API 同时 401 而管理员会话仍 200**、上限改 1MB 立即生效、清空后回退 vars |
 | `tests/thumbnails.mjs` | 浏览器端确实按 480px 缩放、缩略图 ≤96KB 且 `no-store`、两个落地页都出图、渲染尺寸不超过卡片、取图失败回退图标、非图片不产出且伪造上传被 415/404 拒、**额度耗尽后缩略图一起消失**、多文件各自带图、缩略图写入不占上传额度 |
 
@@ -401,6 +402,15 @@ npx wrangler r2 object put filecodebox-file/bg.webp --file=./bg.webp --content-t
 | 长期默认值 | 改 `wrangler.jsonc` 的 `vars.MAX_FILE_SIZE` 后 `npm run deploy` |
 
 设置页里把数值清空并保存，即删除覆盖、回退到 `wrangler.jsonc` 的 vars。
+
+**上限会渲染进首页**（`dropzone` 的 `data-max-bytes`，提示语里也写明"单个文件上限 25.0 MB"），所以后台改完不用改代码：
+
+- 超限文件仍会进待传列表，但对应 chip 标红并写「超上限」，行内提示条点名是哪几个、多大
+- 只要列表里有一个超限，点「发件并获取取件码」整批不发（避免半批上传后误以为都成功了）
+- 服务端 413 照旧兜底：直接打 API、或页面停在旧上限上没刷新时，仍会被拒
+
+多文件批次不再"一个失败就中断整批"：单个文件失败只记一条 `文件名 · 原因`，其余继续上传，
+收尾汇总「成功 N 个 · 失败 M 个」，失败的文件保留在待传列表里便于直接重试。
 
 有效期不再只有「天数」：上传表单的有效期选择器直接对应后端 `expire_style`，可选
 `day / hour / minute / count（按次数失效）/ forever（永久）`；选 `count` 时会自动把「最大下载次数」联动锁定为该数值，避免两个字段互相矛盾。

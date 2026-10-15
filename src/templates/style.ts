@@ -601,6 +601,11 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   transition: background var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out);
 }
 .file-chip .chip-remove:hover { background: var(--color-paper-3); color: var(--color-ink); }
+/* 超过发件上限的文件：允许留在列表里，但明确标红，提交时整批拦下 */
+.file-chip.chip-over { border-color: var(--color-danger); }
+.file-chip.chip-over .chip-size { color: var(--color-danger); }
+/* 行内提示条：替代 alert，不阻断操作也能看清被拦下的是哪几个 */
+.upload-notice { font-size: 13px; line-height: 1.6; color: var(--color-danger); margin-top: 8px; }
 
 /* ---- 字段行 / 有效期控件 ---- */
 .field-row { display: flex; gap: 12px; }
@@ -662,6 +667,9 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
 }
 .result-item a { color: var(--color-ink); text-decoration: underline; text-underline-offset: 2px; }
 .result-item a:hover { color: var(--color-ink-2); }
+/* 多文件批次里单个文件失败：不中断其余，逐条列出原因 */
+.result-item.result-failed { border-color: var(--color-danger); }
+.result-item .rfail { color: var(--color-danger); font-size: 12px; }
 
 /* ---- 游客上传关闭空态 ---- */
 .empty-state {

@@ -24,7 +24,7 @@ import {
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
-import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, resolveLimits } from './shared';
+import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, resolveLimits, FALLBACK_MAX_FILE_SIZE } from './shared';
 import { generateQRCodeGIF } from './qr';
 import { STYLE } from './templates/style';
 import type { HomeOptions } from './templates/pages';
@@ -80,9 +80,13 @@ function getBaseUrl(c: Context<{ Bindings: Env }>): string {
 async function homeOptions(env: Env): Promise<HomeOptions> {
   try {
     const [openUpload, limits] = await Promise.all([getSetting(env.DB, 'open_upload'), resolveLimits(env)]);
-    return { uploadAllowed: (openUpload ?? '1') !== '0', defaultExpireDays: limits.defaultExpireDays };
+    return {
+      uploadAllowed: (openUpload ?? '1') !== '0',
+      defaultExpireDays: limits.defaultExpireDays,
+      maxFileSize: limits.maxSize,
+    };
   } catch {
-    return { uploadAllowed: true, defaultExpireDays: 7 };
+    return { uploadAllowed: true, defaultExpireDays: 7, maxFileSize: FALLBACK_MAX_FILE_SIZE };
   }
 }
 

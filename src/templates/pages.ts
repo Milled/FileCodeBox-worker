@@ -1,5 +1,6 @@
 import type { FileRecord } from '../types';
 import { formatFileSize, escapeHtml } from '../utils';
+import { FALLBACK_MAX_FILE_SIZE } from '../shared';
 import { layout } from './layout';
 
 /** layout 不再包卡片，页面自行决定卡片数量（首页三张，其余一张） */
@@ -12,6 +13,8 @@ export interface HomeOptions {
   uploadAllowed?: boolean;
   /** 当前生效的默认过期天数（fc_settings 优先于 wrangler vars） */
   defaultExpireDays?: number;
+  /** 当前生效的单文件上限，前端据此拦截超限文件 */
+  maxFileSize?: number;
 }
 
 /** 有效期选择器：后端 parseExpire 已支持 day/hour/minute/count/forever，UI 全部开放 */
@@ -80,6 +83,7 @@ function tip(text: string): string {
 export function homePage(opts: HomeOptions = {}): string {
   const uploadAllowed = opts.uploadAllowed !== false;
   const days = typeof opts.defaultExpireDays === 'number' && opts.defaultExpireDays > 0 ? opts.defaultExpireDays : 7;
+  const maxBytes = typeof opts.maxFileSize === 'number' && opts.maxFileSize > 0 ? opts.maxFileSize : FALLBACK_MAX_FILE_SIZE;
 
   // ① 标题 + 管理入口 + 取件
   const pickupCard = `
@@ -99,7 +103,7 @@ ${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', auto
 
   // ② 发件
   const sendCard = `
-    ${uploadAllowed ? uploadUi(days) : guestBlockedUi()}
+    ${uploadAllowed ? uploadUi(days, maxBytes) : guestBlockedUi()}
     ${uploadAllowed ? homeScript() : ''}
     ${codeGroupsScript()}`;
 
@@ -197,7 +201,7 @@ function codeGroupsScript(): string {
 }
 
 /** 上传面板（文件 + 文本），仅在允许游客上传时渲染 */
-function uploadUi(days: number): string {
+function uploadUi(days: number, maxBytes: number): string {
   return `
     <div class="tabs">
       <button class="tab active" data-tab="file" onclick="switchTab('file')">文件</button>
@@ -208,13 +212,14 @@ function uploadUi(days: number): string {
     <div id="tab-file" class="tab-panel active">
       <form id="uploadForm" onsubmit="return handleUpload(event)">
         <div class="input-group">
-          <div class="dz" id="dropZone" tabindex="0" role="button" aria-label="点击或拖拽文件上传">
+          <div class="dz" id="dropZone" tabindex="0" role="button" aria-label="点击或拖拽文件上传" data-max-bytes="${maxBytes}">
             <span class="dz-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17V5"/><path d="m7 10 5-5 5 5"/><path d="M5 19h14"/></svg></span>
             <span class="dz-title">点击选择，或拖拽文件到此处</span>
-            <span class="dz-hint">支持直接粘贴 · 可多选，每个文件各自生成取件码</span>
+            <span class="dz-hint">支持直接粘贴 · 可多选，每个文件各自生成取件码 · 单个文件上限 ${escapeHtml(formatFileSize(maxBytes))}</span>
             <input type="file" name="file" id="fileInput" class="dz-input" multiple>
           </div>
           <div class="file-chips" id="fileList"></div>
+          <p class="upload-notice" id="uploadNotice" role="alert" hidden></p>
         </div>
         <details class="extra">
           <summary>额外发件设置</summary>
@@ -308,6 +313,36 @@ function homeScript(): string {
     }
 
     // ---- 文件选择：点击 / 拖拽 / 粘贴 ----
+    // 上限由服务端写进 dropzone 的 data-max-bytes（fc_settings 优先于 wrangler vars），
+    // 前端写死数字会让后台一改设置就失真
+    function maxBytes() {
+      var dz = document.getElementById('dropZone');
+      var n = dz ? parseInt(dz.getAttribute('data-max-bytes'), 10) : 0;
+      return Number.isFinite(n) && n > 0 ? n : Infinity;
+    }
+
+    function overLimit() {
+      var cap = maxBytes();
+      return pendingFiles.filter(function (f) { return f.size > cap; });
+    }
+
+    function notice(msg) {
+      var el = document.getElementById('uploadNotice');
+      if (!el) return;
+      el.textContent = msg || '';
+      el.hidden = !msg;
+    }
+
+    // 超限文件允许留在列表里（否则用户不知道被丢了哪个），但标红并在提交时整体拦下
+    function reportOverLimit() {
+      var overs = overLimit();
+      if (!overs.length) { notice(''); return overs; }
+      var cap = maxBytes();
+      notice(overs.length + ' 个文件超过 ' + fmtBytes(cap) + ' 上限，点击发件不会开始上传：'
+        + overs.map(function (f) { return f.name + '（' + fmtBytes(f.size) + '）'; }).join('、'));
+      return overs;
+    }
+
     function addFiles(list) {
       var seen = {};
       pendingFiles.forEach(function (f) { seen[f.name + ':' + f.size] = true; });
@@ -316,27 +351,31 @@ function homeScript(): string {
         if (!seen[key]) { pendingFiles.push(f); seen[key] = true; }
       });
       renderChips();
+      reportOverLimit();
     }
 
     function renderChips() {
       var box = document.getElementById('fileList');
       if (!box) return;
+      var cap = maxBytes();
       box.textContent = '';
       pendingFiles.forEach(function (f, i) {
+        var over = f.size > cap;
         var chip = document.createElement('div');
-        chip.className = 'file-chip';
+        chip.className = over ? 'file-chip chip-over' : 'file-chip';
         var name = document.createElement('span');
         name.className = 'chip-name';
         name.textContent = f.name;
         var size = document.createElement('span');
         size.className = 'chip-size';
-        size.textContent = fmtBytes(f.size);
+        size.textContent = over ? fmtBytes(f.size) + ' · 超上限' : fmtBytes(f.size);
+        if (over) size.title = '超过 ' + fmtBytes(cap) + ' 的发件上限，不会被上传';
         var rm = document.createElement('button');
         rm.type = 'button';
         rm.className = 'chip-remove';
         rm.setAttribute('aria-label', '移除 ' + f.name);
         rm.textContent = '×';
-        rm.onclick = function () { pendingFiles.splice(i, 1); renderChips(); };
+        rm.onclick = function () { pendingFiles.splice(i, 1); renderChips(); reportOverLimit(); };
         chip.appendChild(name); chip.appendChild(size); chip.appendChild(rm);
         box.appendChild(chip);
       });
@@ -509,6 +548,13 @@ function homeScript(): string {
       var meta = document.getElementById('uploadMeta');
       var results = document.getElementById('uploadResults');
       if (!pendingFiles.length) { alert('请先选择文件'); return false; }
+      // 有一个超限就整批不发：半批上传会让人以为全部成功了
+      if (reportOverLimit().length) {
+        status.style.display = 'block';
+        status.textContent = '未开始上传';
+        return false;
+      }
+      notice('');
 
       var totalBytes = pendingFiles.reduce(function (s, f) { return s + f.size; }, 0);
       var query = uploadParams();
@@ -545,6 +591,7 @@ function homeScript(): string {
       var jobs = pendingFiles.slice();
       var chain = Promise.resolve();
       var collected = [];
+      var failed = [];
       jobs.forEach(function (file, idx) {
         chain = chain.then(function () {
           return uploadOne(file, query, function (loaded, total) {
@@ -553,19 +600,24 @@ function homeScript(): string {
           }).then(function (data) {
             done += file.size;
             collected.push({ name: file.name, code: data.code, size: file.size });
-            paint(done, '已完成 ' + collected.length + '/' + jobs.length);
+            paint(done, '已完成 ' + (collected.length + failed.length) + '/' + jobs.length);
             // 缩略图必须在跳转前落库，成功页才知道该不该输出 <img>；
             // 失败只回退成文件图标，不能拖垮整条上传链
             return makeThumb(file).then(function (thumb) {
               return thumb ? uploadThumb(data.code, thumb) : null;
             });
+          }).catch(function (err) {
+            // 单个文件失败不再中断整批：后面的继续传，最后统一汇总
+            done += file.size;
+            failed.push({ file: file, name: file.name, reason: (err && err.message) || '上传失败' });
+            paint(done, '已完成 ' + (collected.length + failed.length) + '/' + jobs.length);
           });
         });
       });
 
       chain.then(function () {
         var elapsed = Math.max(1, Date.now() - startedAt);
-        if (collected.length === 1) {
+        if (collected.length === 1 && !failed.length) {
           status.textContent = '上传完成，跳转中…';
           // sent=1 → 上传成功视图（与文本一致），而非收件人的下载页
           window.location.href = '/r/' + collected[0].code + '?sent=1';
@@ -573,9 +625,12 @@ function homeScript(): string {
         }
         btn.disabled = false;
         btn.textContent = '发件并获取取件码';
-        status.textContent = '全部完成 · ' + collected.length + ' 个文件 · ' + (elapsed / 1000).toFixed(1) + 's';
+        status.textContent = (failed.length
+          ? (collected.length ? '成功 ' + collected.length + ' 个 · 失败 ' + failed.length + ' 个' : '全部上传失败')
+          : '全部完成 · ' + collected.length + ' 个文件') + ' · ' + (elapsed / 1000).toFixed(1) + 's';
         // 小文件走不到采样窗口，收尾用平均速率，避免显示 0 B/s
-        meta.textContent = fmtBytes(totalBytes) + ' / ' + fmtBytes(totalBytes) + ' · 平均 ' + fmtBytes((totalBytes / elapsed) * 1000) + '/s';
+        var sentBytes = collected.reduce(function (s, f) { return s + f.size; }, 0);
+        meta.textContent = fmtBytes(sentBytes) + ' / ' + fmtBytes(totalBytes) + ' · 平均 ' + fmtBytes((sentBytes / elapsed) * 1000) + '/s';
         collected.forEach(function (item) {
           var row = document.createElement('div');
           row.className = 'result-item';
@@ -591,8 +646,22 @@ function homeScript(): string {
           row.appendChild(name); row.appendChild(code); row.appendChild(link);
           results.appendChild(row);
         });
-        pendingFiles = [];
+        failed.forEach(function (item) {
+          var row = document.createElement('div');
+          row.className = 'result-item result-failed';
+          var name = document.createElement('span');
+          name.className = 'rname';
+          name.textContent = item.name;
+          var reason = document.createElement('span');
+          reason.className = 'rfail';
+          reason.textContent = item.reason;
+          row.appendChild(name); row.appendChild(reason);
+          results.appendChild(row);
+        });
+        // 失败的留在列表里，用户移除坏文件后可直接重试其余的
+        pendingFiles = failed.map(function (item) { return item.file; });
         renderChips();
+        if (failed.length) notice(failed.length + ' 个文件上传失败，已保留在列表中；其余 ' + collected.length + ' 个已完成。');
       }).catch(function (err) {
         alert(err.message || '上传失败');
         btn.disabled = false;

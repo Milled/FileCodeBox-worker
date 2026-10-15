@@ -22,7 +22,7 @@ import {
 // ===================== 运行时上限 =====================
 
 /** 25MB，与 wrangler.jsonc 的 MAX_FILE_SIZE 默认值一致 */
-const FALLBACK_MAX_FILE_SIZE = 26214400;
+export const FALLBACK_MAX_FILE_SIZE = 26214400;
 const FALLBACK_EXPIRE_DAYS = 7;
 
 /**
