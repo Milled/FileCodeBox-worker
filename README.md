@@ -1,493 +1,248 @@
 # FileCodeBox Worker
 
-> 像取快递一样取文件 — Cloudflare Workers 重写版
+> 像取快递一样取文件 —— 上传后拿到 4 位取件码，对方输码即取，到期自动销毁。
 
-基于 [FileCodeBox](https://github.com/vastsa/FileCodeBox) 的 Cloudflare Workers 移植版，无需服务器，免费部署在 Cloudflare 边缘网络。
+[FileCodeBox](https://github.com/vastsa/FileCodeBox) 的 Cloudflare Workers 移植版：**不需要服务器，也没有构建步骤**，代码直接跑在边缘节点，数据放在 D1（SQLite）+ R2（对象存储），免费额度就能长期挂着。
+
+| 项目 | 说明 |
+|------|------|
+| 运行环境 | Cloudflare Workers · [Hono](https://hono.dev/) · TypeScript |
+| 存储 | D1（元数据）+ R2（文件本体） |
+| 前端 | 服务端渲染，样式与脚本全部内联，**零外部 CDN / 字体 / 图片依赖** |
+| 运行时依赖 | 只有 `hono` 和 `qr` 两个包 |
+| 默认限制 | 单文件 25 MB · 7 天过期 · 文本 512 KB（后台可随时改，不需重新部署） |
+| 深色模式 | 跟随系统 |
+
+---
 
 ## ✨ 功能
 
-- 📤 **上传文件** — 点击 / 拖拽 / 粘贴均可，支持多选，每个文件各自生成 4 位取件码（多选时自动分配**连号**，见[多文件的自定义取件码](#多文件的自定义取件码)；大小上限可配置，见[上传大小与过期配置](#上传大小与过期配置)）
-- 📝 **文本分享** — 粘贴文本即可生成分享链接，页面内直接查看，实时显示 UTF-8 字节数
-- 📥 **取件下载** — 输入取件码下载文件或查看文本
-- 🖼️ **图片预览** — 上传的是图片时，成功页与取件页直接显示缩略图（详见[图片缩略图](#图片缩略图)）
-- 🔐 **管理后台** — 统计仪表盘、文件筛选/排序/分页/删除、系统设置页、登录速率限制
-- ⏰ **灵活有效期** — 天 / 小时 / 分钟 / 按次数 / 永久，五种方式在上传时直接选择
-- 🚧 **超限前置拦截** — 超过当前大小上限的文件在列表里标红，提交时整批不发；多文件某个失败也不中断其余，收尾汇总成败
-- 🎨 **中性 zinc 设计系统** — 对齐上游 2024 主题：纯色底、大圆角玻璃卡、单色强调，深色模式跟随系统
-- 🔌 **开放 API** — 兼容 FileCodeBox v2.1.0，游客上传可在后台一键关闭
+- 📤 **上传文件** — 点击 / 拖拽 / 粘贴均可，支持多选；每个文件各自一个取件码，多选时自动分配**连号码**
+- 📝 **文本分享** — 粘贴文本即得取件码，页面内直接阅读，实时显示 UTF-8 字节数
+- 📥 **取件下载** — 输 4 位码即取，填满自动提交；码不存在或为空时回到取件框重新输入
+- 🖼️ **图片预览** — 上传的是图片时，落地页与取件页直接显示缩略图
+- ⏰ **灵活有效期** — 天 / 小时 / 分钟 / 按下载次数 / 永久，上传时直接选
+- 🚧 **上传前置校验** — 超过大小上限的文件在列表里标红并整批拦下；多文件时某个失败不中断其余，收尾汇总成败
+- 🔐 **管理后台** — 统计仪表盘、文件搜索 / 排序 / 分页 / 删除、系统设置页
+- 🔌 **开放 API** — 兼容 FileCodeBox v2.1.0，`curl` 即可调用
 
 ## 🛡️ 安全特性
 
-经过多轮代码审查加固，具备以下安全能力：
-
-- **XSS 防护** — 所有用户输入经 `escapeHtml()` 转义
+- **XSS 防护** — 所有回显的用户输入统一转义；分享的文本按纯文本渲染，内联标签不会执行
+- **严格 CSP** — `default-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`，不加载任何第三方资源
 - **密码安全** — PBKDF2 10 万次迭代哈希 + 常数时间比较（防时序攻击）
-- **登录限流** — 60 秒窗口内最多 5 次尝试（按客户端 IP）
-- **取件码安全** — CSPRNG 生成 + 防碰撞检测 + 删除/过期后释放复用
-- **SQL 注入防护** — 全部使用参数化查询
-- **CSP 安全头** — 限制资源加载来源，降低 XSS 影响面
-- **文件删除顺序** — R2 先删、DB 兜底（try/finally），避免孤儿文件
-- **缩略图不外泄** — 与正文共用同一套额度判断，次数耗尽即 404；随主文件一起删除，过期清理与孤儿扫描都覆盖 `thumb:` 前缀
+- **限流** — 登录 5 次 / 60 秒、上传 10 次 / 60 秒（按客户端 IP），各类写操作独立计数
+- **SQL 注入防护** — 全部参数化查询
+- **取件码安全** — CSPRNG 生成 + 抢占式占用（`INSERT OR IGNORE` 原子判定，消除并发竞态）
+- **私密内容不被缓存** — 取件页与含正文的结果页一律 `Cache-Control: no-store`
+- **删除即彻底** — 先删 R2 再删 DB（`try/finally` 兜底）；缩略图随主文件一并销毁，过期清理与孤儿对象扫描都覆盖
+- **额度即隐私边界** — 达到最大下载次数后，正文与缩略图一并拒绝访问，文本标题遮蔽为 `***`
+- **游客上传可一键关闭** — 同时作用于网页上传与兼容 API，管理员登录态不受影响；取件与下载始终开放
 
-## 📦 部署方式
+---
 
-### 方式一：Wrangler CLI 部署（推荐本地开发）
+## 🚀 部署（GitHub + Cloudflare Dashboard）
 
-#### 1. 准备工作
+准备：把你的 Fork 推到 GitHub，以及一个 [Cloudflare 账号](https://dash.cloudflare.com/sign-up)。
 
-- [Cloudflare 账号](https://dash.cloudflare.com/sign-up)
-- [Node.js 18+](https://nodejs.org/)
+### 1. 连接仓库
 
-#### 2. 安装 Wrangler 并登录
+Cloudflare Dashboard → **Workers & Pages → Create → Import a Git repository**，选中你的仓库。
 
-```bash
-npm install -g wrangler
-wrangler login
-```
+构建配置保持默认即可 —— 本项目没有构建步骤，入口是 `src/index.ts`，由 Wrangler 直接上传。
 
-#### 3. 克隆项目 & 安装依赖
+### 2. D1 与 R2 会自动创建
 
-```bash
-git clone https://github.com/Milled/FileCodeBox-worker.git
-cd FileCodeBox-worker
-npm install
-```
-
-#### 4. 自动开通 D1 与 R2
-
-`wrangler deploy` 本身不会创建云资源，本仓库提供 `npm run provision` 幂等地完成创建与绑定：
-
-```bash
-npm run provision
-```
-
-脚本按 `wrangler.jsonc` 里声明的资源名执行（全程走 `wrangler` 命令，不经过 shell）：
-
-1. `wrangler whoami --json` 校验登录状态 —— 实测未登录时 `whoami` 仍返回退出码 0，所以只信它的 `loggedIn` 字段
-2. 存在 `filecodebox-db` 就复用，不存在则 `wrangler d1 create`（从输出中抓取 UUID）
-3. 存在 `filecodebox-file` 就复用，不存在则 `wrangler r2 bucket create`
-4. 把返回的 `database_id` 回填进 `wrangler.jsonc`（正则改写，保留注释）
-5. 对新库执行 `schema.sql` 建表 —— 空库上后台登录会因缺 `fc_settings` 表直接 500
-
-可选参数：
-
-```bash
-npm run provision -- --dry-run        # 只报告将要执行的动作，不创建、不写文件
-npm run provision -- --location=apac  # 指定 D1 主位置（weur/eeur/apac/oc/wnam/enam），跳过交互询问
-```
-
-想换资源名或 Worker 名，直接改 `wrangler.jsonc` 后重跑 `npm run provision`：
+`wrangler.jsonc` 声明了这两个绑定，但**故意不写 `database_id`**：
 
 ```jsonc
-{
-  "name": "filecodebox",              // 同一账号内必须唯一，冲突时改名
-  "d1_databases": [{
-    "binding": "DB",
-    "database_name": "filecodebox-db",
-    "database_id": ""                 // 留空即可，由 provision 回填
-  }],
-  "r2_buckets": [{
-    "binding": "FILE_STORE",
-    "bucket_name": "filecodebox-file"
-  }]
-}
+"d1_databases": [{ "binding": "DB", "database_name": "filecodebox-db", "database_id": "" }],
+"r2_buckets":   [{ "binding": "FILE_STORE", "bucket_name": "filecodebox-file" }]
 ```
 
-> - 配置中**不写 `account_id`**，wrangler 会使用 `wrangler login` 的当前账号（多账号时交互式选择）。
-> - 若 wrangler 创建 D1 后询问「是否写入配置文件」，请选 **No**：由脚本回填，否则会追加一条重复的 `binding = DB` 导致部署失败。
-> - R2 需在 Cloudflare 控制台首次接受服务条款后才能通过 API 创建，否则创建存储桶这一步会失败并给出提示。
+从 Dashboard / GitHub 部署时，Cloudflare 会按声明自动创建同名资源并完成绑定，你不用手动建。两点需要知道：
 
-#### 5. 设置管理员密码（Secret，不写入配置）
+- 创建出的 ID **不会写回仓库**，只在 Dashboard 里可见。这不影响线上运行；但如果你之后想在本地 `wrangler deploy`，先跑一次 `npm run provision` 把 ID 回填（它会复用已存在的同名资源）。
+- 想换 Worker 名或资源名，直接改 `wrangler.jsonc` 里的 `name` / `database_name` / `bucket_name` 再推送。`name` 在同一账号下必须唯一。
 
-```bash
-wrangler secret put ADMIN_PASSWORD
-# 输入你的管理员密码
-```
+### 3. 设置管理员密码（Secret）
 
-未设置该 Secret 时，后台登录会被拒绝并提示「未配置管理员密码」。
+部署完成后进入该 Worker → **Settings → Variables and Secrets → Add → Secret text**：
 
-#### 6. 部署
-
-```bash
-npm run deploy
-```
-
-表结构已由第 4 步的 `schema.sql` 建好。若跳过 provision，Cron 每 30 分钟也会幂等补建，但**别指望部署后立刻访问 `/api/init`**：该接口要求管理员身份，而登录又要读 `fc_settings` 表，空库上两者都会 500（实测如此）。
-
----
-
-### 方式二：Cloudflare Dashboard Git 集成（推送自动部署）
-
-> Git 集成只负责构建和发布，**同样不会创建 D1 / R2**。请先在本地跑一次 `npm run provision`（方式一第 4 步）把资源和 `database_id` 准备好，再连接仓库。
-
-#### 1. Fork 本项目到自己的 GitHub
-
-#### 2. 在 Cloudflare Dashboard 操作
-
-1. 进入 **Workers & Pages** → **创建** → **Pages** → **连接到 Git**
-2. 选择你的仓库，构建设置：
-   - **构建命令**：`npm install`
-   - **输出目录**：留空
-3. 点击保存，首次部署会失败（缺少 R2 / D1 绑定）—— 这是正常的
-
-#### 3. 绑定资源
-
-部署后进入项目 **Settings** → **Bindings**：
-
-**R2 存储桶绑定：**
-
-| Binding | 说明 |
-|---------|------|
-| `FILE_STORE` | 选择已有的 R2 存储桶，默认名称 `filecodebox-file` |
-
-**D1 数据库绑定：**
-
-| Binding | 数据库 |
-|---------|--------|
-| `DB` | 选择已有的 D1 数据库，默认名称 `filecodebox-db` |
-
-**Vars（非 Secret）：**
-
-| 变量 | 说明 |
+| 名称 | 值 |
 |------|------|
-| `MAX_FILE_SIZE` | 单文件上限（字节），默认 `26214400` |
-| `DEFAULT_EXPIRE_DAYS` | 默认过期天数，默认 `7` |
-
-**Secret（管理员密码）：**
-
-| Secret | 说明 |
-|--------|------|
 | `ADMIN_PASSWORD` | 你的管理员密码 |
 
-#### 4. 重新部署
+不设这个变量时上传与取件照常，但后台无法登录。密码请存成 Secret，不要写成明文 Variable。
 
-绑定资源后，在 Pages 项目页面点击 **重新部署**（或推送新 commit 自动触发）。
+### 4. 首次访问：等一次建表
 
-#### 5. 初始化数据库
+数据表由 Worker 自己创建（`initDB()`），触发时机是**每 30 分钟一次的 Cron**（`triggers.crons` 已配好）。所以刚部署完立刻打开 `/admin` 可能报错，等半小时即正常。
 
-用命令直接建表最可靠：
+不想等就在本地跑一次，它会复用同名资源、回填 ID 并执行 `schema.sql`：
 
 ```bash
-npx wrangler d1 execute filecodebox-db --remote --file=./schema.sql --yes
+npm install && npx wrangler login && npm run provision
 ```
 
-不要用 `/api/init` 做首次初始化 —— 它要求管理员身份，而登录要读 `fc_settings` 表，空库上两者互相卡死（都返回 500）。兜底方案是等 Cron 每 30 分钟自动幂等建表。
+> 别用 `/api/init` 做首次初始化 —— 它要求管理员身份，而登录又要读 `fc_settings` 表，空库上两者互相卡死。
+
+### 5. 开始使用
+
+打开 `https://<你的 Worker 域名>/` 上传即可。后台在 `/admin`。
+
+想用更好记的地址：Worker → **Settings → Domains & Routes** 绑定自定义域名（域名需托管在 Cloudflare）。
 
 ---
 
-### 常见问题
+## 🔌 API
 
-#### Build token 过期
+两套接口：**兼容 API**（程序调用，统一返回 `{ code, msg, detail }`）与**网页接口**（页面自身使用）。
 
-```
-Failed: The build token selected for this build has been deleted or rolled
-```
-
-在 Cloudflare Dashboard → **Workers & Pages** → 你的项目 → **Settings** → **Builds** → 重新生成 Build token 并重试部署。
-
-#### 绑定自定义域名
-
-Pages 项目 → **Custom domains** → 添加你的域名（需 DNS 已托管在 Cloudflare）。
-
----
-
-## 🔌 API 接口
-
-项目提供两套 API：**Web UI 接口**（页面交互）和 **FileCodeBox 兼容 API**（程序调用）。
-
-### FileCodeBox 兼容 API（v2.1.0）
-
-兼容 [FileCodeBox API v2.1.0](https://fcb-docs.aiuo.net/api/)，统一响应格式 `{ code, msg, detail }`。整套兼容 API 挂载在 `/api` 前缀下（`src/api.ts` 注册、`src/index.ts` 中 `app.route('/api', api)`），因此实际路径是 `/api/share/file`、`/api/admin/dashboard` 等；带与不带结尾斜杠两种写法都已注册。
-
-#### 分享接口（默认免登录，可配置关闭）
+### 分享与下载（默认免登录）
 
 ```bash
-# 上传文件
-curl -X POST "https://你的域名/api/share/file/?expire_value=1&expire_style=day" \
-  -H "X-Filename: example.txt" \
-  --data-binary @example.txt
+# 上传文件：请求体就是文件本身，文件名走 X-Filename 头
+curl -X POST "https://你的域名/api/share/file?expire_value=1&expire_style=day" \
+  -H "X-Filename: example.txt" --data-binary @example.txt
 
 # 分享文本（表单）
-curl -X POST "https://你的域名/api/share/text/" \
+curl -X POST "https://你的域名/api/share/text" \
   -F "text=要分享的内容" -F "expire_value=1" -F "expire_style=day"
 
-# 获取文件信息
-curl "https://你的域名/api/share/select/?code=1234"
-
-# 下载文件
+# 查文件信息 / 下载
+curl "https://你的域名/api/share/select?code=1234"
 curl "https://你的域名/api/share/download?code=1234"
 ```
 
-**expire_style** 支持：`day` / `hour` / `minute` / `count`（限下载次数）/ `forever`
+`expire_style` 支持 `day` / `hour` / `minute` / `count`（限下载次数）/ `forever`。
 
-#### 管理接口（需 Bearer token）
+> 注意 `GET /api/share/select` 会**计入下载次数**（沿用上游语义）；只想查状态请用 `POST /api/share/select`。
+> 上传与查询接口带不带结尾斜杠都能访问。
+
+### 管理接口（Bearer token）
 
 ```bash
-# 登录获取 token（JSON 响应）
 curl -X POST "https://你的域名/api/admin/login" \
-  -H "Content-Type: application/json" \
-  -d '{"password":"你的密码"}'
-# 返回 { code: 200, msg: "success", detail: { token: "xxx", token_type: "Bearer" } }
+  -H "Content-Type: application/json" -d '{"password":"你的密码"}'
+# → { "code": 200, "detail": { "token": "...", "token_type": "Bearer" } }
 
-# 仪表盘
-curl "https://你的域名/api/admin/dashboard" \
-  -H "Authorization: Bearer <token>"
+curl "https://你的域名/api/admin/dashboard"                          -H "Authorization: Bearer <token>"
+curl "https://你的域名/api/admin/file/list?page=1&size=10&keyword=x"   -H "Authorization: Bearer <token>"
+curl -X DELETE "https://你的域名/api/admin/file/delete?id=123"         -H "Authorization: Bearer <token>"
+```
 
-# 文件列表（分页 + 关键词搜索）
-curl "https://你的域名/api/admin/file/list?page=1&size=10&keyword=xxx" \
-  -H "Authorization: Bearer <token>"
+配置读写 —— `get` 返回的是**当前实际生效值**，不是原始配置：
 
-# 删除文件
-curl -X DELETE "https://你的域名/api/admin/file/delete?id=123" \
-  -H "Authorization: Bearer <token>"
+```bash
+curl "https://你的域名/api/admin/config/get" -H "Authorization: Bearer <token>"
 
-# 获取配置（返回当前实际生效的值）
-curl "https://你的域名/api/admin/config/get" \
-  -H "Authorization: Bearer <token>"
-
-# 更新配置（PATCH）
-curl -X PATCH "https://你的域名/api/admin/config/update" \
-  -H "Authorization: Bearer <token>" \
+curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"openUpload":"1","maxFileSize":"26214400","defaultExpireDays":"7"}'
 ```
 
----
-
-### Web UI 接口（页面交互）
+### 网页接口一览
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/` | 首页（上传 + 取件）|
-| GET | `/r` | 取件页；带 `?code=1234` 时 302 跳到 `/r/1234` |
-| GET | `/r/:code` | 取件页（文件详情 / 文本查看）；带 `?sent=1` 是上传者落地页 |
-| POST | `/api/upload` | 文件上传（XHR，返回 JSON `{code, filename, size}`）|
-| POST | `/api/upload/text` | 文本上传（表单，返回 HTML 结果页）|
-| GET | `/api/text/:code` | 获取文本内容（纯文本）|
-| GET / HEAD | `/api/download/:code` | 下载文件（带 Content-Disposition）|
-| GET | `/api/info/:code` | 文件信息（JSON）|
-| GET | `/api/codes/:count` | 为多文件批次分配一段连号且未被占用的取件码（2–20，只查询不抢占）|
-| POST | `/api/thumb/:code` | 上传浏览器端生成的图片缩略图（WebP/JPEG/PNG，服务端硬上限 128KB）|
-| GET | `/api/thumb/:code` | 取缩略图；额度耗尽、过期、非图片均 404，不计下载次数 |
-| GET | `/qrcode/:code` | 取件链接二维码（GIF）|
-| GET | `/static/style.css` | 样式表（immutable 长缓存）|
-| GET | `/static/bg.webp` | 背景图，需自行上传到 R2 根目录，否则 404 |
-| GET | `/admin` | 管理面板：统计卡 + 文件列表（受保护）|
-| GET | `/admin/settings` | 系统设置页（受保护）|
-| POST | `/admin/settings` | 保存游客上传开关 / 大小上限 / 默认过期天数 |
-| POST | `/admin/login` | 管理员登录（HTML 表单，成功后 302 到 `/admin`）|
-| GET | `/admin/logout` | 管理员登出（清除 Cookie 与 DB token）|
-| POST | `/admin/delete/:id` | 删除文件（表单，按数据库 id）|
-| POST | `/admin/cleanup` | 手动清理过期文件 |
-| GET | `/api/init` | 幂等建表（需管理员身份；空库上不可用，见部署方式一第 4 步）|
-| GET | `/console` | 兼容旧路径，302 到 `/admin` |
-| GET | `/api/console/logout` | 兼容旧路径，302 到 `/admin/logout` |
+| GET | `/` | 首页（发件 + 取件） |
+| GET | `/r/:code` | 取件页；带 `?sent=1` 是上传者落地页（无下载入口） |
+| POST | `/api/upload` | 文件上传，返回 `{code, filename, size}` |
+| POST | `/api/upload/text` | 文本上传，返回 HTML 结果页 |
+| GET | `/api/text/:code` · `/api/download/:code` | 取文本 / 下载文件（支持 HEAD） |
+| GET | `/api/info/:code` | 文件信息（JSON） |
+| GET | `/api/codes/:count` | 为多文件批次取一段未被占用的连号码（2–20） |
+| GET / POST | `/api/thumb/:code` | 读取 / 写入图片缩略图 |
+| GET | `/qrcode/:code` | 取件链接二维码（GIF） |
+| GET | `/admin` · `/admin/settings` | 后台面板与设置页 |
+| POST | `/admin/login` · `/admin/settings` · `/admin/delete/:id` · `/admin/cleanup` | 登录 / 保存设置 / 删除 / 手动清理 |
 
-> - 登录入口有两套：`/admin/login` 是浏览器表单（302 重定向），`/api/admin/login` 是 JSON API（返回 Bearer token）。
-> - 未匹配的 `/api/*` 返回 `{"code":404,"msg":"Not Found"}`，其余任意路径兜底渲染首页。
-> - `openUpload` 开关在 `src/shared.ts` 的 `assertUploadAllowed()` 里统一拦截，**同时作用于首页 `/api/upload`、`/api/upload/text` 与兼容 API `/api/share/*`**；关闭后管理员登录态仍可上传。取件与下载不受影响。
+> 未匹配的 `/api/*` 返回 404 JSON，其余任意路径兜底渲染首页。登录有两个入口：`/admin/login` 是浏览器表单（重定向），`/api/admin/login` 是 JSON（返回 token）。
 
 ---
 
 ## 🧑‍💻 使用
 
-| 页面 | 路径 | 说明 |
-|------|------|------|
-| 首页 | `/` | 上传文件 + 文本分享 + 取件码输入 |
-| 取件 | `/r/1234` | 文件详情 / 文本查看 + 下载 |
-| 发件成功 | `/r/1234?sent=1` | 上传者落地页：取件码 + 预览，无下载入口 |
-| 管理 | `/admin` | 管理员登录 |
+**发件** — 拖入文件或粘贴 → 需要时展开「额外发件设置」调整有效期 / 最大下载次数 / 自定义取件码 → 点「发件并获取取件码」。多个文件会各自拿到一段连号的码，此时自定义取件码输入框不可用（一个码只能对应一个文件）。
 
-### 图片缩略图
+**取件** — 首页顶部输入 4 位码，填满即自动取件。文本在线看，文件点「下载文件」。
 
-上传的是图片时，成功页和取件页显示缩略图而不是通用文件图标。
+**后台** — `/admin` 看统计与文件列表；`/admin/settings` 改三项设置，**保存即生效，不用重新部署**：
 
-- **生成在浏览器里**：canvas 按长边 480px 缩放，依次尝试 WebP（0.72 / 0.55）与 JPEG（0.7 / 0.5），逐级降尺寸直到 ≤96KB；解码失败（HEIC、损坏文件）就安静回退成图标。
-  之所以不在 Worker 里解码：免费档每个请求只有 5ms CPU，一张几千万像素的照片必然超限；而 Cloudflare Image Resizing 是付费附加产品，`npm run provision` 也开不了它。
-- **单独存一份**：R2 里主文件是 `file:{code}`，缩略图是 `thumb:{code}`，D1 用 `has_thumb` 标记，页面只在标记为 1 时输出 `<img>`，避免每个非图片取件页都白发一个必然 404 的请求。
-- **它是内容的第二份副本，所以按同一套规矩管**：达到最大下载次数或已过期时 `GET /api/thumb/:code` 返回 404（和文本标题遮蔽成 `***` 同理），响应带 `no-store`；删除与过期清理同时删两个 key，孤儿扫描覆盖 `thumb:` 前缀。
-- **不计下载次数**：缩略图只是页面渲染的一部分，计数会让"打开看一眼"悄悄消耗掉收件人的额度。
-- **只有网页端上传会有**：`curl` 和兼容 API 不经过 canvas，这类文件继续显示图标。
-- 服务端不信任客户端：只接受 WebP/JPEG/PNG 的 magic bytes，硬上限 128KB，且只允许挂在 `image/*`（非 SVG）记录上，用独立限流桶（30 次/60 秒/IP）以免一张图片吃掉两次上传额度。
-- **已有部署不用手动补列**：`has_thumb` 缺失时 `markThumb` 会就地 ALTER 补列再重试一次，Cron 里的 `initDB()` 也会兜底。
-  补列之前的表现是「图片就是不显示预览」而不是报错，因为缩略图全程按可有可无处理。
-- **没出预览时怎么查**：直接访问 `/api/thumb/{取件码}`。404 = 压根没生成（非网页端上传、浏览器解码失败如 HEIC、或额度已用完），
-  500 = 写库失败；页面不会报错，只会安静回退图标。
+| 设置 | 作用 |
+|------|------|
+| 游客上传 | 关闭后匿名上传（网页 + 兼容 API）全部被拒，管理员仍可上传 |
+| 单文件上限 | 覆盖 `MAX_FILE_SIZE`；清空即回退到配置文件里的值 |
+| 默认过期天数 | 覆盖 `DEFAULT_EXPIRE_DAYS` |
 
-### 本地开发与测试
+限制值的生效优先级：**后台设置 > `wrangler.jsonc` 的 `vars` > 内置兜底（25 MB / 7 天）**；非法或非正整数的值会被忽略并落到下一级。首页会显示当前生效的上限，超限文件在列表里就被标红拦下。
+
+### 配置项
+
+| 变量 | 位置 | 默认 | 说明 |
+|------|------|------|------|
+| `ADMIN_PASSWORD` | Secret | 无 | 管理员密码；未设置则无法登录后台 |
+| `MAX_FILE_SIZE` | `vars` | `26214400` | 单文件上限（字节），即 25 MB |
+| `DEFAULT_EXPIRE_DAYS` | `vars` | `7` | 未指定过期参数时的默认天数 |
+| `triggers.crons` | `wrangler.jsonc` | `*/30 * * * *` | 建表、清理过期文件与孤儿对象、清理限流记录 |
+
+### 本地开发
 
 ```bash
-npm run typecheck    # tsc --noEmit
-npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
-npm test             # Playwright 无头浏览器跑取件主流程（test-headless.mjs）
-npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 118 项断言
+npm install
+npx wrangler login
+npm run provision     # 创建或复用 D1 / R2，回填 database_id 并建表
+npm run dev           # http://localhost:8787
 ```
 
-`npm run test:ui` 由 `tests/` 下四个套件组成，复用同一个 Chromium：
+`wrangler dev` 要求 `database_id` 非空（留空会直接崩溃），所以本地开发前先跑一次 `npm run provision`。
 
-| 文件 | 覆盖 |
-|------|------|
-| `tests/public-ui.mjs` | 设计 token（背景无外部依赖、卡片圆角、主按钮明暗反转）、深色模式、内联 SVG 图标可解码、tab 切换不被 CSP 拦、上传→取件→复制→文本回读、移动端无横向溢出 |
-| `tests/upload-interactions.mjs` | 拖拽 / 粘贴 / 多选 chip 增删、多文件顺序上传出**连号**码（自定义码字段同时被禁用）、字节与速率明细、五种有效期真实落库（`count`→`max_downloads`、`hour`→2.000h、`forever`→100 年）、512KB 前端拦截、**体积超限 chip 标红 + 整批拦下**、**单个失败不中断批次且失败项留在列表**、`/api/codes` 边界与"返回的码确实未被占用"、自定义取件码作用域 |
-| `tests/admin-settings.mjs` | 统计卡与列表总数一致、文件行标签与链接、设置页保存/回显、**openUpload 关闭后首页与兼容 API 同时 401 而管理员会话仍 200**、上限改 1MB 立即生效、清空后回退 vars |
-| `tests/thumbnails.mjs` | 浏览器端确实按 480px 缩放、缩略图 ≤96KB 且 `no-store`、两个落地页都出图、渲染尺寸不超过卡片、取图失败回退图标、非图片不产出且伪造上传被 415/404 拒、**额度耗尽后缩略图一起消失**、多文件各自带图、缩略图写入不占上传额度 |
+改代码时有两个坑：
 
-环境变量：`BASE_URL`（默认 `http://127.0.0.1:8790`）、`ADMIN_PASSWORD`（默认 `test-admin-pw`，对应 `.dev.vars`）、`SHOT_DIR`（设置后输出全页截图）、`SKIP_RATE_WAIT=1`（跳过限流等待，快速跑一轮）。
+- 样式是 `src/templates/style.ts` 里的一个字符串，且响应带 `immutable` 长缓存 —— 改完必须递增 `src/templates/layout.ts` 里的 `style.css?v=N`，否则浏览器与 CDN 会一直命中旧样式。
+- 页面脚本写在 JS 模板字符串里，正则中的 `\/` 会被模板吃掉一层转义，容易生成非法正则；改用不含斜杠的写法或再转义一次。
 
-> 这些用例会**真实上传文件并修改后台设置**，所以默认只允许本机地址；打自己的线上环境需显式加 `ALLOW_REMOTE=1`。历史上这套测试的默认地址曾指向别人的生产站点，别重蹈覆辙。
->
-> 三个套件假设本地服务已启动且表已建好：
-> ```bash
-> npx wrangler d1 execute filecodebox-db --local --file=./schema.sql --yes
-> printf 'ADMIN_PASSWORD=test-admin-pw\n' > .dev.vars
-> npx wrangler dev --port 8790
-> ```
-
-`wrangler dev` 要求 `database_id` 非空，配置留空会直接崩溃，实测报 `The expression evaluated to a falsy value: (databaseId)`。两种解法：
-
-- **有 Cloudflare 账号**：跑一次 `npm run provision` 回填真实 ID，本地依旧用模拟存储，不产生线上写入。
-- **完全离线**：复制一份 `wrangler.localtest.jsonc`（已被 gitignore），把 `database_id` 填成任意合法 UUID，用 `npx wrangler dev -c wrangler.localtest.jsonc` 启动。
-- 测线上环境：`BASE_URL=https://你的域名 ALLOW_REMOTE=1 npm run test:ui`
-
-> **已知问题**：本机 `wrangler dev`（4.114）在连续多轮 Playwright 跑测后会偶发整体退出，日志里只有一条空 `ERROR`，而此前所有请求都是 200。这是 wrangler 本地 proxy 的问题，不是应用缺陷 —— 重启 dev 后同一套用例必过。上传限流（10 次/60 秒/IP）由 `tests/helpers.mjs` 的 `rateLimitBreather()` 在每个套件前等窗口滚新来规避（因此整套约需 3 分钟，其中约 170s 是等待），`postWithinRateLimit()` 负责单次重试。
-
-### 背景与站点图标
-
-页面背景已对齐上游 2024 主题：**纯色 `--color-page`（浅 `#f5f5f7` / 深 `#101012`），不再引用任何外部图床**。卡片观感由 `bg/78` 半透明 + `backdrop-blur` + `--shadow-panel` + 顶部 hairline 承担。
-
-想换回图片背景：把图传到 R2 根目录，再把 `style.ts` 的 `body` 加上 `background-image: url("/static/bg.webp")`（`src/index.ts` 已实现该路由，从 R2 读取并带 immutable 长缓存）：
+### 测试
 
 ```bash
-npx wrangler r2 object put filecodebox-file/bg.webp --file=./bg.webp --content-type=image/webp
+npm run typecheck     # tsc --noEmit
+npm test              # 主流程冒烟（Playwright 无头）
+npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图，共 118 项断言
 ```
 
-站点图标是 `src/templates/layout.ts` 里内联的 SVG data URI，零外部请求，改图标直接替换那段 SVG。
+用例假设本地服务已启动且表已建好：
 
-> 改完样式必须把 `layout.ts` 里的 `style.css?v=9` 版本号递增 —— 该响应是 `max-age=31536000, immutable`，不升版本浏览器与 CDN 会一直命中旧缓存。
-
-### Cron 定时清理
-
-项目已内置 `scheduled` handler，在 wrangler.jsonc 的 `triggers.crons` 中配置：
-
-```jsonc
-"triggers": { "crons": ["*/30 * * * *"] }
+```bash
+npx wrangler d1 execute filecodebox-db --local --file=./schema.sql --yes
+printf 'ADMIN_PASSWORD=test-admin-pw\n' > .dev.vars
+npx wrangler dev --port 8790
+BASE_URL=http://127.0.0.1:8790 npm run test:ui
 ```
 
-## ⚙️ 环境变量
+这些用例会**真实上传文件并修改后台设置**，因此默认只允许打本机地址；测自己的线上环境需显式加 `ALLOW_REMOTE=1`。可用环境变量：`BASE_URL`、`ADMIN_PASSWORD`、`SHOT_DIR`（输出全页截图）、`SKIP_RATE_WAIT=1`（跳过限流等待）。
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `ADMIN_PASSWORD` | - | 管理员密码（**Secret**，`wrangler secret put` 设置；未设置时无法登录后台） |
-| `MAX_FILE_SIZE` | `26214400` | 单文件上限（字节），即 25MB；写在 `wrangler.jsonc` 的 `vars` 中 |
-| `DEFAULT_EXPIRE_DAYS` | `7` | 未指定过期参数时的默认天数 |
-
-## 上传大小与过期配置
-
-上限**不写死在代码里**，按以下优先级解析（见 `src/shared.ts` 的 `resolveLimits()`）：
-
-1. 数据库 `fc_settings` 中管理员后台写入的值 —— `PATCH /api/admin/config/update`
-   ```json
-   { "maxFileSize": "52428800", "defaultExpireDays": "30", "openUpload": "1" }
-   ```
-2. `wrangler.jsonc` 的 `vars`（或 Dashboard 里的 Vars）—— `MAX_FILE_SIZE` / `DEFAULT_EXPIRE_DAYS`
-3. 内置兜底 —— 25MB / 7 天
-
-非正整数或无法解析的值会被忽略并落到下一级，避免出现 `NaN` 绕过校验。`GET /api/admin/config/get` 返回的是**实际生效值**，不是原始配置。
-
-修改方式：
-
-| 场景 | 做法 |
-|------|------|
-| 部署后随时调整（推荐） | 后台 `/admin/settings` 表单，保存即写入 `fc_settings` |
-| 程序化调整 | `PATCH /api/admin/config/update`（Bearer token 或管理员 Cookie 均可） |
-| 长期默认值 | 改 `wrangler.jsonc` 的 `vars.MAX_FILE_SIZE` 后 `npm run deploy` |
-
-设置页里把数值清空并保存，即删除覆盖、回退到 `wrangler.jsonc` 的 vars。
-
-**上限会渲染进首页**（`dropzone` 的 `data-max-bytes`，提示语里也写明"单个文件上限 25.0 MB"），所以后台改完不用改代码：
-
-- 超限文件仍会进待传列表，但对应 chip 标红并写「超上限」，行内提示条点名是哪几个、多大
-- 只要列表里有一个超限，点「发件并获取取件码」整批不发（避免半批上传后误以为都成功了）
-- 服务端 413 照旧兜底：直接打 API、或页面停在旧上限上没刷新时，仍会被拒
-
-多文件批次不再"一个失败就中断整批"：单个文件失败只记一条 `文件名 · 原因`，其余继续上传，
-收尾汇总「成功 N 个 · 失败 M 个」，失败的文件保留在待传列表里便于直接重试。
-
-### 多文件的自定义取件码
-
-一个取件码只能对应一个文件，所以选了 2 个以上文件时「自定义取件码」输入框会被禁用
-（提示改为"多文件时自动分配连号取件码"），否则第 2 个文件起必然报 `取件码已被占用`。
-
-替代做法是**连号**：提交时前端调 `GET /api/codes/:count`（2–20），服务端从库里找一段
-随机起点、环形连续且未被占用的码（`9999` 后面接 `0000` 也算连续），按顺序分给每个文件，
-结果列表里逐个显示。用户因此仍然拿到一组好记、可预期的码。
-
-两个细节：
-
-- 这个端点**只查询不抢占**。预占会把 check-then-act 的窗口从毫秒拉长到"用户把 N 个文件传完"，
-  中途 Cron 一跑 `cleanupUsedCodes` 就把码释放了，反而重新制造撞码。真正的占用仍走上传时的
-  `claimCode`（`INSERT OR IGNORE` 原子抢占）。万一两次尝试之间真被撞了，也只是那一个文件失败，
-  其余照传 —— 见上面的批次容错。
-- 拿不到连号（库几乎占满）时前端静默回退为"不指定码，让服务端随机生成"，批次不会因此卡住。
-- 单文件不受影响，自定义码照旧。
-
-有效期不再只有「天数」：上传表单的有效期选择器直接对应后端 `expire_style`，可选
-`day / hour / minute / count（按次数失效）/ forever（永久）`；选 `count` 时会自动把「最大下载次数」联动锁定为该数值，避免两个字段互相矛盾。
-
-直接改数据库也可以：`npx wrangler d1 execute filecodebox-db --remote --command "INSERT OR REPLACE INTO fc_settings(key,value) VALUES('max_file_size','52428800')"`。
-
-另外两处独立限制：文本分享正文最大 512KB（`src/shared.ts`），单 IP 上传限流 10 次 / 60 秒（`checkRateLimit`）。
+---
 
 ## 📁 项目结构
 
 ```
-FileCodeBox-worker/
-├── src/
-│   ├── index.ts               # 主程序 — Web UI 路由 + Cron 清理
-│   ├── api.ts                 # FileCodeBox v2.1.0 兼容 API
-│   ├── shared.ts              # 共享业务逻辑（上传/下载/缩略图/过期/取件码/生效上限，单一数据源）
-│   ├── auth.ts                # 认证: 登录/登出/速率限制
-│   ├── db.ts                  # 数据库: 增删改查 + 取件码抢占 + 限流 + 清理
-│   ├── qr.ts                  # 二维码 GIF 封装
-│   ├── types.ts               # 类型定义
-│   ├── utils.ts               # 工具: 取件码/哈希/IP 提取/HTML 转义
-│   └── templates/
-│       ├── layout.ts          # HTML 布局
-│       ├── style.ts           # 中性 zinc 设计系统 CSS（对齐上游 2024 主题）
-│       └── pages.ts           # 页面模板
-├── scripts/
-│   └── provision.mjs          # 自动创建 D1 / R2、回填 database_id 并执行 schema.sql
-├── tests/
-│   ├── index.mjs              # npm run test:ui 入口（四个套件共用一个 Chromium）
-│   ├── helpers.mjs            # 浏览器夹具、断言器、远端目标保护
-│   ├── public-ui.mjs          # 视觉 token / 深色模式 / CSP / 响应式
-│   ├── upload-interactions.mjs# 拖拽、粘贴、多文件、有效期方式、前端限额
-│   ├── admin-settings.mjs     # 统计卡、设置页、openUpload 全局生效
-│   └── thumbnails.mjs         # 图片缩略图：缩放、体积、隐私边界、回退
-├── schema.sql                 # 表结构（全语句幂等，可重复执行）
-├── wrangler.jsonc             # Cloudflare 配置（资源名在此声明）
-├── tsconfig.json
-└── package.json
+src/
+├── index.ts          # 网页路由 + Cron 清理
+├── api.ts            # FileCodeBox v2.1.0 兼容 API
+├── shared.ts         # 上传 / 下载 / 缩略图 / 连号码 / 生效上限（单一业务逻辑源）
+├── db.ts             # D1 读写、取件码抢占、限流、清理
+├── auth.ts           # 登录 / 登出 / 密码哈希
+├── qr.ts             # 二维码封装
+├── types.ts utils.ts
+└── templates/        # 服务端渲染的页面与样式（无构建步骤）
+scripts/provision.mjs # 创建或复用 D1 / R2，回填 database_id，执行 schema.sql
+schema.sql            # 表结构（全语句幂等，可重复执行）
+wrangler.jsonc        # Cloudflare 配置（资源名在此声明，不含账号 ID）
+tests/                # Playwright 回归套件
+test-headless.mjs     # 主流程冒烟
 ```
-
-## 🏗️ 架构设计
-
-- **单一业务逻辑源**：`shared.ts` 统一实现上传/下载/过期/取件码逻辑，`index.ts` 和 `api.ts` 均为薄路由封装
-- **取件码复用机制**：4 位码删除/过期后通过 `releaseCode()` 释放，可循环使用
-- **上传实现**：`arrayBuffer()` 一次性读取请求体（body 只能消费一次），计算大小后转 `Blob` 流写入 R2
-- **下载计数**：`incrementDownload` 原子更新，避免并发超限
-- **过期清理**：Cron 每 30 分钟触发 `cleanupExpired`，并发删除 R2 + DB 记录
-- **配置生效层**：后台 DB 设置 > wrangler vars > 内置兜底，由 `resolveLimits()` 统一解析，避免接口回报值与实际执行值不一致
-- **资源绑定**：`wrangler.jsonc` 只声明资源名称，`database_id` 由 `npm run provision` 创建后回填，配置里不含任何账号 ID
-
-## 🔧 技术栈
-
-- **框架**: [Hono](https://hono.dev/)
-- **数据库**: Cloudflare D1 (SQLite)
-- **存储**: Cloudflare R2
-- **运行时**: Cloudflare Workers
-- **语言**: TypeScript（严格模式）
 
 ## 📄 许可
 
-MIT License
+本仓库未附带 LICENSE 文件。它是 [FileCodeBox](https://github.com/vastsa/FileCodeBox) 的移植版，商用或二次分发前请先确认上游仓库的许可条款。
