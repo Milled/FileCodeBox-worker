@@ -668,10 +668,10 @@ ${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', auto
   return layout('取件', card(content));
 }
 
-/** 页头三件套。发件带 ?send=1 让首页把焦点放到发件区，收件就是回主页 */
+/** 页头三件套。发件带 ?send=1 让首页把焦点放到发件区，取件就是回主页 */
 function pageNav(): string {
   return `<a href="/?send=1">发件</a>
-        <a href="/">收件</a>
+        <a href="/">取件</a>
         <a href="/admin">管理</a>`;
 }
 
@@ -705,6 +705,12 @@ export function resultPage(opts: {
 }): string {
   const { code, title, baseUrl, text, hasThumb, meta } = opts;
   const shareUrl = `${baseUrl}/r/${code}`;
+  // 与取件页同一套优先级：图片看缩略图，文本看正文，其余给文件图标
+  const preview = hasThumb
+    ? thumbPreview(code)
+    : text !== undefined
+      ? `<div class="command-text">${escapeHtml(text)}</div>`
+      : fileIconSvg();
   const content = `
     <div class="share-grid">
       <div class="share-left">
@@ -718,8 +724,7 @@ export function resultPage(opts: {
         </div>
         <div class="share-title">${escapeHtml(title)}</div>
         <div class="command-box">
-          ${hasThumb ? thumbPreview(code) : ''}
-          ${text !== undefined ? `<div class="command-text">${escapeHtml(text)}</div>` : ''}
+          ${preview}
           <a href="/" class="btn btn-secondary" style="width:auto;align-self:center">继续发件</a>
         </div>
         ${fileMeta(meta)}

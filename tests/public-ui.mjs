@@ -192,12 +192,24 @@ export async function publicUiSuite(browser) {
     /sent=1$/.test(sentView.url) && sentView.h1 === '发件成功' && sentView.hasContinue && !sentView.hasDownload,
     `h1=${sentView.h1} 继续发件=${sentView.hasContinue} 下载=${sentView.hasDownload}`);
   s.ok('「继续发件」在内容框内水平居中', sentView.continueInBox && sentView.continueCentered);
-  s.ok('成功页页头为发件 / 收件 / 管理',
-    JSON.stringify(sentView.nav) === JSON.stringify(['发件', '收件', '管理']), sentView.nav.join(' / '));
+  s.ok('成功页页头为发件 / 取件 / 管理',
+    JSON.stringify(sentView.nav) === JSON.stringify(['发件', '取件', '管理']), sentView.nav.join(' / '));
   s.ok('成功页元信息与取件页一致（大小 / 下载次数 / 过期时间）',
     sentView.metaClass === 'meta-row' && sentView.metaParts.length === 3
       && /B|KB|MB/.test(sentView.metaParts[0]) && /已下载/.test(sentView.metaParts[1]) && /过期|永久/.test(sentView.metaParts[2]),
     sentView.metaParts.join(' · '));
+
+  // 非图片没有缩略图，但应与取件页一样有文件示意图，且居中
+  const iconBox = await light.evaluate(() => {
+    const icon = document.querySelector('.command-box .file-icon');
+    if (!icon) return null;
+    const b = icon.getBoundingClientRect();
+    const c = icon.closest('.command-box').getBoundingClientRect();
+    return { gapL: b.left - c.left, gapR: c.right - b.right, w: b.width, h: b.height };
+  });
+  s.ok('非图片成功页显示文件图标且居中（与取件页一致）',
+    !!iconBox && iconBox.w === 56 && iconBox.h === 56 && Math.abs(iconBox.gapL - iconBox.gapR) < 2,
+    iconBox ? `${iconBox.w}x${iconBox.h} 左右间距 ${Math.round(iconBox.gapL)}/${Math.round(iconBox.gapR)}` : '无图标');
   await light.shot('public-retrieve-light');
 
   await dark.goto(`${BASE}/r/${fileCode}`, { waitUntil: 'networkidle' });
@@ -205,8 +217,8 @@ export async function publicUiSuite(browser) {
   const dlHref = await dark.locator('a:has-text("下载文件")').first().getAttribute('href').catch(() => null);
   s.ok('收件人取件页仍可下载（未被 sent 视图影响）', /^\/api\/download\/\d{4}$/.test(dlHref || ''), String(dlHref));
   const recvNav = await dark.evaluate(() => [...document.querySelectorAll('.header-actions a')].map((a) => a.textContent?.trim()));
-  s.ok('取件页页头同样为发件 / 收件 / 管理',
-    JSON.stringify(recvNav) === JSON.stringify(['发件', '收件', '管理']), recvNav.join(' / '));
+  s.ok('取件页页头同样为发件 / 取件 / 管理',
+    JSON.stringify(recvNav) === JSON.stringify(['发件', '取件', '管理']), recvNav.join(' / '));
   await dark.shot('public-retrieve-dark');
 
   // 文本分享 → 结果页 → 取件页
@@ -225,6 +237,8 @@ export async function publicUiSuite(browser) {
     JSON.stringify(shownOnResult.slice(0, 24)));
   const sizeLine = (await light.textContent('.meta-row')) || '';
   s.ok('字节数仍作为元信息保留', /\d+(\.\d+)? (B|KB|MB)/.test(sizeLine), sizeLine.trim());
+  s.ok('文本结果页以正文为预览，不叠文件图标',
+    (await light.locator('.command-text').count()) === 1 && (await light.locator('.file-icon').count()) === 0);
   // 结果页现在带正文，必须 no-store，否则 CDN 可能把私密内容留在边缘节点
   const cacheProbe = await light.context().request.post(`${BASE}/api/upload/text`, {
     form: { text: 'cache header probe', expire_style: 'day', expire_value: '1', max_downloads: '-1' },

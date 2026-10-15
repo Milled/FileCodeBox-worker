@@ -345,6 +345,8 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   align-items: center;
   justify-content: center;
   margin-bottom: 14px;
+  /* 发件成功页的内容框没有 align-items:center，靠这条保证两页的图标都居中 */
+  align-self: center;
 }
 /* 图片预览：宽度不超过所在卡片，高度封顶 260px；
    align-self 防止在 flex 纵向容器里被 stretch 拉成整宽 */

@@ -318,7 +318,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" \
 npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev，默认 http://localhost:8787（本地模拟 D1 / R2）
 npm test             # Playwright 无头浏览器跑取件主流程（test-headless.mjs）
-npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 107 项断言
+npm run test:ui      # UI 套件：视觉结构 / 上传交互 / 后台设置 / 图片缩略图，共 109 项断言
 ```
 
 `npm run test:ui` 由 `tests/` 下四个套件组成，复用同一个 Chromium：
