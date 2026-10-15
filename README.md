@@ -241,8 +241,15 @@ schema.sql            # 表结构（全语句幂等，可重复执行）
 wrangler.jsonc        # Cloudflare 配置（资源名在此声明，不含账号 ID）
 tests/                # Playwright 回归套件
 test-headless.mjs     # 主流程冒烟
+LICENSE               # MIT（本仓库自行编写的代码）
+FORK_NOTICE.md        # fork 来源与许可关系说明
 ```
 
 ## 📄 许可
 
-本仓库未附带 LICENSE 文件。它是 [FileCodeBox](https://github.com/vastsa/FileCodeBox) 的移植版，商用或二次分发前请先确认上游仓库的许可条款。
+本仓库新增的代码以 **MIT License** 发布，全文见 [LICENSE](LICENSE)。
+
+本仓库 fork 自 [jeio258/FileCodeBox-worker](https://github.com/jeio258/FileCodeBox-worker)，
+后者是 [FileCodeBox](https://github.com/vastsa/FileCodeBox)（LGPL-3.0）的 Cloudflare Workers 重写版。
+继承部分与本 fork 新增部分的边界、以及上游仓库未附许可文件这一注意事项，见
+[FORK_NOTICE.md](FORK_NOTICE.md)。
