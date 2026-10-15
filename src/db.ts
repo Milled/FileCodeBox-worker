@@ -91,6 +91,30 @@ export async function releaseCode(db: D1Database, code: string): Promise<void> {
   await db.prepare('DELETE FROM fc_used_codes WHERE code = ?').bind(code).run();
 }
 
+/**
+ * 找一段连续且未被占用的 4 位取件码（多文件批次用），环形取模所以 9998 后面可以是 9999/0000。
+ * 只查询、不抢占：真正的占用仍走上传时的 claimCode。预占会把 check-then-act 的窗口
+ * 从毫秒拉长到「用户把 N 个文件传完」，中途 Cron 一跑就把码释放掉，反而重新制造撞码。
+ */
+export async function findCodeRun(db: D1Database, count: number): Promise<string[] | null> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const base = Math.floor(Math.random() * 10000);
+    const run: string[] = [];
+    for (let i = 0; i < count; i++) run.push(String((base + i) % 10000).padStart(4, '0'));
+    const placeholders = run.map(() => '?').join(',');
+    const taken = await db
+      .prepare(`
+        SELECT code FROM fc_used_codes WHERE code IN (${placeholders})
+        UNION
+        SELECT code FROM fc_files WHERE code IN (${placeholders}) AND datetime(expire_at) > datetime('now')
+      `)
+      .bind(...run, ...run)
+      .all<{ code: string }>();
+    if ((taken.results ?? []).length === 0) return run;
+  }
+  return null;
+}
+
 // ---- 插入 ----
 
 export async function insertFile(
@@ -369,7 +393,7 @@ export async function checkRateLimit(
 export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
   const rows = await db
     .prepare(
-      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%' OR key LIKE 'thumb_ratelimit:%'",
+      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%' OR key LIKE 'thumb_ratelimit:%' OR key LIKE 'code_ratelimit:%'",
     )
     .all<{ key: string; value: string }>();
   const now = Date.now();

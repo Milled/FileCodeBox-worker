@@ -24,7 +24,7 @@ import {
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
-import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, resolveLimits, FALLBACK_MAX_FILE_SIZE } from './shared';
+import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, allocateCodeRun, resolveLimits, FALLBACK_MAX_FILE_SIZE } from './shared';
 import { generateQRCodeGIF } from './qr';
 import { STYLE } from './templates/style';
 import type { HomeOptions } from './templates/pages';
@@ -238,6 +238,16 @@ app.get('/api/thumb/:code', async (c) => {
       'X-Content-Type-Options': 'nosniff',
     },
   });
+});
+
+// ===================== 连号取件码分配 =====================
+
+app.get('/api/codes/:count', async (c) => {
+  try {
+    return c.json(await allocateCodeRun(c, c.env));
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? '服务器内部错误' }, e?.status ?? 500);
+  }
 });
 
 // ===================== QR 码生成 =====================

@@ -9,6 +9,7 @@ import { isValidCode, generateCode, getClientIp } from './utils';
 import { adminAuth } from './auth';
 import {
   getFileByCode,
+  findCodeRun,
   isCodeTaken,
   claimCode,
   insertFile,
@@ -299,6 +300,38 @@ export async function readThumb(
     body: obj.body as ReadableStream,
     contentType: obj.httpMetadata?.contentType || 'application/octet-stream',
   };
+}
+
+// ===================== 连号取件码 =====================
+
+/** 一次批次能要多少个连号码：与前端多选规模一致，也防止这个端点被当枚举器刷 */
+const MAX_CODE_RUN = 20;
+
+/**
+ * 给多文件批次分配一段连号且未被占用的取件码。
+ * 一个码只能对应一个文件，所以多文件时「自定义取件码」本质上不可用；
+ * 连号是退而求其次：用户仍然拿到一组好记、可预期的码。
+ */
+export async function allocateCodeRun(
+  c: Context<{ Bindings: Env }>,
+  env: Env,
+): Promise<{ codes: string[] }> {
+  await assertUploadAllowed(c, env);
+
+  const count = parseInt(c.req.param('count') || '', 10);
+  if (!Number.isFinite(count) || count < 2 || count > MAX_CODE_RUN) {
+    throw { status: 422 as const, message: `count 需为 2 到 ${MAX_CODE_RUN} 之间的整数` };
+  }
+
+  // 独立限流：它属于上传流程，但吃上传配额会让多文件批次更早撞上限
+  const ip = getClientIp(c.req.raw.headers);
+  if (!(await checkRateLimit(env.DB, 'code_ratelimit', ip, 20))) {
+    throw { status: 429 as const, message: '操作过于频繁，请稍后再试' };
+  }
+
+  const codes = await findCodeRun(env.DB, count);
+  if (!codes) throw { status: 409 as const, message: '暂无可用的连号取件码' };
+  return { codes };
 }
 
 // ===================== 文本分享 =====================

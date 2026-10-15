@@ -46,12 +46,27 @@ export async function uploadInteractionsSuite(browser) {
   s.ok('stepper +1 生效', (await page.inputValue('#fileExpireValue')) === '6');
 
   // ---- 多文件顺序上传 ----
+  // 两个文件时自定义码字段必须已被禁用（一个码只能对应一个文件），改用服务端连号
+  const batchField = await page.evaluate(() => {
+    const g = document.getElementById('fileCodeBoxes');
+    return {
+      disabled: [...g.querySelectorAll('input')].every((b) => b.disabled),
+      dimmed: g.classList.contains('is-disabled'),
+      hint: document.getElementById('fileCodeHint').textContent,
+    };
+  });
+  s.ok('多文件时自定义取件码字段被禁用并说明连号',
+    batchField.disabled && batchField.dimmed && /连号/.test(batchField.hint), batchField.hint);
+
   await Promise.all([
     page.waitForFunction(() => document.querySelectorAll('.result-item').length === 2, null, { timeout: 30000 }),
     page.click('#submitBtn'),
   ]);
   const codes = await page.locator('.result-item .rcode').allTextContents();
   s.ok('多文件逐个上传并返回多个取件码', codes.length === 2 && codes.every((c) => /^\d{4}$/.test(c)), codes.join(','));
+  // 连号按环形判定：9999 后面接 0000 也算连续
+  const step = (parseInt(codes[1], 10) - parseInt(codes[0], 10) + 10000) % 10000;
+  s.ok('多文件的取件码是服务端分配的连号且未被占用', step === 1, codes.join(' → '));
 
   const status = await page.textContent('#uploadStatus');
   s.ok('完成态显示文件数与耗时', /全部完成 · 2 个文件/.test(status || ''), status);
@@ -133,16 +148,28 @@ export async function uploadInteractionsSuite(browser) {
     blocked.url === `${BASE}/` && blocked.shown && /未开始上传/.test(blocked.status) && !blocked.disabled, blocked.status);
 
   // ---- 多文件批次：单个失败不中断其余 ----
+  // 连号方案下两个文件不可能再撞码，所以改用请求拦截让第一个文件被服务端拒绝
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  let uploadReqs = 0;
+  await page.route((u) => u.pathname === '/api/upload', async (route) => {
+    uploadReqs += 1;
+    if (uploadReqs === 1) {
+      await route.fulfill({
+        status: 413,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: '文件过大，最大 25MB' }),
+      });
+      return;
+    }
+    await route.continue();
+  });
   await dropFile(page, { name: 'first.txt', content: '第一个文件' });
   await dropFile(page, { name: 'second.txt', content: '第二个文件' });
-  await expandExtra(page, '#tab-file');
-  // 两个文件共用一个自定义取件码：第二个必然撞码，正好验证批次不被中断
-  await fillCodeBoxes(page, randomCode(), 'fileCodeBoxes');
   await Promise.all([
     page.waitForFunction(() => document.querySelectorAll('.result-item').length === 2, null, { timeout: 30000 }),
     page.click('#submitBtn'),
   ]);
+  await page.unroute((u) => u.pathname === '/api/upload');
   const batch = await page.evaluate(() => ({
     status: document.getElementById('uploadStatus').textContent,
     ok: document.querySelectorAll('.result-item:not(.result-failed) .rcode').length,
@@ -150,9 +177,22 @@ export async function uploadInteractionsSuite(browser) {
     kept: [...document.querySelectorAll('.file-chip .chip-name')].map((e) => e.textContent),
   }));
   s.ok('单个文件失败不中断整批，并汇总成败',
-    /成功 1 个 · 失败 1 个/.test(batch.status) && batch.ok === 1 && batch.fail.length === 1 && /已被占用/.test(batch.fail[0]),
+    /成功 1 个 · 失败 1 个/.test(batch.status) && batch.ok === 1 && batch.fail.length === 1 && /25MB/.test(batch.fail[0]),
     `${batch.status} | ${batch.fail.join(',')}`);
-  s.ok('失败的那个保留在待传列表里', batch.kept.length === 1 && batch.kept[0] === 'second.txt', batch.kept.join(','));
+  s.ok('失败的那个保留在待传列表里', batch.kept.length === 1 && batch.kept[0] === 'first.txt', batch.kept.join(','));
+
+  // ---- 连号分配端点的边界 ----
+  const badCounts = [];
+  for (const n of [1, 21, 999, 'abc']) {
+    badCounts.push(`${n}→${(await apiJson(page, `/api/codes/${n}`)).status}`);
+  }
+  s.ok('count 越界或非数字被拒（422）', badCounts.every((x) => /→422$/.test(x)), badCounts.join(' '));
+
+  const four = (await apiJson(page, '/api/codes/4')).json?.codes || [];
+  const fourStep = four.length === 4 && four.slice(1).every((c, i) => (Number(c) - Number(four[i]) + 10000) % 10000 === 1);
+  const freeStatuses = [];
+  for (const c of four) freeStatuses.push((await apiJson(page, `/api/info/${c}`)).status);
+  s.ok('返回 4 个连号且都未被占用', fourStep && freeStatuses.every((x) => x === 404), `${four.join(',')} info=${freeStatuses.join(',')}`);
 
   // ---- 自定义取件码作用域（历史 bug：会误读页顶取件框） ----
   await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });

@@ -235,7 +235,7 @@ ${expireControl({ valueId: 'fileExpireValue', styleId: 'fileExpireStyle', days }
               </div>
             </div>
             <div class="input-group">
-              <label>自定义取件码 <span class="hint">（可选，留空自动生成）</span></label>
+              <label>自定义取件码 <span class="hint" id="fileCodeHint">（可选，留空自动生成）</span></label>
 ${codeBoxes({ groupId: 'fileCodeBoxes', hiddenId: 'fileCode' })}
             </div>
           </div>
@@ -379,6 +379,20 @@ function homeScript(): string {
         chip.appendChild(name); chip.appendChild(size); chip.appendChild(rm);
         box.appendChild(chip);
       });
+      syncCodeFieldForBatch();
+    }
+
+    // 多文件时把自定义码字段禁用掉：一个码只能对应一个文件，
+    // 让 N 个文件共用一个码的结果是第 2 个起全部「取件码已被占用」
+    function syncCodeFieldForBatch() {
+      var group = document.getElementById('fileCodeBoxes');
+      if (!group) return;
+      var multi = pendingFiles.length > 1;
+      var hint = document.getElementById('fileCodeHint');
+      if (hint) hint.textContent = multi ? '（多文件时自动分配连号取件码）' : '（可选，留空自动生成）';
+      group.classList.toggle('is-disabled', multi);
+      Array.prototype.forEach.call(group.querySelectorAll('input'), function (b) { b.disabled = multi; });
+      // 已填的值不清空：从 3 个文件删回 1 个时，用户填的码还能用
     }
 
     function initDropZone() {
@@ -509,22 +523,30 @@ function homeScript(): string {
     }
 
     // ---- 上传 ----
+    // 取件码不在这里拼：单文件用自定义码，多文件用服务端分配的连号，逐个文件各自带
     function uploadParams() {
       var style = document.getElementById('fileExpireStyle');
       var value = document.getElementById('fileExpireValue');
       var max = document.getElementById('fileMaxDownloads');
-      var code = document.getElementById('fileCode');
       var q = 'expire_style=' + encodeURIComponent(style ? style.value : 'day');
       q += '&expire_value=' + encodeURIComponent(value && value.value ? value.value : '7');
       q += '&max_downloads=' + encodeURIComponent(max && max.value ? max.value : '-1');
-      q += '&code=' + encodeURIComponent(code ? code.value.trim() : '');
       return q;
     }
 
-    function uploadOne(file, query, onProgress) {
+    // 拿不到连号就返回空数组，让服务端随机生成 —— 批次不能因为分配失败而卡住
+    function fetchCodeRun(n) {
+      if (n < 2) return Promise.resolve([]);
+      return fetch('/api/codes/' + n)
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { return d && d.codes && d.codes.length === n ? d.codes : []; })
+        .catch(function () { return []; });
+    }
+
+    function uploadOne(file, query, code, onProgress) {
       return new Promise(function (resolve, reject) {
         var xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/upload?' + query);
+        xhr.open('POST', '/api/upload?' + query + '&code=' + encodeURIComponent(code || ''));
         xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
         xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
         xhr.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded, e.total); };
@@ -589,33 +611,40 @@ function homeScript(): string {
 
       var done = 0;
       var jobs = pendingFiles.slice();
-      var chain = Promise.resolve();
       var collected = [];
       var failed = [];
-      jobs.forEach(function (file, idx) {
-        chain = chain.then(function () {
-          return uploadOne(file, query, function (loaded, total) {
-            onProgress(0, loaded);
-            paint(done + loaded, '上传中 (' + (idx + 1) + '/' + jobs.length + ') ' + file.name);
-          }).then(function (data) {
-            done += file.size;
-            collected.push({ name: file.name, code: data.code, size: file.size });
-            paint(done, '已完成 ' + (collected.length + failed.length) + '/' + jobs.length);
-            // 缩略图必须在跳转前落库，成功页才知道该不该输出 <img>；
-            // 失败只回退成文件图标，不能拖垮整条上传链
-            return makeThumb(file).then(function (thumb) {
-              return thumb ? uploadThumb(data.code, thumb) : null;
+      // 一个码只能对应一个文件，所以多文件时自定义码不可用，改用服务端分配的连号段；
+      // 单文件仍走用户填的自定义码（留空则由服务端随机生成）
+      var custom = document.getElementById('fileCode');
+      var runPromise = jobs.length > 1
+        ? fetchCodeRun(jobs.length)
+        : Promise.resolve([custom ? custom.value.trim() : '']);
+      runPromise.then(function (run) {
+        var chain = Promise.resolve();
+        jobs.forEach(function (file, idx) {
+          chain = chain.then(function () {
+            return uploadOne(file, query, run[idx] || '', function (loaded, total) {
+              onProgress(0, loaded);
+              paint(done + loaded, '上传中 (' + (idx + 1) + '/' + jobs.length + ') ' + file.name);
+            }).then(function (data) {
+              done += file.size;
+              collected.push({ name: file.name, code: data.code, size: file.size });
+              paint(done, '已完成 ' + (collected.length + failed.length) + '/' + jobs.length);
+              // 缩略图必须在跳转前落库，成功页才知道该不该输出 <img>；
+              // 失败只回退成文件图标，不能拖垮整条上传链
+              return makeThumb(file).then(function (thumb) {
+                return thumb ? uploadThumb(data.code, thumb) : null;
+              });
+            }).catch(function (err) {
+              // 单个文件失败不再中断整批：后面的继续传，最后统一汇总
+              done += file.size;
+              failed.push({ file: file, name: file.name, reason: (err && err.message) || '上传失败' });
+              paint(done, '已完成 ' + (collected.length + failed.length) + '/' + jobs.length);
             });
-          }).catch(function (err) {
-            // 单个文件失败不再中断整批：后面的继续传，最后统一汇总
-            done += file.size;
-            failed.push({ file: file, name: file.name, reason: (err && err.message) || '上传失败' });
-            paint(done, '已完成 ' + (collected.length + failed.length) + '/' + jobs.length);
           });
         });
-      });
-
-      chain.then(function () {
+        return chain;
+      }).then(function () {
         var elapsed = Math.max(1, Date.now() - startedAt);
         if (collected.length === 1 && !failed.length) {
           status.textContent = '上传完成，跳转中…';

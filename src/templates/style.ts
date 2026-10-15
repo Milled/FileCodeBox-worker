@@ -601,6 +601,10 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   transition: background var(--dur-short) var(--ease-out), color var(--dur-short) var(--ease-out);
 }
 .file-chip .chip-remove:hover { background: var(--color-paper-3); color: var(--color-ink); }
+/* 多文件批次里自定义码不可用（一个码只能对应一个文件），连号由服务端分配 */
+.code-boxes.is-disabled { opacity: .45; }
+.code-boxes.is-disabled .code-box { cursor: not-allowed; }
+
 /* 超过发件上限的文件：允许留在列表里，但明确标红，提交时整批拦下 */
 .file-chip.chip-over { border-color: var(--color-danger); }
 .file-chip.chip-over .chip-size { color: var(--color-danger); }
