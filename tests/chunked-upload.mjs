@@ -133,11 +133,48 @@ export async function chunkedSuite(browser) {
     s.ok('无效大小 422 / 超上限 413', badSize.status === 422 && overCap.status === 413,
       `${badSize.status}/${overCap.status}`);
 
+    // 拿不到 Content-Length 就必须在碰 body 之前拒绝：老代码在这里退化成 arrayBuffer()
+    // 全量缓冲，那是同一枚 1102 的内存版（isolate 只有 128MB）。
+    // 从 node 侧发 chunked 请求 —— 浏览器侧的 stream body 会被 Chromium 直接掐掉连接
+    const chunkedRes = await fetch(`${BASE}/api/upload?expire_value=1`, {
+      method: 'POST',
+      body: new ReadableStream({ start(c) { c.enqueue(new Uint8Array(4096)); c.close(); } }),
+      duplex: 'half',
+      headers: { 'X-Filename': 'chunked.bin' },
+    });
+    const chunkedBody = await chunkedRes.text();
+    s.ok('缺 Content-Length 在碰 body 之前就 411，不缓冲整个请求',
+      chunkedRes.status === 411 && /Content-Length/.test(chunkedBody),
+      `${chunkedRes.status} ${chunkedBody.slice(0, 60)}`);
+
+    // 零字节文件仍然是合法上传（Content-Length: 0），记账也必须是真的 0
+    const emptyRes = await fetch(`${BASE}/api/upload?expire_value=1`, {
+      method: 'POST', body: new Uint8Array(0), headers: { 'X-Filename': 'empty.bin' },
+    });
+    const emptyJson = await emptyRes.json().catch(() => null);
+    const emptyList = await apiJson(page, '/api/admin/file/list?size=50');
+    const emptyRow = (emptyList.json?.detail?.data || []).find((f) => f.code === emptyJson?.code);
+    if (emptyRow) await call(`/api/admin/file/delete?id=${emptyRow.id}`, { method: 'DELETE' });
+    s.ok('零字节文件按 0 记账且可正常删除',
+      emptyRes.status === 200 && emptyJson?.size === 0 && emptyRow?.size === 0,
+      `${emptyRes.status} size=${emptyJson?.size}`);
+
     // ---- 缺片不能 complete；未完成的会话要占配额 ----
     const half = await call('/api/upload/chunk/init', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filename: 'half.bin', size: BIG, expire_value: '1' }),
     });
+
+    // 片长由服务端从会话行算出（第 1..N-1 片 = part_size，末片 = 余数），Content-Length 只用来
+    // 一次性对账 —— 字节不再逐块搬运，否则一片 8MiB 会跑成一段不中断的 JS，撞上免费计划
+    // 10ms 的连续 CPU 上限（线上 1102）。这里借 half 的会话试，不必再多占一次 init
+    const halfPart = await putPart(`/api/upload/chunk/${half.json.session}/1`, PART / 2, 1);
+    const lastPart = await putPart(`/api/upload/chunk/${half.json.session}/9`, PART, 1);
+    s.ok('片长与账面对不上就 422（首片少送、末片多送都拦得住）',
+      halfPart.status === 422 && /分片长度应为 8388608/.test(halfPart.json?.error || '')
+      && lastPart.status === 422 && /分片长度应为 6291456/.test(lastPart.json?.error || ''),
+      `${halfPart.json?.error} | ${lastPart.json?.error}`);
+
     await putPart(`/api/upload/chunk/${half.json.session}/1`, PART, 1);
     const miss = await call(`/api/upload/chunk/complete/${half.json.session}`, { method: 'POST' });
     s.ok('缺片时 complete 被拒并列出缺哪些',
@@ -164,6 +201,9 @@ export async function chunkedSuite(browser) {
     await Promise.all([page.waitForNavigation(), page.click('form[action="/admin/settings"] button[type="submit"]')]);
 
     // ---- 后台必须能立刻放弃未完成的分片 ----
+    // 上面已经把这一分钟的 10 次上传额度用掉大半（411、零字节那两条也各算一次），
+    // 不等窗口滚新的话这里的两次 init 会撞 429，表现为「后台列表是空的」这种假失败
+    await rateLimitBreather();
     // multipart 会话不是一个对象：不在 bucket.list() 里，R2 面板删不掉、bucket.delete 无效，
     // 「清理过期文件」的孤儿扫描同样看不见，只有 abort 能释放它的存储
     const mkOrphan = (name) => call('/api/upload/chunk/init', {

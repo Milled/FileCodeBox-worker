@@ -119,13 +119,6 @@ export async function assertUploadAllowed(c: Context<{ Bindings: Env }>, env: En
 
 // ===================== 存储配额与流式写入 =====================
 
-/** 流内超限的中断信号。用类型区分三种拒绝：单个文件太大 / 配额已满 / body 比声明的短 */
-class UploadLimitError extends Error {
-  constructor(readonly kind: 'file' | 'quota' | 'short') {
-    super(kind === 'quota' ? 'QUOTA_EXCEEDED' : kind === 'short' ? 'BODY_TOO_SHORT' : 'FILE_SIZE_EXCEEDED');
-  }
-}
-
 /**
  * 剩余可用空间（字节），Infinity = 不限制。
  * 读 storage_used 计数器：由 insertFile / deleteFileRecord / cleanupExpired 增减，
@@ -143,65 +136,29 @@ export function quotaMessage(limits: { maxTotalStorage: number }): string {
 }
 
 /**
- * 流式写入 R2：内存占用与文件大小解耦，不再把整个文件读进 isolate（单 isolate 只有 128MB）。
+ * 文件字节不进 JS：直接把 request.body 交给 R2。
  *
- * R2 只接受「长度已知」的流（TransformStream 的产物长度未知，直接传会报
- * "Provided readable stream must have a known length"），所以必须走 FixedLengthStream：
- * 长度取Content-Length，边读请求体边写入它的 writable 端。
+ * 为什么不能自己搬运：曾经用 FixedLengthStream + read/write 循环把 body 一段段喂给 R2，
+ * 8 MiB 的一页就是几百次不中断的 isolate 唤醒。Workers 的 CPU 上限掐的是"连续执行的一段"
+ * （await I/O 时计时会停），免费计划每请求只有 10ms —— 线上表现就是同一份文件一次成功
+ * 一次 1102「exceededCpu」（失败的 cpuTimeMs 正好停在 10，成功的那条累计 386ms 反而没事：
+ * 它的数据是陆续到达的，每读一块都挂起一次）。
  *
- * 顺带得到一层免费防护：写入超过约定长度的字节会被 stream 自身拒绝，
- * 所以「Content-Length 谎报很小、实际很大」的 body 无法绕过上限（谎报很大则在 close() 时失败）。
- * 注：这条防护在本地测不到 —— miniflare 的 proxy 遇到 chunked 请求体会直接崩掉整个 dev 进程。
+ * request.body 带 Content-Length 时长度已知，R2 直接接受，搬运全在平台内部完成，
+ * JS 只 await 一个 Promise。代价是不再逐块记账，所以长度必须由 Content-Length 提前校验；
+ * 拿不到长度就明确拒绝 —— 把整个文件读进内存的老回退是同一枚 1102 的内存版（isolate 128MB）。
  */
 async function putStreamed(
   env: Env,
   key: string,
   body: ReadableStream<Uint8Array>,
-  opts: { declared: number; quotaLeft: number; contentType: string; filename: string },
+  opts: { contentType: string; filename: string },
 ): Promise<number> {
-  const fixed = new FixedLengthStream(opts.declared);
-  let seen = 0;
-
-  const pump = async (): Promise<void> => {
-    const reader = body.getReader();
-    const writer = fixed.writable.getWriter();
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!value || value.byteLength === 0) continue;
-        seen += value.byteLength;
-        // declared 已经过 Content-Length 预检，所以超出 declared 只可能是 body 谎报了长度
-        if (seen > opts.declared) throw new UploadLimitError('file');
-        if (seen > opts.quotaLeft) throw new UploadLimitError('quota');
-        await writer.write(value);
-      }
-      // 比声明的短：R2 那边永远等不满，必须显式失败
-      if (seen < opts.declared) throw new UploadLimitError('short');
-      await writer.close();
-    } catch (e) {
-      await writer.abort(e).catch(() => {});
-      throw e;
-    }
-  };
-
-  // put 与 pump 并发跑：R2 从 readable 端消费，pump 往 writable 端写。
-  // 优先抛自己的错误，否则调用方只会看到 R2 包装后的流错误
-  let pumpError: unknown;
-  const pumping = pump().catch((e) => { pumpError = e; });
-  try {
-    await Promise.all([
-      env.FILE_STORE.put(key, fixed.readable, {
-        httpMetadata: { contentType: opts.contentType },
-        customMetadata: { filename: opts.filename },
-      }),
-      pumping,
-    ]);
-  } catch (e) {
-    throw pumpError ?? e;
-  }
-  if (pumpError) throw pumpError;
-  return seen;
+  const obj = await env.FILE_STORE.put(key, body, {
+    httpMetadata: { contentType: opts.contentType },
+    customMetadata: { filename: opts.filename },
+  });
+  return obj?.size ?? 0;
 }
 
 // ===================== 文件上传 =====================
@@ -242,15 +199,19 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   const maxSize = limits.maxSize;
   const quotaLeft = await remainingQuota(env, limits.maxTotalStorage);
 
-  // Content-Length 预检：能提前拒绝就不读 body。缺失时（chunked 上传）只能退回缓冲后校验
-  const declared = Number(c.req.header('Content-Length'));
-  const hasDeclared = Number.isFinite(declared) && declared > 0;
-  if (hasDeclared) {
-    if (declared > maxSize) {
-      throw { status: 413 as const, message: `文件过大，最大 ${Math.floor(maxSize / 1048576)}MB` };
-    }
-    if (declared > quotaLeft) throw { status: 507 as const, message: quotaMessage(limits) };
+  // Content-Length 必须拿到：字节不进 JS 搬运之后，长度只能由客户端声明，
+  // 而 R2 也拒绝长度未知的流。缺失就走分片接口或补上这个头，
+  // 绝不退化成"把整个文件读进 isolate"—— 那是 1102 的内存版（单 isolate 只有 128MB）
+  const clHeader = c.req.header('Content-Length');
+  const declared = Number(clHeader);
+  const knownLength = clHeader !== undefined && Number.isInteger(declared) && declared >= 0;
+  if (!knownLength) {
+    throw { status: 411 as const, message: '上传必须带 Content-Length（分块传输请改走分片接口）' };
   }
+  if (declared > maxSize) {
+    throw { status: 413 as const, message: `文件过大，最大 ${Math.floor(maxSize / 1048576)}MB` };
+  }
+  if (declared > quotaLeft) throw { status: 507 as const, message: quotaMessage(limits) };
 
   const code = await ensureCodeAvailable(rawCode, env);
   const key = `file:${code}`;
@@ -261,21 +222,15 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
 
   let size = 0;
   try {
-    const body = c.req.raw.body;
-    if (hasDeclared && body) {
-      // 流式写入：内存占用与文件大小解耦（单 isolate 只有 128MB，几个并发大文件就爆）。
-      // R2 只接受长度已知的流，所以用 FixedLengthStream 承载声明长度并在流内兜底
-      size = await putStreamed(env, key, body, { declared, quotaLeft, contentType: mimeType, filename });
+    const meta = { httpMetadata: { contentType: mimeType }, customMetadata: { filename } };
+    if (declared === 0) {
+      await env.FILE_STORE.put(key, new Uint8Array(0), meta);
+      size = 0;
     } else {
-      // ReadableStream.arrayBuffer() 在 Workers 运行时可用但类型未声明，走 Response 包装
-      const buf = body ? await new Response(body).arrayBuffer() : new ArrayBuffer(0);
-      size = buf.byteLength;
-      if (size > maxSize) throw new UploadLimitError('file');
-      if (size > quotaLeft) throw new UploadLimitError('quota');
-      await env.FILE_STORE.put(key, buf, {
-        httpMetadata: { contentType: mimeType },
-        customMetadata: { filename },
-      });
+      const body = c.req.raw.body;
+      if (!body) throw { status: 400 as const, message: '请求体短于声明的 Content-Length，已放弃保存' };
+      // customMetadata 里不写 size —— 长度以 R2 落库后的真实值为准
+      size = await putStreamed(env, key, body, { contentType: mimeType, filename });
     }
     await insertFile(env.DB, {
       code, filename, size, mimeType, expireAt, maxDownloads: effectiveMaxDownloads, clientIp: ip,
@@ -285,11 +240,6 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
     // 失败必须清干净：残留对象既占空间又会被孤儿扫描算钱
     await env.FILE_STORE.delete(key).catch(() => {});
     await releaseCode(env.DB, code);
-    if (e instanceof UploadLimitError) {
-      if (e.kind === 'quota') throw { status: 507 as const, message: quotaMessage(limits) };
-      if (e.kind === 'short') throw { status: 400 as const, message: '请求体短于声明的 Content-Length，已放弃保存' };
-      throw { status: 413 as const, message: `文件过大，最大 ${Math.floor(maxSize / 1048576)}MB` };
-    }
     throw e;
   }
 }

@@ -36,7 +36,7 @@
 - **限流** — 登录 5 次 / 60 秒、上传 10 次 / 60 秒（按客户端 IP），各类写操作独立计数
 - **SQL 注入防护** — 全部参数化查询
 - **取件码安全** — CSPRNG 生成 + 抢占式占用（`INSERT OR IGNORE` 原子判定，消除并发竞态）
-- **上传不吞内存** — 请求体经 `FixedLengthStream` 流式写入 R2，内存占用与文件大小解耦；失败时删除残留对象并释放取件码
+- **上传不进内存、也不过 JS** — 带 `Content-Length` 的请求体原样交给 R2，字节不在 Worker 里逐块搬运。Free 计划每次请求只有 10ms 连续 CPU，自己搬 8 MiB 必然撞上限（错误 1102）；缺 `Content-Length` 的请求在读 body 之前就 411 拒绝，绝不退化成把整个文件缓冲进 isolate（只有 128MB）
 - **存储配额** — 可选的 R2 总占用上限，超限只拒绝新上传（507），不影响已有文件；计数器由定时任务与 R2 实测值对账
 - **私密内容不被缓存** — 取件页与含正文的结果页一律 `Cache-Control: no-store`
 - **删除即彻底** — 先删 R2 再删 DB（`try/finally` 兜底）；缩略图随主文件一并销毁，过期清理与孤儿对象扫描都覆盖
@@ -146,7 +146,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
   -d '{"openUpload":"1","maxFileSize":"26214400","defaultExpireDays":"7","maxTotalStorage":"536870912"}'
 ```
 
-上传相关的错误码：`413` 单个文件超上限、`507` R2 总占用已满、`429` 触发上传限流（分片用独立的桶，一次会话几十片不会把上传配额吃光）、`401` 游客上传被关、`422` 分片序号越界或缺片。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
+上传相关的错误码：`413` 单个文件超上限、`507` R2 总占用已满、`429` 触发上传限流（分片用独立的桶，一次会话几十片不会把上传配额吃光）、`401` 游客上传被关、`411` 请求没有 `Content-Length`（长度未知，Worker 不接收）、`422` 分片序号越界 / 片长与账面对不上 / 缺片。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
 
 ### 网页接口一览
 
@@ -157,7 +157,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 | POST | `/api/upload` | 文件上传，返回 `{code, filename, size}` |
 | POST | `/api/upload/text` | 文本上传，返回 HTML 结果页 |
 | POST | `/api/upload/chunk/init` | 开一个分片会话（校验大小/配额、预占取件码），返回会话句柄 `session` 与片数 |
-| PUT | `/api/upload/chunk/:session/:part` | 上传一片（8 MiB 以内，直接流进 R2 multipart 会话） |
+| PUT | `/api/upload/chunk/:session/:part` | 上传一片（长度由服务端按会话算出，请求体直接流进 R2 multipart 会话） |
 | GET | `/api/upload/chunk/status/:session` | 已收到哪些片号，供重试时跳过 |
 | POST | `/api/upload/chunk/complete/:session` | 合并收尾，返回 `{code, filename, size}` |
 | POST | `/api/upload/chunk/abort/:session` | 放弃会话，释放预留的取件码与配额 |
@@ -179,6 +179,8 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 **发件** — 拖入文件或粘贴 → 需要时展开「额外发件设置」调整有效期 / 最大下载次数 / 自定义取件码 → 点「发件并获取取件码」。多个文件会各自拿到一段连号的码，此时自定义取件码输入框不可用（一个码只能对应一个文件）。
 
 **大文件** — 超过 16 MiB 的文件会自动切成 8 MiB 的分片并发上传（3 路），单片失败只重传那一片，不必整个文件重来。阈值定在 16 MiB 而不是「能塞进一个请求就行」那么高，是因为慢上行下一个大 PUT 会在半途被掐断，而单请求没有重试粒度：一片传完就是传完了。分片由 R2 在存储侧合并成一个对象，所以取件码、后台记录、下载次数、过期清理都与普通文件完全一致。单次会话最多 1000 片（约 8 GiB）。
+
+**为什么字节不能过 JS** — Cloudflare 每次请求的 CPU 上限是算"连续执行的一段"（await I/O 时计时会停），Free 计划只有 10 ms。在 Worker 里逐块搬 8 MiB 正好是一整段不中断的 memcpy，线上表现是同一份文件随机某几片 `503 / Error 1102 exceededCpu`，而且成败取决于那一片的字节在 Worker 开始读之前到齐了没有 —— 网络快反而更容易死。所以两条上传路径都把 `request.body` 原样交给 R2，JS 只 await 一个 Promise；长度必须来自 `Content-Length`（单文件）或会话记录里算出的片长（分片），拿不到就 411，而不是把文件读进内存。
 
 **没传完的分片怎么清** — 未合并的 multipart 会话**不是一个对象**：R2 面板里看不到它，删文件、删对象都够不着，只有 `abort` 能释放，而它已经在按存储计费。本项目有三条清理路径：浏览器在传失败或页面被关掉时自己 abort；每 30 分钟的定时任务放弃超过 6 小时未完成的会话（「清理过期文件」按钮也会顺带做一次）；`/admin` 顶部会列出所有进行中的分片会话（文件名、声明大小、已传片数、挂起时长），可以逐条「放弃」或一次「全部放弃」。
 
@@ -241,7 +243,7 @@ npm run dev           # http://localhost:8787
 ```bash
 npm run typecheck     # tsc --noEmit
 npm test              # 主流程冒烟（Playwright 无头）
-npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片，共 150 项断言
+npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片，共 153 项断言
 ```
 
 用例假设本地服务已启动且表已建好：

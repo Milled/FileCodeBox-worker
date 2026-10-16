@@ -155,9 +155,9 @@ export async function chunkInit(
 }
 
 /**
- * 收一片：请求体直接流进 multipart 会话。
- * 每片用 FixedLengthStream 承载 Content-Length —— R2 不接受长度未知的流，
- * 顺带让「实际字节数与声明不符」在写入时就失败，而不是攒出一个坏对象。
+ * 收一片：请求体原样交给 R2，字节不进 JS。
+ * R2 接受带 Content-Length 的 request.body（长度已知），转发在平台内部完成；
+ * 自己 read/write 搬运会把 8 MiB 跑成一段不中断的执行，撞上免费计划 10ms 的连续 CPU 上限。
  */
 export async function chunkPut(
   c: Context<{ Bindings: Env }>,
@@ -182,37 +182,23 @@ export async function chunkPut(
   const existing = await listChunkParts(env.DB, uploadId);
   if (existing.some((p) => p.part_number === part)) return { ok: true, part, skipped: true };
 
+  // 每片该有多少字节由会话行算出来，不信任客户端：第 1..N-1 片恒等于 part_size，末片是余数。
+  // Content-Length 只用来一次性对账，字节本身不进 JS —— 免费计划每请求 10ms 连续 CPU，
+  // 自己搬运 8 MiB 正好会跑成一段不中断的执行，线上表现为随机某几片 1102
+  const expected = part < task.total_parts ? task.part_size : task.size - task.part_size * (task.total_parts - 1);
   const declared = Number(c.req.header('Content-Length'));
-  if (!Number.isFinite(declared) || declared <= 0) throw { status: 422 as const, message: '分片缺少 Content-Length' };
-  if (declared > CHUNK_PART_SIZE) throw { status: 413 as const, message: '单个分片超过 8 MiB' };
+  if (declared !== expected) {
+    throw { status: 422 as const, message: `分片长度应为 ${expected} 字节（第 ${part}/${task.total_parts} 片）` };
+  }
   if (!c.req.raw.body) throw { status: 422 as const, message: '分片内容为空' };
-
-  const fixed = new FixedLengthStream(declared);
-  const pump = async (): Promise<void> => {
-    const reader = c.req.raw.body!.getReader();
-    const writer = fixed.writable.getWriter();
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) await writer.write(value);
-      }
-      await writer.close();
-    } catch (e) {
-      await writer.abort(e).catch(() => {});
-      throw e;
-    }
-  };
 
   const mp = env.FILE_STORE.resumeMultipartUpload(`file:${task.code}`, uploadId);
   let etag = '';
   try {
-    const [uploaded] = await Promise.all([mp.uploadPart(part, fixed.readable), pump()]);
-    etag = uploaded.etag;
-  } catch (e) {
-    // FixedLengthStream 会拒绝超出约定长度的写入，这是唯一能确定的客户端错误；
-    // 其余原样抛出，宁可留 500 也不要猜错成客户端问题
-    if (e instanceof Error && /allotted size/i.test(e.message)) {
+    ({ etag } = await mp.uploadPart(part, c.req.raw.body));
+  } catch (e: any) {
+    // 长度对不上账（声明了却少送/多送）是唯一能确定属于客户端的失败，其余原样抛出
+    if (e instanceof Error && /allotted size|known length/i.test(e.message)) {
       throw { status: 422 as const, message: '分片实际大小与 Content-Length 不符' };
     }
     throw e;
