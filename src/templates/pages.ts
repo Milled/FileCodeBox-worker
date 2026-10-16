@@ -577,31 +577,58 @@ function homeScript(): string {
       });
     }
 
-    function putPart(s, file, n, attempt, onProgress) {
+    // 用 XHR 而不是 fetch：只有它能报「上传方向」的进度。
+    // fetch 要等整片传完才有结果，130MB 的文件在慢上行下会长时间停在 0 B/s，
+    // 用户完全分不清是慢还是卡死
+    function putPart(s, file, n, attempt, onLoaded) {
       var start = (n - 1) * s.part_size;
       var blob = file.slice(start, Math.min(start + s.part_size, file.size));
-      return fetch('/api/upload/chunk/' + encodeURIComponent(s.upload_id) + '/' + n, { method: 'PUT', body: blob })
-        .then(function (r) {
-          if (r.ok) { onProgress(blob.size); return null; }
-          return r.json().catch(function () { return null; }).then(function (j) {
-            throw new Error((j && (j.error || j.msg)) || ('分片 ' + n + ' 上传失败（HTTP ' + r.status + '）'));
-          });
-        })
-        .catch(function (e) {
-          // 弱网下只重传这一片，不用整个文件重来
-          if (attempt < 2) return putPart(s, file, n, attempt + 1, onProgress);
-          throw e;
-        });
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('PUT', '/api/upload/chunk/' + encodeURIComponent(s.upload_id) + '/' + n);
+        xhr.upload.onprogress = function (e) { if (e.lengthComputable) onLoaded(n, e.loaded); };
+        xhr.onload = function () {
+          if (xhr.status >= 200 && xhr.status < 300) { onLoaded(n, blob.size); resolve(); return; }
+          var msg = '';
+          try { msg = JSON.parse(xhr.responseText).error; } catch (err) { msg = ''; }
+          reject(new Error(msg || ('分片 ' + n + ' 上传失败（HTTP ' + xhr.status + '）')));
+        };
+        xhr.onerror = function () { reject(new Error('分片 ' + n + ' 网络错误')); };
+        xhr.send(blob);
+      }).catch(function (e) {
+        // 弱网下只重传这一片，不用整个文件重来
+        if (attempt < 2) return putPart(s, file, n, attempt + 1, onLoaded);
+        throw e;
+      });
     }
 
-    function runPartPool(s, todo, file, onProgress) {
+    // 3 路并发，进度是所有在飞片的字节之和（否则会来回跳）
+    function runPartPool(s, todo, file, base, onProgress) {
       var queue = todo.slice();
-      var workers = [];
-      var lanes = Math.min(3, queue.length);
+      var live = {};
+      var finished = 0;
+      function report() {
+        var bytes = base;
+        for (var k in live) bytes += live[k];
+        // 外层回调的签名是 (loaded, total, extra)，标签必须放第三位，否则会盖掉 total
+        onProgress(bytes, file.size, '分片 ' + finished + '/' + s.total_parts);
+      }
+      function onLoaded(n, bytes) {
+        if (live[n] === bytes) return;
+        live[n] = bytes;
+        report();
+      }
       function worker() {
         if (!queue.length) return Promise.resolve();
-        return putPart(s, file, queue.shift(), 0, onProgress).then(worker);
+        var n = queue.shift();
+        return putPart(s, file, n, 0, onLoaded).then(function () {
+          finished += 1;
+          return worker();
+        });
       }
+      report();  // 先出一次「分片 0/N」，让界面立刻证明分片通道已经跑起来
+      var workers = [];
+      var lanes = Math.min(3, queue.length);
       for (var i = 0; i < lanes; i++) workers.push(worker());
       return Promise.all(workers);
     }
@@ -634,14 +661,9 @@ function homeScript(): string {
             var got = {};
             (st && st.done ? st.done : []).forEach(function (n) { got[n] = true; });
             var todo = indexes.filter(function (n) { return !got[n]; });
-            // 外层进度要的是"当前文件已传字节数"，所以这里累加；
-            // 已完成的片也先计入，否则续传时进度条会从 0 开始
-            var sent = (s.total_parts - todo.length) * s.part_size;
-            onProgress(sent, file.size);
-            return runPartPool(s, todo, file, function (bytes) {
-              sent += bytes;
-              onProgress(sent, file.size);
-            });
+            // 已完成的片先计入，续传时进度条不从 0 开始
+            var base = (s.total_parts - todo.length) * s.part_size;
+            return runPartPool(s, todo, file, base, onProgress);
           })
           .then(function () {
             return fetchJson('/api/upload/chunk/complete/' + encodeURIComponent(s.upload_id), { method: 'POST' });
@@ -716,9 +738,10 @@ function homeScript(): string {
         var chain = Promise.resolve();
         jobs.forEach(function (file, idx) {
           chain = chain.then(function () {
-            return sendOne(file, query, run[idx] || '', function (loaded, total) {
+            return sendOne(file, query, run[idx] || '', function (loaded, total, extra) {
               onProgress(0, loaded);
-              paint(done + loaded, '上传中 (' + (idx + 1) + '/' + jobs.length + ') ' + file.name);
+              paint(done + loaded, '上传中 (' + (idx + 1) + '/' + jobs.length + ') ' + file.name
+                + (extra ? ' · ' + extra : ''));
             }).then(function (data) {
               done += file.size;
               collected.push({ name: file.name, code: data.code, size: file.size });

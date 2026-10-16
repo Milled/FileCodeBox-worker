@@ -93,6 +93,18 @@ export async function chunkedSuite(browser) {
     const afterDone = await call(`/api/upload/chunk/status/${sess.upload_id}`, {});
     s.ok('complete 后会话即结束（不残留）', afterDone.status === 404, String(afterDone.status));
 
+    // 分片合成的文件必须和普通文件一样可删：走后台删除接口，顺带验证配额被释放
+    const before = Number((await apiJson(page, '/api/admin/config/get')).json?.detail?.storageUsed || '0');
+    const list = await apiJson(page, '/api/admin/file/list?size=50');
+    const row = (list.json?.detail?.data || []).find((f) => f.code === code);
+    const del = row
+      ? await call(`/api/admin/file/delete?id=${row.id}`, { method: 'DELETE' })
+      : { status: 0 };
+    const after = Number((await apiJson(page, '/api/admin/config/get')).json?.detail?.storageUsed || '0');
+    s.ok('分片文件可删除且释放配额',
+      del.status === 200 && (before - after) === BIG,
+      `${del.status} ${before} → ${after}`);
+
     // ---- 参数与越界校验 ----
     const badSize = await call('/api/upload/chunk/init', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filename: 'x', size: 0 }),
@@ -117,7 +129,9 @@ export async function chunkedSuite(browser) {
       miss.status === 422 && /缺少分片/.test(miss.json?.error || ''), miss.json?.error);
 
     // 配额取「当前已用 + 8MB」：单独已用不超过，但加上那个未完成的 70MiB 会话就一定超。
-    // 不能写死数字 —— 本地桶会随反复跑测累积，写死会让拒绝原因变成"本来就已超"
+    // 不能写死数字 —— 本地桶会随反复跑测累积，写死会让拒绝原因变成"本来就已超"。
+    // 前提是库里没有别的未完成会话：崩溃的跑测会留下会话（cron 6 小时才清），
+    // 那些 pending 会让 abort 之后的重试仍然 507，表现为本条断言失败
     const used = Number((await apiJson(page, '/api/admin/config/get')).json?.detail?.storageUsed || '0');
     const quotaMb = Math.ceil(used / 1048576) + 8;
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
@@ -140,6 +154,11 @@ export async function chunkedSuite(browser) {
     const ui = await newPage(browser, { tag: 'chunk-ui' });
     const chunkUrls = [];
     ui.on('request', (r) => { if (r.url().includes('/api/upload/chunk/')) chunkUrls.push(r.url()); });
+    // 限速到 10MB/s：不节流的话 loopback 两秒传完，采不到中间进度
+    const cdp = await ui.context().newCDPSession(ui);
+    await cdp.send('Network.emulateNetworkConditions', {
+      offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: 10 * 1024 * 1024,
+    });
     await ui.goto(`${BASE}/`, { waitUntil: 'networkidle' });
     await ui.evaluate(async () => {
       const big = new Uint8Array(70 * 1024 * 1024);
@@ -147,17 +166,26 @@ export async function chunkedSuite(browser) {
       dt.items.add(new File([big], 'ui-big.bin', { type: 'application/octet-stream' }));
       document.getElementById('dropZone').dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
     });
-    const navBig = (await Promise.all([
-      ui.waitForNavigation({ url: /\/r\/\d{4}/, timeout: 120000 }).catch(() => null),
-      ui.click('#submitBtn'),
-    ]))[0];
+    ui.click('#submitBtn').catch(() => {});
+    // 分片路径以前只在整片传完时更新一次进度，慢上行下会长时间显示 0 B/s，
+    // 用户分不清是慢还是卡死；这里断言进度确实在中间值上连续爬过
+    const samples = new Set();
+    for (let i = 0; i < 60; i++) {
+      await ui.waitForTimeout(250);
+      const m = ((await ui.textContent('#uploadMeta').catch(() => '')) || '').trim();
+      const sent = m.split(' / ')[0];
+      if (sent && sent !== '0 B') samples.add(sent);
+      if (/\/r\/\d{4}/.test(ui.url())) break;
+    }
+    s.ok('分片上传过程中进度连续累加（不是停在 0）', samples.size >= 3, [...samples].slice(0, 4).join(' → '));
+    // 采样循环本身就在等跳转，这里读最终 URL，不再重复 waitForNavigation
+    const uiCode = /\/r\/(\d{4})/.exec(ui.url())?.[1] || '';
     s.ok('>64MiB 的文件由前端自动切到分片通道',
-      !!navBig && chunkUrls.some((u) => u.includes('/init')) && chunkUrls.some((u) => u.includes('/complete')),
+      !!uiCode && chunkUrls.some((u) => u.includes('/init')) && chunkUrls.some((u) => u.includes('/complete')),
       `${chunkUrls.length} 个分片请求`);
-    const uiCode = navBig ? /\/r\/(\d{4})/.exec(navBig.url())?.[1] : '';
     const uiInfo = uiCode ? await apiJson(ui, `/api/info/${uiCode}`) : { json: null };
     s.ok('分片上传后仍落在成功视图且大小正确',
-      !!navBig && navBig.url().includes('?sent=1') && uiInfo.json?.size === 70 * 1024 * 1024,
+      ui.url().includes('?sent=1') && uiInfo.json?.size === 70 * 1024 * 1024,
       `code=${uiCode} size=${uiInfo.json?.size}`);
 
     // 小文件必须继续走原来的单请求路径
@@ -167,6 +195,13 @@ export async function chunkedSuite(browser) {
     await Promise.all([ui.waitForNavigation({ url: /\/r\/\d{4}/, timeout: 60000 }), ui.click('#submitBtn')]);
     s.ok('小文件仍走单请求，不多付往返', chunkUrls.length === 0, `${chunkUrls.length}`);
     await ui.close();
+
+    // 收尾把 UI 造出来的 70MiB 删掉，否则每跑一次本地桶就多 70MiB
+    if (uiCode) {
+      const uiList = await apiJson(page, '/api/admin/file/list?size=50');
+      const uiRow = (uiList.json?.detail?.data || []).find((f) => f.code === uiCode);
+      if (uiRow) await call(`/api/admin/file/delete?id=${uiRow.id}`, { method: 'DELETE' });
+    }
 
     s.ok('无页面异常', problems.length === 0, problems.join(' | '));
   } finally {
