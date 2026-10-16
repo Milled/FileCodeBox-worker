@@ -307,8 +307,8 @@ function homeScript(): string {
     }
 
     function fmtBytes(n) {
-      if (n > 1048576) return (n / 1048576).toFixed(1) + ' MB';
-      if (n > 1024) return (n / 1024).toFixed(1) + ' KB';
+      if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+      if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
       return Math.round(n) + ' B';
     }
 
@@ -1146,6 +1146,9 @@ export interface AdminConfig {
 
 export function adminSettingsPage(config: AdminConfig, saved?: string): string {
   const mb = (n: number) => (n / 1048576).toFixed(n % 1048576 === 0 ? 0 : 1);
+  // 表单以 MB 为单位（字节数对人不直观），存进去仍是字节：
+  // 服务端比较、兼容 API 与 fc_settings 的语义都不变
+  const toMb = (bytes: number) => (bytes > 0 ? String(Math.round((bytes / 1048576) * 100) / 100) : '');
   // Cloudflare 按账号套餐限制单次请求体大小，Free/Pro 是最窄的那档
   const PLATFORM_BODY_LIMIT = 104857600;
   const content = `
@@ -1174,26 +1177,26 @@ export function adminSettingsPage(config: AdminConfig, saved?: string): string {
       </div>
       <div class="setting-row">
         <div class="setting-text">
-          <div class="setting-title">单文件大小上限</div>
+          <div class="setting-title">单文件大小上限（MB）</div>
           <div class="setting-desc">
-            <div>单位字节。生效优先级：此处填写值 &gt; wrangler 变量 ${config.varsMaxFileSize}（${mb(config.varsMaxFileSize)} MB）&gt; 内置兜底 25 MB；清空保存即回退到变量值。</div>
+            <div>单位 MB（可填小数，如 0.5）。生效优先级：此处填写值 &gt; wrangler 变量 ${mb(config.varsMaxFileSize)} MB &gt; 内置兜底 25 MB；清空保存即回退到变量值。</div>
             <div>另有一条本软件管不住的上限：Cloudflare 单次请求体最大 100 MB（Free / Pro 账号）、200 MB（Business）、5 GB（Enterprise），取决于账号套餐而不是 Workers 套餐。当前未启用分片上传，超过请求体上限的文件会在平台层被直接掐断。</div>
             ${config.maxFileSize > PLATFORM_BODY_LIMIT ? '<div class="setting-warn">当前设置已超过 100 MB：Free / Pro 账号下这类文件拿不到本软件的「文件过大」提示，而是被平台直接拒绝。请下调上限，或等分片上传启用后再调高。</div>' : ''}
           </div>
         </div>
-        <input type="number" name="maxFileSize" class="input setting-control" min="1024" max="5368709120" step="1" value="${config.maxFileSize}" placeholder="${config.varsMaxFileSize}">
+        <input type="number" name="maxFileSizeMb" class="input setting-control" min="0.1" max="5120" step="0.1" value="${toMb(config.maxFileSize)}" placeholder="${toMb(config.varsMaxFileSize)}">
       </div>
       <div class="setting-row">
         <div class="setting-text">
-          <div class="setting-title">R2 总占用上限</div>
+          <div class="setting-title">R2 总占用上限（MB）</div>
           <div class="setting-desc">
-            <div>单位字节，留空或 0 = 不限制。当前已用 ${formatFileSize(config.storageUsed)}${config.maxTotalStorage > 0 ? ` / 上限 ${formatFileSize(config.maxTotalStorage)}（剩余 ${formatFileSize(Math.max(0, config.maxTotalStorage - config.storageUsed))}）` : ''}。</div>
+            <div>单位 MB，留空或 0 = 不限制。当前已用 ${formatFileSize(config.storageUsed)}${config.maxTotalStorage > 0 ? ` / 上限 ${formatFileSize(config.maxTotalStorage)}（剩余 ${formatFileSize(Math.max(0, config.maxTotalStorage - config.storageUsed))}）` : ''}。</div>
             <div>统计口径是本应用写入的 R2 对象（主文件 + 缩略图），不含你手动放进桶里的其他文件；数值随上传与删除实时增减，并由每 30 分钟一次的定时任务用 R2 实测值对账。</div>
             <div>撞到上限时新的上传与文本分享都会被拒（507），已有文件不受影响；删除文件或等它们过期即释放空间。</div>
             <div>R2 免费额度为 10 GiB 存储，超出部分按量计费且不会自动熔断，建议按预算设一个上限。</div>
           </div>
         </div>
-        <input type="number" name="maxTotalStorage" class="input setting-control" min="0" step="1" value="${config.maxTotalStorage || ''}" placeholder="0 = 不限制">
+        <input type="number" name="maxTotalStorageMb" class="input setting-control" min="0" step="0.1" value="${toMb(config.maxTotalStorage)}" placeholder="0 = 不限制">
       </div>
       <div class="setting-row">
         <div class="setting-text">

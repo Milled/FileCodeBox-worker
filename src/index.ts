@@ -333,12 +333,17 @@ app.post('/admin/settings', async (c) => {
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
   const body = await c.req.parseBody();
   const field = (k: string) => (typeof body[k] === 'string' ? (body[k] as string).trim() : '');
+  // 表单以 MB 为单位（字节数对人不直观），落库仍是字节：
+  // 服务端比较、fc_settings 与兼容 API 的语义都不变。
+  // 留空 / 0 / 非法值统一写成空串，resolveLimits 会忽略它并回退到 wrangler vars
+  const mbField = (k: string) => {
+    const n = parseFloat(field(k));
+    return Number.isFinite(n) && n > 0 ? String(Math.round(n * 1048576)) : '';
+  };
   await setSetting(env.DB, 'open_upload', field('openUpload') === '0' ? '0' : '1');
-  // 清空即回退到 wrangler vars：resolveLimits 会忽略空值与非法值
-  await setSetting(env.DB, 'max_file_size', field('maxFileSize'));
+  await setSetting(env.DB, 'max_file_size', mbField('maxFileSizeMb'));
   await setSetting(env.DB, 'default_expire_days', field('defaultExpireDays'));
-  // 总占用上限：留空或 0 都表示不限制（resolveLimits 把非正整数当作未设置）
-  await setSetting(env.DB, 'max_total_storage', field('maxTotalStorage'));
+  await setSetting(env.DB, 'max_total_storage', mbField('maxTotalStorageMb'));
   return c.redirect('/admin/settings?saved=1');
 });
 

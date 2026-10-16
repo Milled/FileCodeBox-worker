@@ -51,8 +51,9 @@ export async function hashPassword(pwd: string): Promise<string> {
 
 /** 格式化文件大小 */
 export function formatFileSize(bytes: number): string {
-  if (bytes > 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
-  if (bytes > 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  // 用 >= 而非 >：正好 1 MiB / 1 KiB 时否则会显示成 "1024.0 KB" 这种别扭值
+  if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
 }
 
