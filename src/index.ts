@@ -20,7 +20,9 @@ import {
   incrementDownload,
   getDashboardStats,
   getSetting,
+  getStorageUsed,
   setSetting,
+  setStorageUsed,
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
@@ -92,7 +94,9 @@ async function homeOptions(env: Env): Promise<HomeOptions> {
 
 /** 后台设置页所需的当前值（生效值 + vars 回退值） */
 async function adminConfig(env: Env): Promise<AdminConfig> {
-  const [openUpload, limits] = await Promise.all([getSetting(env.DB, 'open_upload'), resolveLimits(env)]);
+  const [openUpload, limits, used] = await Promise.all([
+    getSetting(env.DB, 'open_upload'), resolveLimits(env), getStorageUsed(env.DB),
+  ]);
   const toInt = (v: string | undefined, fallback: number) => {
     const n = parseInt(v ?? '', 10);
     return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -101,6 +105,8 @@ async function adminConfig(env: Env): Promise<AdminConfig> {
     openUpload: openUpload ?? '1',
     maxFileSize: limits.maxSize,
     defaultExpireDays: limits.defaultExpireDays,
+    maxTotalStorage: limits.maxTotalStorage,
+    storageUsed: used,
     varsMaxFileSize: toInt(env.MAX_FILE_SIZE, 26214400),
     varsDefaultExpireDays: toInt(env.DEFAULT_EXPIRE_DAYS, 7),
   };
@@ -303,11 +309,14 @@ app.get('/admin', async (c) => {
   const dateTo = c.req.query('date_to') || '';
   const sort = c.req.query('sort') || 'newest';
 
-  const [{ files, total }, stats] = await Promise.all([
+  const [{ files, total }, stats, limits, used] = await Promise.all([
     listFilesAdvanced(env.DB, page, 50, keyword, dateFrom, dateTo, sort),
     getDashboardStats(env.DB),
+    resolveLimits(env),
+    getStorageUsed(env.DB),
   ]);
-  return c.html(adminPanel(files, total, page, undefined, { keyword, dateFrom, dateTo, sort }, stats));
+  return c.html(adminPanel(files, total, page, undefined, { keyword, dateFrom, dateTo, sort }, stats,
+    { used, limit: limits.maxTotalStorage }));
 });
 
 // 后台设置页：写入 fc_settings 覆盖 wrangler vars（resolveLimits 中 DB 优先），保存即生效
@@ -328,6 +337,8 @@ app.post('/admin/settings', async (c) => {
   // 清空即回退到 wrangler vars：resolveLimits 会忽略空值与非法值
   await setSetting(env.DB, 'max_file_size', field('maxFileSize'));
   await setSetting(env.DB, 'default_expire_days', field('defaultExpireDays'));
+  // 总占用上限：留空或 0 都表示不限制（resolveLimits 把非正整数当作未设置）
+  await setSetting(env.DB, 'max_total_storage', field('maxTotalStorage'));
   return c.redirect('/admin/settings?saved=1');
 });
 
@@ -379,6 +390,10 @@ app.post('/admin/cleanup', async (c) => {
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
 
   await cleanupExpired(env.DB, env.FILE_STORE);
+  // 与 Cron 同一条路径：顺带清孤儿对象并把 storage_used 对账成 R2 实测值。
+  // 新部署或计数器漂移时，管理员点一次就能拿到准确数字，不必等半小时
+  const { usedBytes, scanned } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
+  if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
   return c.redirect('/admin');
 });
 
@@ -424,7 +439,10 @@ export default {
           // 幂等初始化：确保首次部署后表结构自动就绪（/api/init 已需鉴权）
           await initDB(env.DB);
           const { expiredCount, cleanedCodes } = await cleanupExpired(env.DB, env.FILE_STORE);
-          const { scanned, removed } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
+          const { scanned, removed, usedBytes } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
+          // 对账：孤儿扫描已经逐页累加了实测占用，直接改写计数器，
+          // 修掉增量计数器在异常路径上可能攒出的漂移（0 表示桶确实空了，不是"没扫到"）
+          if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
           const rateLimitCleaned = await cleanupRateLimitEntries(env.DB);
           console.log(JSON.stringify({
             event: 'scheduled_cleanup',
@@ -432,6 +450,7 @@ export default {
             cleanedCodes,
             r2Scanned: scanned,
             r2Removed: removed,
+            storageUsed: usedBytes,
             rateLimitCleaned,
           }));
         } catch (e) {

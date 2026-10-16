@@ -10,7 +10,7 @@ import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env } from './types';
 import { formatFileSize } from './utils';
-import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, setSetting } from './db';
+import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, getStorageUsed, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
 import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits } from './shared';
 
@@ -36,6 +36,9 @@ async function effectiveConfig(c: Context<Bindings>) {
     openUpload: (await getSetting(c.env.DB, 'open_upload')) ?? '1',
     maxFileSize: String(limits.maxSize),
     defaultExpireDays: String(limits.defaultExpireDays),
+    // '0' = 不限制总占用
+    maxTotalStorage: String(limits.maxTotalStorage),
+    storageUsed: String(await getStorageUsed(c.env.DB)),
   };
 }
 
@@ -136,10 +139,12 @@ adminApi.use('*', async (c, next) => {
 });
 
 adminApi.get('/dashboard', async (c) => {
-  const stats = await getDashboardStats(c.env.DB);
+  // storageUsed 用配额计数器而不是 D1 求和：两者会因缩略图与对账而不同，
+  // 而管理员拿这个数字是为了判断"还剩多少能传"，必须与拒绝上传时用的是同一个值
+  const [stats, used] = await Promise.all([getDashboardStats(c.env.DB), getStorageUsed(c.env.DB)]);
   return ok(c, {
     totalFiles: stats.totalFiles,
-    storageUsed: formatFileSize(stats.totalSize),
+    storageUsed: formatFileSize(used),
     todayCount: stats.todayCount,
     todaySize: formatFileSize(stats.todaySize),
     yesterdayCount: stats.yesterdayCount,
@@ -201,6 +206,7 @@ adminApi.patch('/config/update', async (c) => {
   if (body.openUpload !== undefined) await setSetting(env.DB, 'open_upload', String(body.openUpload));
   if (body.maxFileSize !== undefined) await setSetting(env.DB, 'max_file_size', String(body.maxFileSize));
   if (body.defaultExpireDays !== undefined) await setSetting(env.DB, 'default_expire_days', String(body.defaultExpireDays));
+  if (body.maxTotalStorage !== undefined) await setSetting(env.DB, 'max_total_storage', String(body.maxTotalStorage));
 
   return ok(c, await effectiveConfig(c));
 });

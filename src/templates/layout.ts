@@ -20,7 +20,7 @@ export function layout(title: string, content: string, showFooter = true, wide =
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${title}</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2318181b'/><path d='M7 12h18v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2z' fill='%23f4f4f5'/><path d='M6 8h20v4H6z' fill='%23e4e4e7'/><path d='M14 8h4v18h-4z' fill='%23a1a1aa'/></svg>">
-  <link rel="stylesheet" href="/static/style.css?v=19">
+  <link rel="stylesheet" href="/static/style.css?v=20">
 </head>
 <body>
   <div class="container${wide ? ' container-wide' : ''}">

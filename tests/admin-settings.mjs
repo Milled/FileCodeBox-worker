@@ -84,6 +84,48 @@ export async function adminSettingsSuite(browser) {
     const rBack = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m-again.bin' } });
     s.ok('清空设置后回退到 wrangler vars', rBack.status() === 200, await rBack.text());
 
+    // ---- R2 总占用配额 ----
+    await page.evaluate(() => fetch('/admin/cleanup', { method: 'POST' }).then(() => 1));
+    const recon = await apiJson(page, '/api/admin/config/get');
+    s.ok('手动清理会顺带对账 storage_used', Number(recon.json?.detail?.storageUsed || '0') > 0,
+      recon.json?.detail?.storageUsed);
+
+    await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
+    await page.fill('input[name="maxTotalStorage"]', '100');
+    await save();
+    const rQuota = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, {
+      data: '配额测试内容', headers: { 'X-Filename': 'quota.bin' },
+    });
+    const quotaText = await rQuota.text();
+    s.ok('撞到总占用上限时新上传被拒（507）', rQuota.status() === 507 && /存储空间已满/.test(quotaText),
+      `${rQuota.status()} ${quotaText.slice(0, 40)}`);
+
+    const rTextQuota = await anon.request.post(`${BASE}/api/upload/text`, { form: { text: '配额下的文本', expire_value: '1' } });
+    s.ok('文本分享同样受总占用上限约束', rTextQuota.status() === 507, String(rTextQuota.status()));
+
+    await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
+    const desc = (await page.$$eval('.setting-desc', (els) => els.map((e) => e.textContent).join('\n'))) || '';
+    s.ok('设置页显示已用 / 上限 / 剩余与计量口径',
+      /当前已用/.test(desc) && /上限 100 B/.test(desc) && /统计口径/.test(desc),
+      desc.replace(/\s+/g, ' ').match(/当前已用[^。]*。/)?.[0] || '未找到');
+
+    await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
+    await page.fill('input[name="maxTotalStorage"]', '');
+    await save();
+    const rFree = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, {
+      data: '清空配额之后', headers: { 'X-Filename': 'free.bin' },
+    });
+    s.ok('清空总占用上限即恢复不限制', rFree.status() === 200, await rFree.text());
+
+    // ---- 超过平台上限时的警示文案 ----
+    await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
+    await page.fill('input[name="maxFileSize"]', '209715200');
+    await save();
+    s.ok('上限超过 100MB 时给出平台层警示', (await page.locator('.setting-warn').count()) === 1);
+    await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
+    await page.fill('input[name="maxFileSize"]', '');
+    await save();
+
     const after = await apiJson(page, '/api/admin/config/get');
     s.ok('config/get 回报实际生效值', after.json?.detail?.maxFileSize === varsMax, after.body);
   } finally {
@@ -92,8 +134,9 @@ export async function adminSettingsSuite(browser) {
     await page.selectOption('select[name="openUpload"]', '1').catch(() => {});
     await page.fill('input[name="maxFileSize"]', '').catch(() => {});
     await page.fill('input[name="defaultExpireDays"]', '').catch(() => {});
+    await page.fill('input[name="maxTotalStorage"]', '').catch(() => {});
     await save().catch(() => {});
-    s.note('已恢复 openUpload=1 并清空大小/过期覆盖');
+    s.note('已恢复 openUpload=1 并清空大小/过期/总占用覆盖');
   }
 
   s.ok('无页面异常', problems.length === 0, problems.join(' | '));

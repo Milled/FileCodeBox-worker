@@ -146,6 +146,9 @@ export async function insertFile(
       file.isText ?? 0,
     )
     .run();
+  // 新记录即新占用。计数器只在 insertFile / deleteFileRecord / cleanupExpired
+  // 这三个唯一出入口上增减，避免漏记与重复记
+  await adjustStorageUsed(db, file.size);
 }
 
 // ---- 下载计数 ----
@@ -162,6 +165,37 @@ export async function incrementDownload(
     .bind(code)
     .run();
   return result.meta.changes > 0;
+}
+
+// ---- 已用空间计数器 ----
+
+/**
+ * 调整 storage_used 计数器（delta 可为负）。
+ * 用 SQL 表达式做读改写而不是先查再写，避免并发上传互相覆盖计数；
+ * 下限夹到 0，防止异常路径把计数器压成负数后配额形同虚设。
+ */
+export async function adjustStorageUsed(db: D1Database, delta: number): Promise<void> {
+  if (!Number.isFinite(delta) || delta === 0) return;
+  await db
+    .prepare(`
+      INSERT INTO fc_settings(key, value) VALUES('storage_used', ?)
+      ON CONFLICT(key) DO UPDATE SET value = CAST(
+        MAX(0, CAST(COALESCE(fc_settings.value, '0') AS INTEGER) + ?) AS TEXT)
+    `)
+    .bind(String(delta), delta)
+    .run();
+}
+
+/** 当前计数器值；未初始化或对账前可能为 0 */
+export async function getStorageUsed(db: D1Database): Promise<number> {
+  const raw = await getSetting(db, 'storage_used');
+  const n = parseInt(raw ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** 对账：把计数器整体改写为 R2 实测值 */
+export async function setStorageUsed(db: D1Database, bytes: number): Promise<void> {
+  await setSetting(db, 'storage_used', String(Math.max(0, Math.floor(bytes))));
 }
 
 // ---- 缩略图 ----
@@ -189,6 +223,7 @@ export async function deleteFileRecord(
   if (file) {
     await db.prepare('DELETE FROM fc_files WHERE id = ?').bind(id).run();
     await releaseCode(db, file.code);
+    await adjustStorageUsed(db, -file.size);
   }
   return file;
 }
@@ -318,6 +353,7 @@ export async function cleanupExpired(
 
   // 先删记录，再释放取件码（并行执行，释放顺序不影响结果）
   await db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')").run();
+  await adjustStorageUsed(db, -files.reduce((s, f) => s + (f.size || 0), 0));
   await Promise.all(files.map((f) => releaseCode(db, f.code)));
 
   const cleanedCodes = await cleanupUsedCodes(db);
@@ -422,10 +458,10 @@ export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
 export async function cleanupOrphanedR2Objects(
   db: D1Database,
   bucket: R2Bucket,
-): Promise<{ scanned: number; removed: number }> {
+): Promise<{ scanned: number; removed: number; usedBytes: number }> {
   // cursor 翻页收集全部对象（4 位码全空间上限约 1 万个 ≈ 11 页 × 2 前缀），
   // 只扫首页会永久漏扫字典序靠后的 key
-  const objects: Array<{ key: string; code: string; uploaded: Date }> = [];
+  const objects: Array<{ key: string; code: string; uploaded: Date; size: number }> = [];
   for (const prefix of ['file:', 'thumb:']) {
     let cursor: string | undefined;
     do {
@@ -436,12 +472,13 @@ export async function cleanupOrphanedR2Objects(
           // R2 key 带前缀，D1 code 无前缀，查询前必须剥离
           code: o.key.slice(prefix.length),
           uploaded: o.uploaded,
+          size: o.size,
         })),
       );
       cursor = listed.truncated ? listed.cursor : undefined;
     } while (cursor);
   }
-  if (objects.length === 0) return { scanned: 0, removed: 0 };
+  if (objects.length === 0) return { scanned: 0, removed: 0, usedBytes: 0 };
 
   // 批量查询 D1 中存在的取件码（D1 单条查询绑定变量上限 100）；
   // 主文件与缩略图共用一个 code，先去重再查，省掉一半绑定量
@@ -462,11 +499,14 @@ export async function cleanupOrphanedR2Objects(
   // 窗口内的正常对象无 D1 记录，过早清理会静默丢数据
   const GRACE_MS = 3_600_000;
   const now = Date.now();
-  const orphans = objects
+  const orphanKeys = objects
     .filter((o) => !activeCodes.has(o.code) && now - o.uploaded.getTime() > GRACE_MS)
     .map((o) => o.key);
-  if (orphans.length === 0) return { scanned: objects.length, removed: 0 };
+  const removedSet = new Set(orphanKeys);
+  // 顺带得出实测占用，供 scheduled 回写计数器做对账（不额外多扫一遍桶）
+  const usedBytes = objects.reduce((s, o) => s + (removedSet.has(o.key) ? 0 : o.size), 0);
+  if (orphanKeys.length === 0) return { scanned: objects.length, removed: 0, usedBytes };
 
-  await Promise.all(orphans.map((k) => bucket.delete(k)));
-  return { scanned: objects.length, removed: orphans.length };
+  await Promise.all(orphanKeys.map((k) => bucket.delete(k)));
+  return { scanned: objects.length, removed: orphanKeys.length, usedBytes };
 }
