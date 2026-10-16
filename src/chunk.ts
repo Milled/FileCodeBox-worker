@@ -24,6 +24,7 @@ import {
 import {
   deleteChunkTask,
   getChunkTask,
+  getChunkTaskBySession,
   hasFileRecord,
   insertChunkTask,
   insertFile,
@@ -37,22 +38,41 @@ import {
 
 /** 每片 8 MiB：远高于 S3 兼容接口「非末片最小 5 MiB」的要求，又远小于最窄套餐的请求体上限 */
 export const CHUNK_PART_SIZE = 8 * 1024 * 1024;
-/** 超过这个大小才走分片。小文件继续用单请求 XHR，不为常见情况多付两次往返 */
-export const CHUNK_THRESHOLD = 64 * 1024 * 1024;
+/**
+ * 超过这个大小才走分片。
+ * 曾经是 64 MiB（只为绕开 Cloudflare 的单次请求体上限），但慢上行还有一条时间线：
+ * 一个 50MB 的 PUT 在 500KB/s 上要用满 100 秒，边缘会在传输中途掐断连接，
+ * 而单请求没有重试粒度 —— 用户看到的就是一次「网络错误」加 50MB 白传。
+ * 按两片算，常见大文件都能拆成可重传的短请求。
+ */
+export const CHUNK_THRESHOLD = 16 * 1024 * 1024;
 /** R2 单次会话允许 10,000 片，这里收紧到 1000（≈ 8 GiB），越界直接拒绝而不是静默截断 */
 const MAX_PARTS = 1000;
 /** 未完成会话的保留时长。超时必须 abort —— 已上传但未 complete 的分片会持续计费 */
 export const CHUNK_STALE_MS = 6 * 3600_000;
 
-// R2 的 uploadId 实测 171 字符、字符集是 base64url 那一套；长度上限留到 256，
-// 只用来挡住明显恶意的路径参数，真正的鉴权是「这一行在 fc_chunk_uploads 里存在吗」
-const UPLOAD_ID_RE = /^[A-Za-z0-9_-]{8,256}$/;
+// 客户端句柄：我们自己生成的 32 位十六进制，绝不使用 R2 的 uploadId。
+// 后者是 base64 家族的任意字符串，长度和字符集都不归我们管 —— 放进 URL 路径早晚被某一环
+// （转义、二次解码、按 / 切段）改写，症状是每片都 422、进度永远 0/N，而会话已经在桶里计费
+const SESSION_RE = /^[0-9a-f]{32}$/;
 
-function requireTask(c: Context<{ Bindings: Env }>): { uploadId: string; part: number } {
-  const uploadId = c.req.param('upload_id') ?? '';
-  if (!UPLOAD_ID_RE.test(uploadId)) throw { status: 422 as const, message: '无效的上传会话标识' };
-  const part = parseInt(c.req.param('part') ?? '');
-  return { uploadId, part };
+function newSessionId(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/** 从路径句柄取回会话行。404 与 422 分开：前者是会话已结束，后者是句柄格式不对 */
+async function resolveTask(c: Context<{ Bindings: Env }>, env: Env): Promise<ChunkTask> {
+  const task = await getChunkTaskBySession(env.DB, sessionIdOf(c));
+  if (!task) throw { status: 404 as const, message: '上传会话不存在或已结束' };
+  return task;
+}
+
+function sessionIdOf(c: Context<{ Bindings: Env }>): string {
+  const session = c.req.param('session') ?? '';
+  if (!SESSION_RE.test(session)) throw { status: 422 as const, message: '无效的上传会话标识' };
+  return session;
 }
 
 /** 与 uploadFile 一致的过期参数解析（兼容旧参数名 expire_days） */
@@ -72,7 +92,7 @@ function expireFrom(body: Record<string, unknown>, defaultExpireDays: number): {
 export async function chunkInit(
   c: Context<{ Bindings: Env }>,
   env: Env,
-): Promise<{ upload_id: string; code: string; part_size: number; total_parts: number }> {
+): Promise<{ session: string; code: string; part_size: number; total_parts: number }> {
   await assertUploadAllowed(c, env);
 
   const ip = getClientIp(c.req.raw.headers);
@@ -108,6 +128,7 @@ export async function chunkInit(
 
   const code = await ensureCodeAvailable(String(body.code ?? '').trim(), env);
   const key = `file:${code}`;
+  const sessionId = newSessionId();
   let uploadId = '';
   try {
     const mp = await env.FILE_STORE.createMultipartUpload(key, {
@@ -116,7 +137,7 @@ export async function chunkInit(
     });
     uploadId = mp.uploadId;
     const task: ChunkTask = {
-      upload_id: uploadId, code, filename, size, part_size: CHUNK_PART_SIZE, total_parts: totalParts,
+      upload_id: uploadId, session_id: sessionId, code, filename, size, part_size: CHUNK_PART_SIZE, total_parts: totalParts,
       mime_type: mimeType, expire_at: expireAt, max_downloads: maxDownloads,
       created_at: new Date().toISOString(), ip,
     };
@@ -130,7 +151,7 @@ export async function chunkInit(
     throw e;
   }
 
-  return { upload_id: uploadId, code, part_size: CHUNK_PART_SIZE, total_parts: totalParts };
+  return { session: sessionId, code, part_size: CHUNK_PART_SIZE, total_parts: totalParts };
 }
 
 /**
@@ -142,17 +163,17 @@ export async function chunkPut(
   c: Context<{ Bindings: Env }>,
   env: Env,
 ): Promise<{ ok: true; part: number; skipped?: boolean }> {
-  const { uploadId, part } = requireTask(c);
+  const part = parseInt(c.req.param('part') ?? '');
 
   // 分片必须用独立限流桶：一次会话可能有上百片，共用上传桶会把自己掐死；
-  // 反过来没有它，拿到 uploadId 的人就能无限刷片
+  // 反过来没有它，拿到会话句柄的人就能无限刷片
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'chunk_ratelimit', ip, 300))) {
     throw { status: 429 as const, message: '分片上传过于频繁，请稍后再试' };
   }
 
-  const task = await getChunkTask(env.DB, uploadId);
-  if (!task) throw { status: 404 as const, message: '上传会话不存在或已结束' };
+  const task = await resolveTask(c, env);
+  const uploadId = task.upload_id;
   if (!Number.isInteger(part) || part < 1 || part > task.total_parts) {
     throw { status: 422 as const, message: '分片序号超出范围' };
   }
@@ -201,16 +222,14 @@ export async function chunkPut(
   return { ok: true, part };
 }
 
-/** 已传哪些片（供断点续传跳过）。uploadId 是随机的，这里只暴露片号，不暴露内容 */
+/** 已传哪些片（供断点续传跳过）。句柄是随机的，这里只暴露片号，不暴露内容 */
 export async function chunkStatus(
   c: Context<{ Bindings: Env }>,
   env: Env,
-): Promise<{ upload_id: string; total_parts: number; done: number[] }> {
-  const { uploadId } = requireTask(c);
-  const task = await getChunkTask(env.DB, uploadId);
-  if (!task) throw { status: 404 as const, message: '上传会话不存在或已结束' };
-  const parts = await listChunkParts(env.DB, uploadId);
-  return { upload_id: uploadId, total_parts: task.total_parts, done: parts.map((p) => p.part_number) };
+): Promise<{ session: string; total_parts: number; done: number[] }> {
+  const task = await resolveTask(c, env);
+  const parts = await listChunkParts(env.DB, task.upload_id);
+  return { session: task.session_id, total_parts: task.total_parts, done: parts.map((p) => p.part_number) };
 }
 
 /** 合并收尾：片齐了才 complete，记账一律用 R2 合成后的真实大小 */
@@ -218,9 +237,8 @@ export async function chunkComplete(
   c: Context<{ Bindings: Env }>,
   env: Env,
 ): Promise<{ code: string; filename: string; size: number }> {
-  const { uploadId } = requireTask(c);
-  const task = await getChunkTask(env.DB, uploadId);
-  if (!task) throw { status: 404 as const, message: '上传会话不存在或已结束' };
+  const task = await resolveTask(c, env);
+  const uploadId = task.upload_id;
 
   const parts = await listChunkParts(env.DB, uploadId);
   const have = new Set(parts.map((p) => p.part_number));
@@ -263,12 +281,10 @@ export async function chunkComplete(
   return { code: task.code, filename: task.filename, size };
 }
 
-/** 客户端主动放弃：清会话、释放取件码 */
+/** 客户端主动放弃：清会话、释放取件码。已经结束的会话重复放弃也返回成功（页面卸载会兜底再发一次） */
 export async function chunkAbort(c: Context<{ Bindings: Env }>, env: Env): Promise<{ ok: true }> {
-  const { uploadId } = requireTask(c);
-  const task = await getChunkTask(env.DB, uploadId);
-  if (!task) return { ok: true };
-  await forceAbort(env, task);
+  const task = await getChunkTaskBySession(env.DB, sessionIdOf(c));
+  if (task) await forceAbort(env, task);
   return { ok: true };
 }
 

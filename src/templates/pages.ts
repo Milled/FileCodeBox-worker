@@ -1,4 +1,5 @@
 import type { ChunkTask, FileRecord } from '../types';
+import { CHUNK_THRESHOLD } from '../chunk';
 import { formatFileSize, escapeHtml } from '../utils';
 import { FALLBACK_MAX_FILE_SIZE } from '../shared';
 import { layout } from './layout';
@@ -562,11 +563,11 @@ function homeScript(): string {
     }
 
     // ---- 分片上传（大文件） ----
-    // 单次请求体受套餐上限约束（Free/Pro 100MB），超过就必须在浏览器里切开：
-    // 每片是一个独立 PUT（带 Content-Length 的 Blob），服务端把它们直接流进
-    // 同一个 R2 multipart 会话，complete 时由 R2 合成一个对象 —— 仍然只有一个取件码。
-    var CHUNK_PART = 8 * 1024 * 1024;
-    var CHUNK_AT = 64 * 1024 * 1024;
+    // 单次请求除了受套餐的体积上限约束，还受时间约束：慢上行下一个大 PUT 会在半途被掐断，
+    // 而且没有重试粒度。所以超过阈值的文件一律切开，每片是独立 PUT（带 Content-Length 的
+    // Blob），服务端把它们直接流进同一个 R2 multipart 会话，complete 时由 R2 合成一个对象
+    // —— 仍然只有一个取件码。阈值与片大小都取自服务端常量（src/chunk.ts），两端不各写一个数字
+    var CHUNK_AT = ${CHUNK_THRESHOLD};
 
     function fetchJson(url, init) {
       return fetch(url, init).then(function (r) {
@@ -585,7 +586,7 @@ function homeScript(): string {
       var blob = file.slice(start, Math.min(start + s.part_size, file.size));
       return new Promise(function (resolve, reject) {
         var xhr = new XMLHttpRequest();
-        xhr.open('PUT', '/api/upload/chunk/' + encodeURIComponent(s.upload_id) + '/' + n);
+        xhr.open('PUT', '/api/upload/chunk/' + s.session + '/' + n);
         xhr.upload.onprogress = function (e) { if (e.lengthComputable) onLoaded(n, e.loaded); };
         xhr.onload = function () {
           if (xhr.status >= 200 && xhr.status < 300) { onLoaded(n, blob.size); resolve(); return; }
@@ -643,7 +644,7 @@ function homeScript(): string {
     var liveChunks = {};
     function abortLiveChunks() {
       Object.keys(liveChunks).forEach(function (id) {
-        fetch('/api/upload/chunk/abort/' + encodeURIComponent(id), { method: 'POST', keepalive: true }).catch(function () {});
+        fetch('/api/upload/chunk/abort/' + id, { method: 'POST', keepalive: true }).catch(function () {});
       });
     }
     window.addEventListener('pagehide', abortLiveChunks);
@@ -654,7 +655,7 @@ function homeScript(): string {
         var i = kv.indexOf('=');
         if (i > 0) p[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
       });
-      var session = { upload_id: '' };
+      var handle = '';
       return fetchJson('/api/upload/chunk/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -668,12 +669,12 @@ function homeScript(): string {
           max_downloads: p.max_downloads,
         }),
       }).then(function (s) {
-        session = s;
-        liveChunks[s.upload_id] = true;
+        handle = s.session;
+        liveChunks[handle] = true;
         var indexes = [];
         for (var n = 1; n <= s.total_parts; n++) indexes.push(n);
         // 先问服务端已经收到哪些片，重试时不白传
-        return fetchJson('/api/upload/chunk/status/' + encodeURIComponent(s.upload_id), {})
+        return fetchJson('/api/upload/chunk/status/' + handle, {})
           .catch(function () { return { done: [] }; })
           .then(function (st) {
             var got = {};
@@ -684,18 +685,18 @@ function homeScript(): string {
             return runPartPool(s, todo, file, base, onProgress);
           })
           .then(function () {
-            return fetchJson('/api/upload/chunk/complete/' + encodeURIComponent(s.upload_id), { method: 'POST' })
+            return fetchJson('/api/upload/chunk/complete/' + handle, { method: 'POST' })
               .then(function (r) {
-                delete liveChunks[s.upload_id];
+                delete liveChunks[handle];
                 return r;
               });
           });
       }).catch(function (e) {
         // 传败了要自己 abort：未完成的分片不是对象，R2 面板看不见、后台「清理过期文件」也
         // 扫不到，留着就一直占存储。abort 失败也要把原错误抛出去，别盖掉真正的失败原因
-        if (!session.upload_id) throw e;
-        delete liveChunks[session.upload_id];
-        return fetchJson('/api/upload/chunk/abort/' + encodeURIComponent(session.upload_id), { method: 'POST' })
+        if (!handle) throw e;
+        delete liveChunks[handle];
+        return fetchJson('/api/upload/chunk/abort/' + handle, { method: 'POST' })
           .catch(function () {})
           .then(function () { throw e; });
       });
@@ -1225,7 +1226,8 @@ export function adminPanel(
         <span class="fmeta">${formatFileSize(s.size)}</span>
         <span class="fmeta">${s.parts_done}/${s.total_parts} 片</span>
         <span class="fmeta">挂起 ${held}</span>
-        <form method="post" action="/admin/chunk/abort/${encodeURIComponent(s.upload_id)}" style="display:inline;margin-left:6px" onsubmit="return confirm('\u786e\u8ba4\u653e\u5f03\u8fd9\u4e2a\u5206\u7247\u4f1a\u8bdd\uff1f\u5df2\u4e0a\u4f20\u7684\u5206\u7247\u4f1a\u88ab\u5220\u9664')">
+        <form method="post" action="/admin/chunk/abort" style="display:inline;margin-left:6px" onsubmit="return confirm('\u786e\u8ba4\u653e\u5f03\u8fd9\u4e2a\u5206\u7247\u4f1a\u8bdd\uff1f\u5df2\u4e0a\u4f20\u7684\u5206\u7247\u4f1a\u88ab\u5220\u9664')">
+          <input type="hidden" name="upload_id" value="${escapeHtml(s.upload_id)}">
           <button type="submit" class="btn-danger" style="background:none;border:none;cursor:pointer">放弃</button>
         </form>
       </div>`;
@@ -1359,7 +1361,7 @@ export function adminSettingsPage(config: AdminConfig, saved?: string): string {
           <div class="setting-title">单文件大小上限（MB）</div>
           <div class="setting-desc">
             <div>单位 MB（可填小数，如 0.5）。生效优先级：此处填写值 &gt; wrangler 变量 ${mb(config.varsMaxFileSize)} MB &gt; 内置兜底 100 MB；清空保存即回退到变量值。</div>
-            <div>超过 64 MiB 的文件会自动走分片上传（每片 8 MiB，由 R2 合并成一个对象，仍然只有一个取件码），所以这里填多大都能传 —— 不受 Cloudflare 单次请求体上限（Free/Pro 100 MB、Business 200 MB）约束。分片仍受「R2 总占用上限」以及单次会话 1000 片（约 8 GiB）的限制。</div>
+            <div>超过 ${Math.round(CHUNK_THRESHOLD / 1048576)} MiB 的文件会自动走分片上传（每片 8 MiB，由 R2 合并成一个对象，仍然只有一个取件码），所以这里填多大都能传 —— 既不受 Cloudflare 单次请求体上限（Free/Pro 100 MB、Business 200 MB）约束，也不会因为上行慢、单个请求拖太久而被边缘掐断。分片仍受「R2 总占用上限」以及单次会话 1000 片（约 8 GiB）的限制。</div>
           </div>
         </div>
         <input type="number" name="maxFileSizeMb" class="input setting-control" min="0.1" max="5120" step="0.1" value="${toMb(config.maxFileSize)}" placeholder="${toMb(config.varsMaxFileSize)}">

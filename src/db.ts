@@ -25,6 +25,7 @@ export async function initDB(db: D1Database): Promise<void> {
     // 是因为前端会并发上传同一次会话的多片，JSON 的读改写会互相覆盖丢 etag
     `CREATE TABLE IF NOT EXISTS fc_chunk_uploads (
       upload_id TEXT PRIMARY KEY,
+      session_id TEXT,
       code TEXT UNIQUE NOT NULL,
       filename TEXT NOT NULL,
       size INTEGER NOT NULL DEFAULT 0,
@@ -47,6 +48,7 @@ export async function initDB(db: D1Database): Promise<void> {
   const migrations = [
     'ALTER TABLE fc_files ADD COLUMN is_text INTEGER DEFAULT 0',
     'ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0',
+    ADD_SESSION_COLUMN,
   ];
   for (const s of stmts) {
     try { await db.prepare(s).run(); } catch { /* ignore */ }
@@ -243,14 +245,37 @@ export async function markThumb(db: D1Database, code: string): Promise<void> {
 
 // ---- 分片上传会话 ----
 
+/**
+ * session_id 是后加的一列。已部署的库里可能还没有它 —— initDB 只由 Cron 触发，
+ * 最长要等 30 分钟才补列，期间第一次分片 init 必须自己补上，否则整个分片通道都是 500
+ */
+const ADD_SESSION_COLUMN = 'ALTER TABLE fc_chunk_uploads ADD COLUMN session_id TEXT';
+
 export async function insertChunkTask(db: D1Database, t: ChunkTask): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO fc_chunk_uploads(upload_id, code, filename, size, part_size, total_parts, mime_type, expire_at, max_downloads, created_at, ip)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(t.upload_id, t.code, t.filename, t.size, t.part_size, t.total_parts, t.mime_type, t.expire_at, t.max_downloads, t.created_at, t.ip)
-    .run();
+  const stmt = () =>
+    db
+      .prepare(
+        `INSERT INTO fc_chunk_uploads(upload_id, session_id, code, filename, size, part_size, total_parts, mime_type, expire_at, max_downloads, created_at, ip)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        t.upload_id, t.session_id, t.code, t.filename, t.size, t.part_size, t.total_parts,
+        t.mime_type, t.expire_at, t.max_downloads, t.created_at, t.ip,
+      );
+  try {
+    await stmt().run();
+  } catch (e: any) {
+    // 只补「列不存在」这一种失败，其余原样抛出，别让取件码冲突被掩盖成建列错误。
+    // SQLite 对 INSERT 的说法是 "table X has no column named Y"，对 WHERE 才是 "no such column"
+    if (!/has no column named|no such column/i.test(String(e?.message ?? e))) throw e;
+    await db.prepare(ADD_SESSION_COLUMN).run();
+    await stmt().run();
+  }
+}
+
+/** 按客户端句柄取会话。句柄是服务端自生成的 32 位十六进制，不含 R2 的原始 uploadId */
+export async function getChunkTaskBySession(db: D1Database, sessionId: string): Promise<ChunkTask | null> {
+  return db.prepare('SELECT * FROM fc_chunk_uploads WHERE session_id = ?').bind(sessionId).first<ChunkTask>();
 }
 
 export async function getChunkTask(db: D1Database, uploadId: string): Promise<ChunkTask | null> {

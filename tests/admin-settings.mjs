@@ -127,7 +127,7 @@ export async function adminSettingsSuite(browser) {
     s.ok('上限 200MB 正常回显且说明分片',
       (await page.inputValue('input[name="maxFileSizeMb"]')) === '200'
         && /分片上传/.test(capDesc) && /8 MiB/.test(capDesc),
-      capDesc.replace(/\s+/g, ' ').match(/超过 64 MiB[^。]*。/)?.[0]?.slice(0, 46) || '未找到');
+      capDesc.replace(/\s+/g, ' ').match(/超过 16 MiB[^。]*。/)?.[0]?.slice(0, 46) || '未找到');
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
     await page.fill('input[name="maxFileSizeMb"]', '');
     await save();

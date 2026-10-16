@@ -18,6 +18,12 @@ export interface FileRecord {
 /** 分片上传会话（fc_chunk_uploads 一行） */
 export interface ChunkTask {
   upload_id: string;
+  /**
+   * 客户端句柄：服务端生成的 32 位十六进制，只用它出现在 URL 里。
+   * R2 的 uploadId 是 base64 家族的任意串，字符集与长度都不归我们管 ——
+   * 放进路径迟早被某一环改写成一个查不到的键（分片全 422、进度永远 0/N）
+   */
+  session_id: string;
   /** 预分配的取件码，会话建好时就占用，避免传完才发现码被抢 */
   code: string;
   filename: string;

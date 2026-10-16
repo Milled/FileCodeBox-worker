@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS fc_used_codes (
 -- JSON 的读改写会互相覆盖丢 etag（丢了就没法 complete）。
 CREATE TABLE IF NOT EXISTS fc_chunk_uploads (
   upload_id TEXT PRIMARY KEY,
+  session_id TEXT,
   code TEXT UNIQUE NOT NULL,
   filename TEXT NOT NULL,
   size INTEGER NOT NULL DEFAULT 0,

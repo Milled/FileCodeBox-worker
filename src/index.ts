@@ -189,7 +189,7 @@ app.post('/api/upload/chunk/init', async (c) => {
   }
 });
 
-app.put('/api/upload/chunk/:upload_id/:part', async (c) => {
+app.put('/api/upload/chunk/:session/:part', async (c) => {
   try {
     return c.json(await chunkPut(c, c.env));
   } catch (e: any) {
@@ -197,7 +197,7 @@ app.put('/api/upload/chunk/:upload_id/:part', async (c) => {
   }
 });
 
-app.get('/api/upload/chunk/status/:upload_id', async (c) => {
+app.get('/api/upload/chunk/status/:session', async (c) => {
   try {
     return c.json(await chunkStatus(c, c.env));
   } catch (e: any) {
@@ -205,7 +205,7 @@ app.get('/api/upload/chunk/status/:upload_id', async (c) => {
   }
 });
 
-app.post('/api/upload/chunk/complete/:upload_id', async (c) => {
+app.post('/api/upload/chunk/complete/:session', async (c) => {
   try {
     return c.json(await chunkComplete(c, c.env));
   } catch (e: any) {
@@ -213,7 +213,7 @@ app.post('/api/upload/chunk/complete/:upload_id', async (c) => {
   }
 });
 
-app.post('/api/upload/chunk/abort/:upload_id', async (c) => {
+app.post('/api/upload/chunk/abort/:session', async (c) => {
   try {
     return c.json(await chunkAbort(c, c.env));
   } catch (e: any) {
@@ -438,11 +438,16 @@ app.post('/admin/delete/:id', async (c) => {
   return c.redirect('/admin');
 });
 
-/** 未完成的 multipart 不是对象，R2 面板和孤儿扫描都清不掉，只能由管理员立刻 abort */
-app.post('/admin/chunk/abort/:upload_id', async (c) => {
+/**
+ * 未完成的 multipart 不是对象，R2 面板和孤儿扫描都清不掉，只能由管理员立刻 abort。
+ * upload_id 走表单而不是路径：它是 R2 给的原始字符串，字符集不归我们管，
+ * 放进 URL 迟早被某一环改写成一个查不到的键
+ */
+app.post('/admin/chunk/abort', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
-  await abortChunkSession(env, c.req.param('upload_id') ?? '');
+  const body = await c.req.parseBody();
+  await abortChunkSession(env, typeof body['upload_id'] === 'string' ? body['upload_id'] : '');
   return c.redirect('/admin');
 });
 
