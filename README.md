@@ -166,8 +166,9 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 | GET | `/api/codes/:count` | 为多文件批次取一段未被占用的连号码（2–20） |
 | GET / POST | `/api/thumb/:code` | 读取 / 写入图片缩略图 |
 | GET | `/qrcode/:code` | 取件链接二维码（GIF） |
-| GET | `/admin` · `/admin/settings` | 后台面板与设置页 |
-| POST | `/admin/login` · `/admin/settings` · `/admin/delete/:id` · `/admin/cleanup` | 登录 / 保存设置 / 删除 / 手动清理 |
+| GET | `/admin` · `/admin/settings` | 后台面板（含进行中的分片会话列表）与设置页 |
+| POST | `/admin/login` · `/admin/delete/:id` · `/admin/cleanup` | 登录 / 删除 / 手动清理（含放弃超时未完成的分片） |
+| POST | `/admin/chunk/abort/:upload_id` · `/admin/chunk/abort-all` | 立刻放弃单个 / 全部未完成的分片会话 |
 
 > 未匹配的 `/api/*` 返回 404 JSON，其余任意路径兜底渲染首页。登录有两个入口：`/admin/login` 是浏览器表单（重定向），`/api/admin/login` 是 JSON（返回 token）。
 
@@ -177,7 +178,11 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 
 **发件** — 拖入文件或粘贴 → 需要时展开「额外发件设置」调整有效期 / 最大下载次数 / 自定义取件码 → 点「发件并获取取件码」。多个文件会各自拿到一段连号的码，此时自定义取件码输入框不可用（一个码只能对应一个文件）。
 
-**大文件** — 超过 64 MiB 的文件会自动切成 8 MiB 的分片并发上传（3 路），单片失败只重传那一片，不必整个文件重来。分片由 R2 在存储侧合并成一个对象，所以取件码、后台记录、下载次数、过期清理都与普通文件完全一致。两点要留意：半途放弃的会话会在 6 小时后被定时任务清掉（已上传但未合并的分片是会计费的，所以必须清）；单次会话最多 1000 片，即约 8 GiB。
+**大文件** — 超过 64 MiB 的文件会自动切成 8 MiB 的分片并发上传（3 路），单片失败只重传那一片，不必整个文件重来。分片由 R2 在存储侧合并成一个对象，所以取件码、后台记录、下载次数、过期清理都与普通文件完全一致。单次会话最多 1000 片（约 8 GiB）。
+
+**没传完的分片怎么清** — 未合并的 multipart 会话**不是一个对象**：R2 面板里看不到它，删文件、删对象都够不着，只有 `abort` 能释放，而它已经在按存储计费。本项目有三条清理路径：浏览器在传失败或页面被关掉时自己 abort；每 30 分钟的定时任务放弃超过 6 小时未完成的会话（「清理过期文件」按钮也会顺带做一次）；`/admin` 顶部会列出所有进行中的分片会话（文件名、声明大小、已传片数、挂起时长），可以逐条「放弃」或一次「全部放弃」。
+
+万一某次崩溃让会话连 D1 记录都没留下（Workers API 无法列举 multipart，应用就再也看不见它），只能用 R2 的 S3 兼容接口手动清理：`aws s3api list-multipart-uploads --bucket <桶名>` 找到 `Key` 与 `UploadId`，再 `aws s3api abort-multipart-upload --bucket <桶名> --key <Key> --upload-id <UploadId>`。endpoint 是 `https://<AccountID>.r2.cloudflarestorage.com`，凭证在 R2 → Manage R2 API Tokens 里创建，需要 Object Read & Write 权限。
 
 **取件** — 首页顶部输入 4 位码，填满即自动取件。文本在线看，文件点「下载文件」。
 
@@ -194,7 +199,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 
 限制值的生效优先级：**后台设置 > `wrangler.jsonc` 的 `vars` > 内置兜底（25 MB / 7 天）**；非法或非正整数的值会被忽略并落到下一级。首页会显示当前生效的上限，超限文件在列表里就被标红拦下。
 
-单文件上限另有一条软件管不住的自然边界：Cloudflare 的**单次请求体上限**按账号套餐为 100 MB（Free / Pro）、200 MB（Business）、5 GB（Enterprise）。本项目当前未启用分片上传，所以超过该值的文件会在平台层被直接掐断，拿不到软件自己的「文件过大」提示 —— 设置页在填值超过 100 MB 时会给出这条警示。
+单文件上限还有一条软件管不住的平台边界：Cloudflare 的**单次请求体上限**按账号套餐为 100 MB（Free / Pro）、200 MB（Business）、5 GB（Enterprise）。本项目对超过 64 MiB 的文件走分片通道，每片只有 8 MiB，因此不受这条上限约束，上限可以按需要设得更大；小于 64 MiB 的文件仍是单次请求上传，理论上会被套餐上限掐断，但那个值远高于 64 MiB，正常配置碰不到。
 
 ### 存储配额怎么算
 
@@ -234,7 +239,7 @@ npm run dev           # http://localhost:8787
 ```bash
 npm run typecheck     # tsc --noEmit
 npm test              # 主流程冒烟（Playwright 无头）
-npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片，共 143 项断言
+npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片，共 147 项断言
 ```
 
 用例假设本地服务已启动且表已建好：

@@ -394,6 +394,20 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
 }
 .expired { opacity: 0.4; }
 
+/* ---- 后台：进行中的分片上传（未 abort 的分片不在 R2 对象列表里） ---- */
+.chunk-sessions { margin-bottom: 16px; }
+.chunk-sessions .cs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.chunk-sessions form { margin: 0; }
+.chunk-sessions .setting-desc { margin-bottom: 8px; }
+
 /* ---- footer ---- */
 .footer {
   text-align: center;

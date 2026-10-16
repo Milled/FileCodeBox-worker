@@ -17,6 +17,8 @@ export async function chunkedSuite(browser) {
   const page = await admin.newPage();
   const problems = [];
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
+  // 后台的放弃/删除都是 confirm 表单，不接住对话框 Playwright 会自动取消
+  page.on('dialog', (d) => d.accept().catch(() => {}));
 
   // JSON 请求可以直接发；二进制 body 必须在页面里构造（evaluate 的参数会被序列化掉）
   const call = (path, init) => page.evaluate(async ([p, i]) => {
@@ -42,6 +44,10 @@ export async function chunkedSuite(browser) {
     await rateLimitBreather();
     await page.fill('input[name="password"]', ADMIN_PASSWORD);
     await Promise.all([page.waitForNavigation(), page.click('button[type="submit"]')]);
+
+    // 崩溃的历史跑测会留下未完成会话（cron 要 6 小时才清），它们的声明大小一直占着
+    // 配额预检，会让本套件的断言从「因为这个会话才超」变成「本来就已超」。开局先全放弃
+    await call('/admin/chunk/abort-all', { method: 'POST' });
 
     // 上限要高于 70 MiB，否则分片通道自己就会被拦（默认 100MB 已够，这里显式确认）
     const cap = await apiJson(page, '/api/admin/config/get');
@@ -129,9 +135,7 @@ export async function chunkedSuite(browser) {
       miss.status === 422 && /缺少分片/.test(miss.json?.error || ''), miss.json?.error);
 
     // 配额取「当前已用 + 8MB」：单独已用不超过，但加上那个未完成的 70MiB 会话就一定超。
-    // 不能写死数字 —— 本地桶会随反复跑测累积，写死会让拒绝原因变成"本来就已超"。
-    // 前提是库里没有别的未完成会话：崩溃的跑测会留下会话（cron 6 小时才清），
-    // 那些 pending 会让 abort 之后的重试仍然 507，表现为本条断言失败
+    // 不能写死数字 —— 本地桶会随反复跑测累积，写死会让拒绝原因变成"本来就已超"
     const used = Number((await apiJson(page, '/api/admin/config/get')).json?.detail?.storageUsed || '0');
     const quotaMb = Math.ceil(used / 1048576) + 8;
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
@@ -149,6 +153,42 @@ export async function chunkedSuite(browser) {
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
     await page.fill('input[name="maxTotalStorageMb"]', '');
     await Promise.all([page.waitForNavigation(), page.click('form[action="/admin/settings"] button[type="submit"]')]);
+
+    // ---- 后台必须能立刻放弃未完成的分片 ----
+    // multipart 会话不是一个对象：不在 bucket.list() 里，R2 面板删不掉、bucket.delete 无效，
+    // 「清理过期文件」的孤儿扫描同样看不见，只有 abort 能释放它的存储
+    const mkOrphan = (name) => call('/api/upload/chunk/init', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: name, size: BIG, expire_value: '1' }),
+    }).then((r) => r.json?.upload_id || '');
+    const orphanA = await mkOrphan('orphan-a.bin');
+    await putPart(`/api/upload/chunk/${orphanA}/1`, PART, 1);
+    const orphanB = await mkOrphan('orphan-b.bin');
+
+    await page.goto(`${BASE}/admin`, { waitUntil: 'networkidle' });
+    const blockText = ((await page.locator('.chunk-sessions').textContent()) || '').replace(/\s+/g, ' ');
+    s.ok('后台列出进行中的分片会话及其片数',
+      /进行中的分片上传 2 个/.test(blockText) && /1\/9 片/.test(blockText) && /0\/9 片/.test(blockText),
+      blockText.slice(0, 150));
+
+    await Promise.all([
+      page.waitForNavigation(),
+      page.locator('.chunk-sessions .file-list-item', { hasText: 'orphan-a.bin' })
+        .locator('button[type="submit"]').click(),
+    ]);
+    const aGone = await call(`/api/upload/chunk/status/${orphanA}`, {});
+    const rowText = ((await page.locator('.chunk-sessions').textContent()) || '').replace(/\s+/g, ' ');
+    s.ok('单条「放弃」立即 abort 并从列表消失',
+      aGone.status === 404 && !/orphan-a\.bin/.test(rowText) && /orphan-b\.bin/.test(rowText),
+      `${aGone.status} ${rowText.slice(0, 90)}`);
+
+    await Promise.all([
+      page.waitForNavigation(),
+      page.click('.chunk-sessions .cs-head button[type="submit"]'),
+    ]);
+    const bGone = await call(`/api/upload/chunk/status/${orphanB}`, {});
+    s.ok('「全部放弃」清空所有会话（0 片的也清）',
+      bGone.status === 404 && (await page.locator('.chunk-sessions').count()) === 0, String(bGone.status));
 
     // ---- 前端会自动选对通道 ----
     const ui = await newPage(browser, { tag: 'chunk-ui' });
@@ -194,6 +234,32 @@ export async function chunkedSuite(browser) {
     await dropImage(ui, { name: 'ui-small.png', width: 300, height: 200 });
     await Promise.all([ui.waitForNavigation({ url: /\/r\/\d{4}/, timeout: 60000 }), ui.click('#submitBtn')]);
     s.ok('小文件仍走单请求，不多付往返', chunkUrls.length === 0, `${chunkUrls.length}`);
+
+    // ---- 分片传败了，前端必须自己 abort ----
+    // 用户报的「三个删不掉的部分文件」就是这么攒出来的：传一半断掉，会话既不在文件列表
+    // 也不在 R2 面板里，不清就会一直占存储直到 6 小时超时
+    const failUrls = [];
+    const onFailReq = (r) => { if (r.url().includes('/api/upload/chunk/')) failUrls.push(r.url()); };
+    ui.on('request', onFailReq);
+    await ui.route('**/api/upload/chunk/**', (route) => {
+      if (route.request().method() !== 'PUT') return route.continue();
+      return route.fulfill({ status: 400, contentType: 'application/json', body: '{"error":"模拟断线"}' });
+    });
+    await ui.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+    await ui.evaluate(async () => {
+      const big = new Uint8Array(70 * 1024 * 1024);
+      const dt = new DataTransfer();
+      dt.items.add(new File([big], 'chunk-fail.bin', { type: 'application/octet-stream' }));
+      document.getElementById('dropZone').dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    });
+    await ui.click('#submitBtn');
+    await ui.waitForFunction(() => document.getElementById('uploadStatus')?.textContent.includes('失败'), { timeout: 60000 });
+    await ui.unroute('**/api/upload/chunk/**');
+    ui.off('request', onFailReq);
+    await page.goto(`${BASE}/admin`, { waitUntil: 'networkidle' });
+    s.ok('分片失败后前端自动 abort，不留下清不掉的会话',
+      failUrls.some((u) => /\/abort\//.test(u)) && (await page.locator('.chunk-sessions').count()) === 0,
+      `分片请求 ${failUrls.length} 个，其中 abort ${failUrls.filter((u) => /\/abort\//.test(u)).length} 个`);
     await ui.close();
 
     // 收尾把 UI 造出来的 70MiB 删掉，否则每跑一次本地桶就多 70MiB

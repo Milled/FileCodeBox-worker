@@ -28,6 +28,7 @@ import {
   insertChunkTask,
   insertFile,
   listChunkParts,
+  listChunkTasks,
   listStaleChunkTasks,
   releaseCode,
   saveChunkPart,
@@ -121,6 +122,9 @@ export async function chunkInit(
     };
     await insertChunkTask(env.DB, task);
   } catch (e) {
+    // 建了会话但没落成 D1 行，必须就地 abort：Workers API 列举不到 multipart 会话，
+    // 没有记录的会话谁都清不掉，只能等它一直计费（R2 面板既看不见也删不掉）
+    if (uploadId) await env.FILE_STORE.resumeMultipartUpload(key, uploadId).abort().catch(() => {});
     // 会话没建成就把码还回去，否则一次失败的 init 会白占一个码
     await releaseCode(env.DB, code).catch(() => {});
     throw e;
@@ -277,8 +281,9 @@ export async function chunkAbort(c: Context<{ Bindings: Env }>, env: Env): Promi
 async function forceAbort(env: Env, task: ChunkTask): Promise<void> {
   try {
     await env.FILE_STORE.resumeMultipartUpload(`file:${task.code}`, task.upload_id).abort();
-  } catch {
-    /* 会话可能已完成或本就不存在 */
+  } catch (e: any) {
+    // 会话可能已完成或本就不存在；但行一删就再没有 API 能列出它，所以失败必须留痕
+    console.error(`分片 abort 失败 code=${task.code} size=${task.size}: ${e?.message || e}`);
   }
   await deleteChunkTask(env.DB, task.upload_id);
   if (!(await hasFileRecord(env.DB, task.code))) {
@@ -293,4 +298,25 @@ export async function cleanupStaleChunkUploads(env: Env): Promise<number> {
     await forceAbort(env, task);
   }
   return stale.length;
+}
+
+/**
+ * 后台手动放弃单个会话。
+ * 未完成的 multipart 不是对象 —— R2 面板删不掉、bucket.delete 也无效，只能走 abort，
+ * 所以必须给管理员一个立刻执行的入口，而不是让他等 6 小时超时。
+ */
+export async function abortChunkSession(env: Env, uploadId: string): Promise<boolean> {
+  const task = await getChunkTask(env.DB, uploadId);
+  if (!task) return false;
+  await forceAbort(env, task);
+  return true;
+}
+
+/** 后台「放弃全部进行中会话」 */
+export async function abortAllChunkSessions(env: Env): Promise<number> {
+  const tasks = await listChunkTasks(env.DB);
+  for (const task of tasks) {
+    await forceAbort(env, task);
+  }
+  return tasks.length;
 }

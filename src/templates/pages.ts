@@ -1,4 +1,4 @@
-import type { FileRecord } from '../types';
+import type { ChunkTask, FileRecord } from '../types';
 import { formatFileSize, escapeHtml } from '../utils';
 import { FALLBACK_MAX_FILE_SIZE } from '../shared';
 import { layout } from './layout';
@@ -607,6 +607,7 @@ function homeScript(): string {
       var queue = todo.slice();
       var live = {};
       var finished = 0;
+      var bail = null;
       function report() {
         var bytes = base;
         for (var k in live) bytes += live[k];
@@ -619,19 +620,33 @@ function homeScript(): string {
         report();
       }
       function worker() {
-        if (!queue.length) return Promise.resolve();
+        // 一片彻底失败后不再取新片：继续传只是白耗上行带宽，而各泳道各自 reject 会让
+        // Promise.all 之外的错误变成未捕获异常（控制台一片红，用户看不出到底哪片坏了）
+        if (bail || !queue.length) return Promise.resolve();
         var n = queue.shift();
         return putPart(s, file, n, 0, onLoaded).then(function () {
           finished += 1;
           return worker();
+        }, function (e) {
+          if (!bail) bail = e;
         });
       }
       report();  // 先出一次「分片 0/N」，让界面立刻证明分片通道已经跑起来
       var workers = [];
       var lanes = Math.min(3, queue.length);
       for (var i = 0; i < lanes; i++) workers.push(worker());
-      return Promise.all(workers);
+      return Promise.all(workers).then(function () { if (bail) throw bail; });
     }
+
+    // 正在飞的会话，页面被关掉时用 keepalive 兜底 abort（那时 .catch 根本不会执行，
+    // 而挂着不管的分片会一直占存储直到 6 小时超时）
+    var liveChunks = {};
+    function abortLiveChunks() {
+      Object.keys(liveChunks).forEach(function (id) {
+        fetch('/api/upload/chunk/abort/' + encodeURIComponent(id), { method: 'POST', keepalive: true }).catch(function () {});
+      });
+    }
+    window.addEventListener('pagehide', abortLiveChunks);
 
     function chunkUpload(file, query, code, onProgress) {
       var p = {};
@@ -639,6 +654,7 @@ function homeScript(): string {
         var i = kv.indexOf('=');
         if (i > 0) p[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
       });
+      var session = { upload_id: '' };
       return fetchJson('/api/upload/chunk/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -652,6 +668,8 @@ function homeScript(): string {
           max_downloads: p.max_downloads,
         }),
       }).then(function (s) {
+        session = s;
+        liveChunks[s.upload_id] = true;
         var indexes = [];
         for (var n = 1; n <= s.total_parts; n++) indexes.push(n);
         // 先问服务端已经收到哪些片，重试时不白传
@@ -666,8 +684,20 @@ function homeScript(): string {
             return runPartPool(s, todo, file, base, onProgress);
           })
           .then(function () {
-            return fetchJson('/api/upload/chunk/complete/' + encodeURIComponent(s.upload_id), { method: 'POST' });
+            return fetchJson('/api/upload/chunk/complete/' + encodeURIComponent(s.upload_id), { method: 'POST' })
+              .then(function (r) {
+                delete liveChunks[s.upload_id];
+                return r;
+              });
           });
+      }).catch(function (e) {
+        // 传败了要自己 abort：未完成的分片不是对象，R2 面板看不见、后台「清理过期文件」也
+        // 扫不到，留着就一直占存储。abort 失败也要把原错误抛出去，别盖掉真正的失败原因
+        if (!session.upload_id) throw e;
+        delete liveChunks[session.upload_id];
+        return fetchJson('/api/upload/chunk/abort/' + encodeURIComponent(session.upload_id), { method: 'POST' })
+          .catch(function () {})
+          .then(function () { throw e; });
       });
     }
 
@@ -1137,8 +1167,9 @@ export function adminPanel(
   error?: string,
   filters?: { keyword: string; dateFrom: string; dateTo: string; sort: string },
   stats?: AdminStats,
-  /** 配额视角的已用/上限（含缩略图，且与 R2 实测对账），与 enforcement 用的是同一个数 */
-  storage?: { used: number; limit: number },
+  /** 配额视角的已用/上限（含缩略图，且与 R2 实测对账），与 enforcement 用的是同一个数；
+   *  sessions 是进行中的分片上传，未 abort 的分片不在 list() 里，只能在这里清 */
+  storage?: { used: number; limit: number; sessions?: Array<ChunkTask & { parts_done: number }> },
 ): string {
   const totalPages = Math.ceil(total / 50);
   const pagination =
@@ -1180,6 +1211,39 @@ export function adminPanel(
   const sortOptions = Object.entries(SORT_LABELS)
     .map(([k, v]) => `<option value="${k}"${k === f.sort ? ' selected' : ''}>${v}</option>`)
     .join('');
+
+  // 未完成的分片会话：R2 的 multipart 不是对象，面板看不到、孤儿扫描 list() 也扫不到，
+  // 只有 abort 能释放，所以必须给管理员一个立刻放弃的入口，而不是干等超时
+  const sessions = storage?.sessions ?? [];
+  const sessionRows = sessions
+    .map((s) => {
+      const sec = Math.max(0, Math.floor((Date.now() - new Date(s.created_at).getTime()) / 1000));
+      const held = sec < 60 ? `${sec} 秒` : sec < 3600 ? `${Math.floor(sec / 60)} 分钟` : `${Math.floor(sec / 3600)} 小时`;
+      return `<div class="file-list-item">
+        <span class="tag">分片</span>
+        <span class="fname" title="取件码 ${escapeHtml(s.code)}">${escapeHtml(s.filename)}</span>
+        <span class="fmeta">${formatFileSize(s.size)}</span>
+        <span class="fmeta">${s.parts_done}/${s.total_parts} 片</span>
+        <span class="fmeta">挂起 ${held}</span>
+        <form method="post" action="/admin/chunk/abort/${encodeURIComponent(s.upload_id)}" style="display:inline;margin-left:6px" onsubmit="return confirm('\u786e\u8ba4\u653e\u5f03\u8fd9\u4e2a\u5206\u7247\u4f1a\u8bdd\uff1f\u5df2\u4e0a\u4f20\u7684\u5206\u7247\u4f1a\u88ab\u5220\u9664')">
+          <button type="submit" class="btn-danger" style="background:none;border:none;cursor:pointer">放弃</button>
+        </form>
+      </div>`;
+    })
+    .join('');
+
+  const sessionBlock = sessions.length
+    ? `<div class="chunk-sessions">
+      <div class="cs-head">
+        <span>进行中的分片上传 ${sessions.length} 个 · 已声明 ${formatFileSize(sessions.reduce((n, s) => n + s.size, 0))}</span>
+        <form method="post" action="/admin/chunk/abort-all" onsubmit="return confirm('\u786e\u8ba4\u653e\u5f03\u5168\u90e8\u5206\u7247\u4f1a\u8bdd\uff1f\u6b63\u5728\u4e0a\u4f20\u7684\u4f1a\u8bdd\u4f1a\u5931\u8d25')">
+          <button type="submit" class="btn btn-secondary btn-sm">全部放弃</button>
+        </form>
+      </div>
+      <div class="setting-desc">这些是还没传完的分片，不占文件列表也不出现在 R2 面板里，只有放弃（abort）才会释放其存储占用。若有人正在上传请勿误点。</div>
+      ${sessionRows}
+    </div>`
+    : '';
 
   const statCards = stats
     ? `
@@ -1229,10 +1293,11 @@ export function adminPanel(
     </form>
 
     <div style="margin-bottom:14px">
-      <form method="post" action="/admin/cleanup" style="display:inline" onsubmit="return confirm('\u786e\u8ba4\u6e05\u7406\u6240\u6709\u8fc7\u671f\u6587\u4ef6\uff1f')">
+      <form method="post" action="/admin/cleanup" style="display:inline" onsubmit="return confirm('\u786e\u8ba4\u6e05\u7406\u6240\u6709\u8fc7\u671f\u6587\u4ef6\uff1f')" title="同时放弃超过 6 小时未完成的分片上传">
         <button type="submit" class="btn btn-secondary btn-sm" style="text-decoration:none">清理过期文件</button>
       </form>
     </div>
+    ${sessionBlock}
     <div>${fileRows || '<div style="text-align:center;color:var(--color-ink-2);padding:20px">暂无文件</div>'}</div>
     ${pagination}
     <div style="text-align:center;margin-top:14px">

@@ -293,6 +293,17 @@ export async function getPendingChunkBytes(db: D1Database): Promise<number> {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
+/** 全部进行中的会话，后台列表用（管理员要能立刻放弃，不能只等超时） */
+export async function listChunkTasks(db: D1Database): Promise<Array<ChunkTask & { parts_done: number }>> {
+  const rows = await db
+    .prepare(
+      `SELECT u.*, (SELECT COUNT(*) FROM fc_chunk_parts p WHERE p.upload_id = u.upload_id) AS parts_done
+       FROM fc_chunk_uploads u ORDER BY datetime(u.created_at) DESC`,
+    )
+    .all<ChunkTask & { parts_done: number }>();
+  return rows.results ?? [];
+}
+
 /** 超时未完成的会话（供 cron abort，避免已传分片一直计费） */
 export async function listStaleChunkTasks(db: D1Database, olderThanMs: number): Promise<ChunkTask[]> {
   const cutoff = new Date(Date.now() - olderThanMs).toISOString();

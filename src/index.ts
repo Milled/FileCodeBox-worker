@@ -19,6 +19,7 @@ import {
   cleanupRateLimitEntries,
   incrementDownload,
   getDashboardStats,
+  listChunkTasks,
   getSetting,
   getStorageUsed,
   setSetting,
@@ -28,7 +29,7 @@ import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
 import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, allocateCodeRun, resolveLimits, FALLBACK_MAX_FILE_SIZE } from './shared';
 import { generateQRCodeGIF } from './qr';
-import { chunkInit, chunkPut, chunkStatus, chunkComplete, chunkAbort, cleanupStaleChunkUploads } from './chunk';
+import { chunkInit, chunkPut, chunkStatus, chunkComplete, chunkAbort, abortChunkSession, abortAllChunkSessions, cleanupStaleChunkUploads } from './chunk';
 import { STYLE } from './templates/style';
 import type { HomeOptions } from './templates/pages';
 import type { AdminConfig } from './templates/pages';
@@ -355,14 +356,15 @@ app.get('/admin', async (c) => {
   const dateTo = c.req.query('date_to') || '';
   const sort = c.req.query('sort') || 'newest';
 
-  const [{ files, total }, stats, limits, used] = await Promise.all([
+  const [{ files, total }, stats, limits, used, chunkTasks] = await Promise.all([
     listFilesAdvanced(env.DB, page, 50, keyword, dateFrom, dateTo, sort),
     getDashboardStats(env.DB),
     resolveLimits(env),
     getStorageUsed(env.DB),
+    listChunkTasks(env.DB),
   ]);
   return c.html(adminPanel(files, total, page, undefined, { keyword, dateFrom, dateTo, sort }, stats,
-    { used, limit: limits.maxTotalStorage }));
+    { used, limit: limits.maxTotalStorage, sessions: chunkTasks }));
 });
 
 // 后台设置页：写入 fc_settings 覆盖 wrangler vars（resolveLimits 中 DB 优先），保存即生效
@@ -436,11 +438,28 @@ app.post('/admin/delete/:id', async (c) => {
   return c.redirect('/admin');
 });
 
+/** 未完成的 multipart 不是对象，R2 面板和孤儿扫描都清不掉，只能由管理员立刻 abort */
+app.post('/admin/chunk/abort/:upload_id', async (c) => {
+  const env = c.env;
+  if (!(await adminAuth(c, env))) return c.redirect('/admin');
+  await abortChunkSession(env, c.req.param('upload_id') ?? '');
+  return c.redirect('/admin');
+});
+
+app.post('/admin/chunk/abort-all', async (c) => {
+  const env = c.env;
+  if (!(await adminAuth(c, env))) return c.redirect('/admin');
+  await abortAllChunkSessions(env);
+  return c.redirect('/admin');
+});
+
 app.post('/admin/cleanup', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
 
   await cleanupExpired(env.DB, env.FILE_STORE);
+  // 也要扫超时未完成的分片会话：它们不是对象，孤儿扫描看不见
+  await cleanupStaleChunkUploads(env);
   // 与 Cron 同一条路径：顺带清孤儿对象并把 storage_used 对账成 R2 实测值。
   // 新部署或计数器漂移时，管理员点一次就能拿到准确数字，不必等半小时
   const { usedBytes, scanned } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
