@@ -561,6 +561,99 @@ function homeScript(): string {
       });
     }
 
+    // ---- 分片上传（大文件） ----
+    // 单次请求体受套餐上限约束（Free/Pro 100MB），超过就必须在浏览器里切开：
+    // 每片是一个独立 PUT（带 Content-Length 的 Blob），服务端把它们直接流进
+    // 同一个 R2 multipart 会话，complete 时由 R2 合成一个对象 —— 仍然只有一个取件码。
+    var CHUNK_PART = 8 * 1024 * 1024;
+    var CHUNK_AT = 64 * 1024 * 1024;
+
+    function fetchJson(url, init) {
+      return fetch(url, init).then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (j) {
+          if (r.ok && j) return j;
+          throw new Error((j && (j.error || j.msg)) || ('上传失败（HTTP ' + r.status + '）'));
+        });
+      });
+    }
+
+    function putPart(s, file, n, attempt, onProgress) {
+      var start = (n - 1) * s.part_size;
+      var blob = file.slice(start, Math.min(start + s.part_size, file.size));
+      return fetch('/api/upload/chunk/' + encodeURIComponent(s.upload_id) + '/' + n, { method: 'PUT', body: blob })
+        .then(function (r) {
+          if (r.ok) { onProgress(blob.size); return null; }
+          return r.json().catch(function () { return null; }).then(function (j) {
+            throw new Error((j && (j.error || j.msg)) || ('分片 ' + n + ' 上传失败（HTTP ' + r.status + '）'));
+          });
+        })
+        .catch(function (e) {
+          // 弱网下只重传这一片，不用整个文件重来
+          if (attempt < 2) return putPart(s, file, n, attempt + 1, onProgress);
+          throw e;
+        });
+    }
+
+    function runPartPool(s, todo, file, onProgress) {
+      var queue = todo.slice();
+      var workers = [];
+      var lanes = Math.min(3, queue.length);
+      function worker() {
+        if (!queue.length) return Promise.resolve();
+        return putPart(s, file, queue.shift(), 0, onProgress).then(worker);
+      }
+      for (var i = 0; i < lanes; i++) workers.push(worker());
+      return Promise.all(workers);
+    }
+
+    function chunkUpload(file, query, code, onProgress) {
+      var p = {};
+      query.split('&').forEach(function (kv) {
+        var i = kv.indexOf('=');
+        if (i > 0) p[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
+      });
+      return fetchJson('/api/upload/chunk/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          size: file.size,
+          content_type: file.type || 'application/octet-stream',
+          code: code || '',
+          expire_style: p.expire_style,
+          expire_value: p.expire_value,
+          max_downloads: p.max_downloads,
+        }),
+      }).then(function (s) {
+        var indexes = [];
+        for (var n = 1; n <= s.total_parts; n++) indexes.push(n);
+        // 先问服务端已经收到哪些片，重试时不白传
+        return fetchJson('/api/upload/chunk/status/' + encodeURIComponent(s.upload_id), {})
+          .catch(function () { return { done: [] }; })
+          .then(function (st) {
+            var got = {};
+            (st && st.done ? st.done : []).forEach(function (n) { got[n] = true; });
+            var todo = indexes.filter(function (n) { return !got[n]; });
+            // 外层进度要的是"当前文件已传字节数"，所以这里累加；
+            // 已完成的片也先计入，否则续传时进度条会从 0 开始
+            var sent = (s.total_parts - todo.length) * s.part_size;
+            onProgress(sent, file.size);
+            return runPartPool(s, todo, file, function (bytes) {
+              sent += bytes;
+              onProgress(sent, file.size);
+            });
+          })
+          .then(function () {
+            return fetchJson('/api/upload/chunk/complete/' + encodeURIComponent(s.upload_id), { method: 'POST' });
+          });
+      });
+    }
+
+    function sendOne(file, query, code, onProgress) {
+      if (file.size > CHUNK_AT) return chunkUpload(file, query, code, onProgress);
+      return uploadOne(file, query, code, onProgress);
+    }
+
     function handleUpload(e) {
       e.preventDefault();
       var btn = document.getElementById('submitBtn');
@@ -623,7 +716,7 @@ function homeScript(): string {
         var chain = Promise.resolve();
         jobs.forEach(function (file, idx) {
           chain = chain.then(function () {
-            return uploadOne(file, query, run[idx] || '', function (loaded, total) {
+            return sendOne(file, query, run[idx] || '', function (loaded, total) {
               onProgress(0, loaded);
               paint(done + loaded, '上传中 (' + (idx + 1) + '/' + jobs.length + ') ' + file.name);
             }).then(function (data) {
@@ -1149,8 +1242,6 @@ export function adminSettingsPage(config: AdminConfig, saved?: string): string {
   // 表单以 MB 为单位（字节数对人不直观），存进去仍是字节：
   // 服务端比较、兼容 API 与 fc_settings 的语义都不变
   const toMb = (bytes: number) => (bytes > 0 ? String(Math.round((bytes / 1048576) * 100) / 100) : '');
-  // Cloudflare 按账号套餐限制单次请求体大小，Free/Pro 是最窄的那档
-  const PLATFORM_BODY_LIMIT = 104857600;
   const content = `
     <div class="header">
       <div>
@@ -1179,9 +1270,8 @@ export function adminSettingsPage(config: AdminConfig, saved?: string): string {
         <div class="setting-text">
           <div class="setting-title">单文件大小上限（MB）</div>
           <div class="setting-desc">
-            <div>单位 MB（可填小数，如 0.5）。生效优先级：此处填写值 &gt; wrangler 变量 ${mb(config.varsMaxFileSize)} MB &gt; 内置兜底 25 MB；清空保存即回退到变量值。</div>
-            <div>另有一条本软件管不住的上限：Cloudflare 单次请求体最大 100 MB（Free / Pro 账号）、200 MB（Business）、5 GB（Enterprise），取决于账号套餐而不是 Workers 套餐。当前未启用分片上传，超过请求体上限的文件会在平台层被直接掐断。</div>
-            ${config.maxFileSize > PLATFORM_BODY_LIMIT ? '<div class="setting-warn">当前设置已超过 100 MB：Free / Pro 账号下这类文件拿不到本软件的「文件过大」提示，而是被平台直接拒绝。请下调上限，或等分片上传启用后再调高。</div>' : ''}
+            <div>单位 MB（可填小数，如 0.5）。生效优先级：此处填写值 &gt; wrangler 变量 ${mb(config.varsMaxFileSize)} MB &gt; 内置兜底 100 MB；清空保存即回退到变量值。</div>
+            <div>超过 64 MiB 的文件会自动走分片上传（每片 8 MiB，由 R2 合并成一个对象，仍然只有一个取件码），所以这里填多大都能传 —— 不受 Cloudflare 单次请求体上限（Free/Pro 100 MB、Business 200 MB）约束。分片仍受「R2 总占用上限」以及单次会话 1000 片（约 8 GiB）的限制。</div>
           </div>
         </div>
         <input type="number" name="maxFileSizeMb" class="input setting-control" min="0.1" max="5120" step="0.1" value="${toMb(config.maxFileSize)}" placeholder="${toMb(config.varsMaxFileSize)}">

@@ -28,6 +28,7 @@ import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
 import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, allocateCodeRun, resolveLimits, FALLBACK_MAX_FILE_SIZE } from './shared';
 import { generateQRCodeGIF } from './qr';
+import { chunkInit, chunkPut, chunkStatus, chunkComplete, chunkAbort, cleanupStaleChunkUploads } from './chunk';
 import { STYLE } from './templates/style';
 import type { HomeOptions } from './templates/pages';
 import type { AdminConfig } from './templates/pages';
@@ -107,7 +108,7 @@ async function adminConfig(env: Env): Promise<AdminConfig> {
     defaultExpireDays: limits.defaultExpireDays,
     maxTotalStorage: limits.maxTotalStorage,
     storageUsed: used,
-    varsMaxFileSize: toInt(env.MAX_FILE_SIZE, 26214400),
+    varsMaxFileSize: toInt(env.MAX_FILE_SIZE, 104857600),
     varsDefaultExpireDays: toInt(env.DEFAULT_EXPIRE_DAYS, 7),
   };
 }
@@ -171,6 +172,51 @@ app.post('/api/upload', async (c) => {
   } catch (e: any) {
     const status = e?.status ?? 500;
     return c.json({ error: e?.message ?? '服务器内部错误' }, status);
+  }
+});
+
+// ===================== 分片上传（大文件） =====================
+// 单次请求体受套餐上限约束（Free/Pro 100MB），大文件只能拆成多个请求。
+// 每片直接流进同一个 R2 multipart 会话，complete 时由 R2 合成一个对象：
+// 一个文件仍然只有一个取件码，后台仍然只是一行记录。
+
+app.post('/api/upload/chunk/init', async (c) => {
+  try {
+    return c.json(await chunkInit(c, c.env));
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? '初始化失败' }, e?.status ?? 500);
+  }
+});
+
+app.put('/api/upload/chunk/:upload_id/:part', async (c) => {
+  try {
+    return c.json(await chunkPut(c, c.env));
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? '分片保存失败' }, e?.status ?? 500);
+  }
+});
+
+app.get('/api/upload/chunk/status/:upload_id', async (c) => {
+  try {
+    return c.json(await chunkStatus(c, c.env));
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? '查询失败' }, e?.status ?? 500);
+  }
+});
+
+app.post('/api/upload/chunk/complete/:upload_id', async (c) => {
+  try {
+    return c.json(await chunkComplete(c, c.env));
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? '合并失败' }, e?.status ?? 500);
+  }
+});
+
+app.post('/api/upload/chunk/abort/:upload_id', async (c) => {
+  try {
+    return c.json(await chunkAbort(c, c.env));
+  } catch (e: any) {
+    return c.json({ error: e?.message ?? '放弃失败' }, e?.status ?? 500);
   }
 });
 
@@ -448,6 +494,8 @@ export default {
           // 对账：孤儿扫描已经逐页累加了实测占用，直接改写计数器，
           // 修掉增量计数器在异常路径上可能攒出的漂移（0 表示桶确实空了，不是"没扫到"）
           if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
+          // 超时未完成的分片会话必须 abort：已上传但未合并的分片会一直计费
+          const staleChunks = await cleanupStaleChunkUploads(env);
           const rateLimitCleaned = await cleanupRateLimitEntries(env.DB);
           console.log(JSON.stringify({
             event: 'scheduled_cleanup',
@@ -456,6 +504,7 @@ export default {
             r2Scanned: scanned,
             r2Removed: removed,
             storageUsed: usedBytes,
+            staleChunks,
             rateLimitCleaned,
           }));
         } catch (e) {

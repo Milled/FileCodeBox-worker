@@ -15,8 +15,9 @@ import { publicUiSuite } from './public-ui.mjs';
 import { uploadInteractionsSuite } from './upload-interactions.mjs';
 import { adminSettingsSuite } from './admin-settings.mjs';
 import { thumbnailSuite } from './thumbnails.mjs';
+import { chunkedSuite } from './chunked-upload.mjs';
 
-const SUITES = [publicUiSuite, uploadInteractionsSuite, adminSettingsSuite, thumbnailSuite];
+const SUITES = [publicUiSuite, uploadInteractionsSuite, adminSettingsSuite, thumbnailSuite, chunkedSuite];
 
 const browser = await launchBrowser();
 const results = [];

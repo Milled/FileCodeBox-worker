@@ -1,4 +1,4 @@
-import type { FileRecord } from './types';
+import type { ChunkTask, FileRecord } from './types';
 
 /** 初始化数据库表（幂等，可多次调用） */
 export async function initDB(db: D1Database): Promise<void> {
@@ -20,6 +20,28 @@ export async function initDB(db: D1Database): Promise<void> {
     `CREATE TABLE IF NOT EXISTS fc_settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    )`,
+    // 分片上传：会话与已传片分两张表。每片一行而不是把 etag 存成 JSON 数组，
+    // 是因为前端会并发上传同一次会话的多片，JSON 的读改写会互相覆盖丢 etag
+    `CREATE TABLE IF NOT EXISTS fc_chunk_uploads (
+      upload_id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      filename TEXT NOT NULL,
+      size INTEGER NOT NULL DEFAULT 0,
+      part_size INTEGER NOT NULL,
+      total_parts INTEGER NOT NULL,
+      mime_type TEXT DEFAULT 'application/octet-stream',
+      expire_at TEXT NOT NULL,
+      max_downloads INTEGER DEFAULT -1,
+      created_at TEXT NOT NULL,
+      ip TEXT DEFAULT ''
+    )`,
+    `CREATE TABLE IF NOT EXISTS fc_chunk_parts (
+      upload_id TEXT NOT NULL,
+      part_number INTEGER NOT NULL,
+      etag TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (upload_id, part_number)
     )`,
   ];
   const migrations = [
@@ -58,6 +80,12 @@ export async function getFileById(
   id: number,
 ): Promise<FileRecord | null> {
   return db.prepare('SELECT * FROM fc_files WHERE id = ?').bind(id).first<FileRecord>();
+}
+
+/** 该取件码是否已有文件记录（含已过期的）。释放码之前必须查一次，否则会误放行复用 */
+export async function hasFileRecord(db: D1Database, code: string): Promise<boolean> {
+  const row = await db.prepare('SELECT 1 AS hit FROM fc_files WHERE code = ?').bind(code).first();
+  return row !== null;
 }
 
 export async function isCodeTaken(db: D1Database, code: string): Promise<boolean> {
@@ -211,6 +239,68 @@ export async function markThumb(db: D1Database, code: string): Promise<void> {
     await db.prepare('ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0').run();
     await db.prepare(sql).bind(code).run();
   }
+}
+
+// ---- 分片上传会话 ----
+
+export async function insertChunkTask(db: D1Database, t: ChunkTask): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO fc_chunk_uploads(upload_id, code, filename, size, part_size, total_parts, mime_type, expire_at, max_downloads, created_at, ip)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(t.upload_id, t.code, t.filename, t.size, t.part_size, t.total_parts, t.mime_type, t.expire_at, t.max_downloads, t.created_at, t.ip)
+    .run();
+}
+
+export async function getChunkTask(db: D1Database, uploadId: string): Promise<ChunkTask | null> {
+  return db.prepare('SELECT * FROM fc_chunk_uploads WHERE upload_id = ?').bind(uploadId).first<ChunkTask>();
+}
+
+/** 记录一片的 etag。重复上传同一片（客户端重试）用 REPLACE 覆盖，幂等 */
+export async function saveChunkPart(db: D1Database, uploadId: string, partNumber: number, etag: string): Promise<void> {
+  await db
+    .prepare('INSERT OR REPLACE INTO fc_chunk_parts(upload_id, part_number, etag, created_at) VALUES (?, ?, ?, ?)')
+    .bind(uploadId, partNumber, etag, new Date().toISOString())
+    .run();
+}
+
+export async function listChunkParts(
+  db: D1Database,
+  uploadId: string,
+): Promise<Array<{ part_number: number; etag: string }>> {
+  const rows = await db
+    .prepare('SELECT part_number, etag FROM fc_chunk_parts WHERE upload_id = ? ORDER BY part_number')
+    .bind(uploadId)
+    .all<{ part_number: number; etag: string }>();
+  return rows.results ?? [];
+}
+
+export async function deleteChunkTask(db: D1Database, uploadId: string): Promise<void> {
+  await db.prepare('DELETE FROM fc_chunk_parts WHERE upload_id = ?').bind(uploadId).run();
+  await db.prepare('DELETE FROM fc_chunk_uploads WHERE upload_id = ?').bind(uploadId).run();
+}
+
+/**
+ * 未完成会话声明的总字节数。
+ * 配额预检要把它算进去：否则几个 300MB 的会话可以各自通过预检，最后合计爆掉。
+ */
+export async function getPendingChunkBytes(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare('SELECT COALESCE(SUM(size), 0) AS pending FROM fc_chunk_uploads')
+    .first<{ pending: number | string }>();
+  const n = Number(row?.pending ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** 超时未完成的会话（供 cron abort，避免已传分片一直计费） */
+export async function listStaleChunkTasks(db: D1Database, olderThanMs: number): Promise<ChunkTask[]> {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const rows = await db
+    .prepare('SELECT * FROM fc_chunk_uploads WHERE datetime(created_at) <= datetime(?)')
+    .bind(cutoff)
+    .all<ChunkTask>();
+  return rows.results ?? [];
 }
 
 // ---- 删除 ----
@@ -429,7 +519,7 @@ export async function checkRateLimit(
 export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
   const rows = await db
     .prepare(
-      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%' OR key LIKE 'thumb_ratelimit:%' OR key LIKE 'code_ratelimit:%'",
+      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%' OR key LIKE 'thumb_ratelimit:%' OR key LIKE 'code_ratelimit:%' OR key LIKE 'chunk_ratelimit:%'",
     )
     .all<{ key: string; value: string }>();
   const now = Date.now();

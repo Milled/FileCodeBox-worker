@@ -17,14 +17,15 @@ import {
   markThumb,
   releaseCode,
   checkRateLimit,
+  getPendingChunkBytes,
   getSetting,
   getStorageUsed,
 } from './db';
 
 // ===================== 运行时上限 =====================
 
-/** 25MB，与 wrangler.jsonc 的 MAX_FILE_SIZE 默认值一致 */
-export const FALLBACK_MAX_FILE_SIZE = 26214400;
+/** 100MB，与 wrangler.jsonc 的 MAX_FILE_SIZE 默认值一致 */
+export const FALLBACK_MAX_FILE_SIZE = 104857600;
 const FALLBACK_EXPIRE_DAYS = 7;
 
 /**
@@ -84,7 +85,7 @@ export function parseExpire(
  * isCodeTaken 预检双表快速失败；claimCode（INSERT OR IGNORE + changes）为
  * 原子门闩，并发同码时仅一个请求成功，失败方不再继续写 R2/D1。
  */
-async function ensureCodeAvailable(rawCode: string, env: Env): Promise<string> {
+export async function ensureCodeAvailable(rawCode: string, env: Env): Promise<string> {
   if (rawCode && !isValidCode(rawCode)) {
     throw { status: 400 as const, message: '取件码必须为 4 位数字' };
   }
@@ -130,13 +131,14 @@ class UploadLimitError extends Error {
  * 读 storage_used 计数器：由 insertFile / deleteFileRecord / cleanupExpired 增减，
  * 并由 Cron 用 R2 实测值对账。不在上传路径上扫桶 —— 那会让每次上传多花 O(对象数) 的请求。
  */
-async function remainingQuota(env: Env, maxTotalStorage: number): Promise<number> {
+export async function remainingQuota(env: Env, maxTotalStorage: number): Promise<number> {
   if (maxTotalStorage <= 0) return Infinity;
-  const used = await getStorageUsed(env.DB);
-  return Math.max(0, maxTotalStorage - used);
+  // 未完成的分片会话也要占位：否则几个 300MB 的会话各自通过预检，最后合计爆掉
+  const [used, pending] = await Promise.all([getStorageUsed(env.DB), getPendingChunkBytes(env.DB)]);
+  return Math.max(0, maxTotalStorage - used - pending);
 }
 
-function quotaMessage(limits: { maxTotalStorage: number }): string {
+export function quotaMessage(limits: { maxTotalStorage: number }): string {
   return `存储空间已满（上限 ${formatFileSize(limits.maxTotalStorage)}），请删除过期文件或让管理员调整总占用上限`;
 }
 

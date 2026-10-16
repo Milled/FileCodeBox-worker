@@ -35,3 +35,28 @@ CREATE TABLE IF NOT EXISTS fc_settings (
 CREATE TABLE IF NOT EXISTS fc_used_codes (
   code TEXT PRIMARY KEY
 );
+
+-- 分片上传：会话与已传片分两张表。
+-- 每片一行而不是把 etag 存成 JSON 数组，是因为前端会并发上传同一次会话的多片，
+-- JSON 的读改写会互相覆盖丢 etag（丢了就没法 complete）。
+CREATE TABLE IF NOT EXISTS fc_chunk_uploads (
+  upload_id TEXT PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  filename TEXT NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  part_size INTEGER NOT NULL,
+  total_parts INTEGER NOT NULL,
+  mime_type TEXT DEFAULT 'application/octet-stream',
+  expire_at TEXT NOT NULL,
+  max_downloads INTEGER DEFAULT -1,
+  created_at TEXT NOT NULL,
+  ip TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS fc_chunk_parts (
+  upload_id TEXT NOT NULL,
+  part_number INTEGER NOT NULL,
+  etag TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (upload_id, part_number)
+);

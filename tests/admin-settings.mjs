@@ -118,11 +118,16 @@ export async function adminSettingsSuite(browser) {
     });
     s.ok('清空总占用上限即恢复不限制', rFree.status() === 200, await rFree.text());
 
-    // ---- 超过平台上限时的警示文案 ----
+    // ---- 分片说明文案：超过 100MB 现在是合法配置，不该再报平台警示 ----
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
     await page.fill('input[name="maxFileSizeMb"]', '200');
     await save();
-    s.ok('上限超过 100MB 时给出平台层警示', (await page.locator('.setting-warn').count()) === 1);
+    await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
+    const capDesc = (await page.$$eval('.setting-desc', (els) => els.map((e) => e.textContent).join('\n'))) || '';
+    s.ok('上限 200MB 正常回显且说明分片',
+      (await page.inputValue('input[name="maxFileSizeMb"]')) === '200'
+        && /分片上传/.test(capDesc) && /8 MiB/.test(capDesc),
+      capDesc.replace(/\s+/g, ' ').match(/超过 64 MiB[^。]*。/)?.[0]?.slice(0, 46) || '未找到');
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
     await page.fill('input[name="maxFileSizeMb"]', '');
     await save();

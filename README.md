@@ -10,7 +10,8 @@
 | 存储 | D1（元数据）+ R2（文件本体） |
 | 前端 | 服务端渲染，样式与脚本全部内联，**零外部 CDN / 字体 / 图片依赖** |
 | 运行时依赖 | 只有 `hono` 和 `qr` 两个包 |
-| 默认限制 | 单文件 25 MB · 7 天过期 · 文本 512 KB（后台可随时改，不需重新部署） |
+| 默认限制 | 单文件 100 MB · 7 天过期 · 文本 512 KB（后台可随时改，不需重新部署） |
+| 大文件 | 超过 64 MiB 自动分片上传，不受 Cloudflare 单次请求体上限约束 |
 | 深色模式 | 跟随系统 |
 
 ---
@@ -18,6 +19,7 @@
 ## ✨ 功能
 
 - 📤 **上传文件** — 点击 / 拖拽 / 粘贴均可，支持多选；每个文件各自一个取件码，多选时自动分配**连号码**
+- 📦 **大文件分片** — 超过 64 MiB 自动切成 8 MiB 的分片并发上传，服务端直接流进 R2 multipart 会话；**一个文件仍然只有一个取件码，后台仍然只是一行记录**
 - 📝 **文本分享** — 粘贴文本即得取件码，页面内直接阅读，实时显示 UTF-8 字节数
 - 📥 **取件下载** — 输 4 位码即取，填满自动提交；码不存在或为空时回到取件框重新输入
 - 🖼️ **图片预览** — 上传的是图片时，落地页与取件页直接显示缩略图
@@ -144,7 +146,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
   -d '{"openUpload":"1","maxFileSize":"26214400","defaultExpireDays":"7","maxTotalStorage":"536870912"}'
 ```
 
-上传相关的错误码：`413` 单个文件超上限、`507` R2 总占用已满、`429` 触发上传限流、`401` 游客上传被关。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
+上传相关的错误码：`413` 单个文件超上限、`507` R2 总占用已满、`429` 触发上传限流（分片用独立的桶，一次会话几十片不会把上传配额吃光）、`401` 游客上传被关、`422` 分片序号越界或缺片。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
 
 ### 网页接口一览
 
@@ -154,6 +156,11 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 | GET | `/r/:code` | 取件页；带 `?sent=1` 是上传者落地页（无下载入口） |
 | POST | `/api/upload` | 文件上传，返回 `{code, filename, size}` |
 | POST | `/api/upload/text` | 文本上传，返回 HTML 结果页 |
+| POST | `/api/upload/chunk/init` | 开一个分片会话（校验大小/配额、预占取件码），返回 `upload_id` 与片数 |
+| PUT | `/api/upload/chunk/:upload_id/:part` | 上传一片（8 MiB 以内，直接流进 R2 multipart 会话） |
+| GET | `/api/upload/chunk/status/:upload_id` | 已收到哪些片号，供重试时跳过 |
+| POST | `/api/upload/chunk/complete/:upload_id` | 合并收尾，返回 `{code, filename, size}` |
+| POST | `/api/upload/chunk/abort/:upload_id` | 放弃会话，释放预留的取件码与配额 |
 | GET | `/api/text/:code` · `/api/download/:code` | 取文本 / 下载文件（支持 HEAD） |
 | GET | `/api/info/:code` | 文件信息（JSON） |
 | GET | `/api/codes/:count` | 为多文件批次取一段未被占用的连号码（2–20） |
@@ -169,6 +176,8 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 ## 🧑‍💻 使用
 
 **发件** — 拖入文件或粘贴 → 需要时展开「额外发件设置」调整有效期 / 最大下载次数 / 自定义取件码 → 点「发件并获取取件码」。多个文件会各自拿到一段连号的码，此时自定义取件码输入框不可用（一个码只能对应一个文件）。
+
+**大文件** — 超过 64 MiB 的文件会自动切成 8 MiB 的分片并发上传（3 路），单片失败只重传那一片，不必整个文件重来。分片由 R2 在存储侧合并成一个对象，所以取件码、后台记录、下载次数、过期清理都与普通文件完全一致。两点要留意：半途放弃的会话会在 6 小时后被定时任务清掉（已上传但未合并的分片是会计费的，所以必须清）；单次会话最多 1000 片，即约 8 GiB。
 
 **取件** — 首页顶部输入 4 位码，填满即自动取件。文本在线看，文件点「下载文件」。
 
@@ -198,7 +207,7 @@ R2 免费额度为 10 GiB 存储，超出部分按量计费且**不会自动熔�
 | 变量 | 位置 | 默认 | 说明 |
 |------|------|------|------|
 | `ADMIN_PASSWORD` | Secret | 无 | 管理员密码；未设置则无法登录后台 |
-| `MAX_FILE_SIZE` | `vars` | `26214400` | 单文件上限（字节），即 25 MB |
+| `MAX_FILE_SIZE` | `vars` | `104857600` | 单文件上限（字节），即 100 MB |
 | `DEFAULT_EXPIRE_DAYS` | `vars` | `7` | 未指定过期参数时的默认天数 |
 | `triggers.crons` | `wrangler.jsonc` | `*/30 * * * *` | 建表、清理过期文件与孤儿对象、清理限流记录 |
 
@@ -225,7 +234,7 @@ npm run dev           # http://localhost:8787
 ```bash
 npm run typecheck     # tsc --noEmit
 npm test              # 主流程冒烟（Playwright 无头）
-npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图，共 124 项断言
+npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图，共 141 项断言
 ```
 
 用例假设本地服务已启动且表已建好：
@@ -248,6 +257,7 @@ src/
 ├── index.ts          # 网页路由 + Cron 清理
 ├── api.ts            # FileCodeBox v2.1.0 兼容 API
 ├── shared.ts         # 上传 / 下载 / 缩略图 / 连号码 / 生效上限（单一业务逻辑源）
+├── chunk.ts          # 分片上传：会话、逐片流进 R2 multipart、合并收尾
 ├── db.ts             # D1 读写、取件码抢占、限流、清理
 ├── auth.ts           # 登录 / 登出 / 密码哈希
 ├── qr.ts             # 二维码封装

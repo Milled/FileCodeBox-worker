@@ -719,7 +719,6 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
 /* 设置说明较长：按句子分行才读得下去（模板里的换行会被浏览器折成一坨） */
 .setting-desc { font-size: 12px; color: var(--color-ink-2); margin-top: 2px; line-height: 1.7; }
 .setting-desc > div + div { margin-top: 6px; }
-.setting-warn { color: var(--color-danger); font-weight: 600; }
 .setting-control { width: auto; min-width: 12rem; flex-shrink: 0; }
 form[action="/admin/settings"] > .btn { margin-top: 20px; }
 
