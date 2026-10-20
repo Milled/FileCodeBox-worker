@@ -7,8 +7,8 @@
  */
 import { BASE, ADMIN_PASSWORD, newPage, Suite, dropImage, rateLimitBreather, apiJson } from './helpers.mjs';
 
-const PART = 8 * 1024 * 1024;
-const BIG = 70 * 1024 * 1024; // → 9 片（8 满片 + 1 个 6 MiB 尾片）
+const PART = 16 * 1024 * 1024;
+const BIG = 70 * 1024 * 1024; // → 5 片（4 满片 + 1 个 6 MiB 尾片），也刚好越过 64 MiB 的分片阈值
 const MB100 = 100 * 1024 * 1024;
 
 export async function chunkedSuite(browser) {
@@ -59,7 +59,7 @@ export async function chunkedSuite(browser) {
       body: JSON.stringify({ filename: 'big.bin', size: BIG, content_type: 'application/octet-stream', expire_style: 'day', expire_value: '1' }),
     });
     const sess = init.json || {};
-    s.ok('init 返回会话与片数', init.status === 200 && sess.total_parts === 9 && sess.part_size === PART,
+    s.ok('init 返回会话与片数', init.status === 200 && sess.total_parts === 5 && sess.part_size === PART,
       `${init.status} parts=${sess.total_parts}`);
     // 句柄必须是服务端自生成的 32 位十六进制：拿 R2 的原始 uploadId 当句柄，
     // 它的字符集不归我们管，放进路径早晚被某一环改写成一个查不到的键
@@ -74,13 +74,14 @@ export async function chunkedSuite(browser) {
       const r = await putPart(`/api/upload/chunk/${sess.session}/${n}`, partSizes[n - 1], n);
       putResults.push(r.status);
     }
-    s.ok('9 片全部接收', putResults.every((x) => x === 200), putResults.join(','));
+    s.ok('5 片全部接收', putResults.every((x) => x === 200), putResults.join(','));
 
     const status = await call(`/api/upload/chunk/status/${sess.session}`, {});
-    s.ok('status 列出已传片号', status.json?.done?.length === 9 && status.json.done[0] === 1, JSON.stringify(status.json?.done));
+    s.ok('status 列出已传片号', status.json?.done?.length === 5 && status.json.done[0] === 1, JSON.stringify(status.json?.done));
 
     const again = await putPart(`/api/upload/chunk/${sess.session}/3`, partSizes[2], 3);
-    s.ok('重复上传同一片幂等跳过', again.status === 200 && again.json?.skipped === true, JSON.stringify(again.json));
+    s.ok('重复上传同一片不报错（预查已去掉，靠 R2 覆盖语义兜住）',
+      again.status === 200 && again.json?.ok === true, JSON.stringify(again.json));
 
     const done = await call(`/api/upload/chunk/complete/${sess.session}`, { method: 'POST' });
     s.ok('complete 合成一个对象并返回取件码',
@@ -96,9 +97,9 @@ export async function chunkedSuite(browser) {
       const buf = new Uint8Array(await r.arrayBuffer());
       return { status: r.status, len: buf.length, first: buf[0], mid: buf[1048576], tail: buf[69 * 1048576] };
     }, code);
-    // 每片填充值就是片号：0 / 1MiB 落在第 1 片，69MiB 落在第 9 片
+    // 每片填充值就是片号：0 / 1MiB 落在第 1 片，69MiB 落在第 5 片（64MiB 之后）
     s.ok('下载回来字节数与各片内容一致',
-      back.status === 200 && back.len === BIG && back.first === 1 && back.mid === 1 && back.tail === 9,
+      back.status === 200 && back.len === BIG && back.first === 1 && back.mid === 1 && back.tail === 5,
       `${back.len} B 首片=${back.first} 尾区=${back.tail}`);
 
     const afterDone = await call(`/api/upload/chunk/status/${sess.session}`, {});
@@ -166,12 +167,12 @@ export async function chunkedSuite(browser) {
     });
 
     // 片长由服务端从会话行算出（第 1..N-1 片 = part_size，末片 = 余数），Content-Length 只用来
-    // 一次性对账 —— 字节不再逐块搬运，否则一片 8MiB 会跑成一段不中断的 JS，撞上免费计划
+    // 一次性对账 —— 字节不再逐块搬运，否则一片 16MiB 会跑成一段不中断的 JS，撞上免费计划
     // 10ms 的连续 CPU 上限（线上 1102）。这里借 half 的会话试，不必再多占一次 init
     const halfPart = await putPart(`/api/upload/chunk/${half.json.session}/1`, PART / 2, 1);
-    const lastPart = await putPart(`/api/upload/chunk/${half.json.session}/9`, PART, 1);
+    const lastPart = await putPart(`/api/upload/chunk/${half.json.session}/5`, PART, 1);
     s.ok('片长与账面对不上就 422（首片少送、末片多送都拦得住）',
-      halfPart.status === 422 && /分片长度应为 8388608/.test(halfPart.json?.error || '')
+      halfPart.status === 422 && /分片长度应为 16777216/.test(halfPart.json?.error || '')
       && lastPart.status === 422 && /分片长度应为 6291456/.test(lastPart.json?.error || ''),
       `${halfPart.json?.error} | ${lastPart.json?.error}`);
 
@@ -217,7 +218,7 @@ export async function chunkedSuite(browser) {
     await page.goto(`${BASE}/admin`, { waitUntil: 'networkidle' });
     const blockText = ((await page.locator('.chunk-sessions').textContent()) || '').replace(/\s+/g, ' ');
     s.ok('后台列出进行中的分片会话及其片数',
-      /进行中的分片上传 2 个/.test(blockText) && /1\/9 片/.test(blockText) && /0\/9 片/.test(blockText),
+      /进行中的分片上传 2 个/.test(blockText) && /1\/5 片/.test(blockText) && /0\/5 片/.test(blockText),
       blockText.slice(0, 150));
 
     await Promise.all([
@@ -287,15 +288,14 @@ export async function chunkedSuite(browser) {
     await Promise.all([ui.waitForNavigation({ url: /\/r\/\d{4}/, timeout: 60000 }), ui.click('#submitBtn')]);
     s.ok('小文件仍走单请求，不多付往返', chunkUrls.length === 0, `${chunkUrls.length}`);
 
-    // ---- 阈值降到 16MiB ----
-    // 一个 17MB 的文件过去整份塞进一个 PUT：慢上行下会在半途被掐断，而且没有重试粒度。
+    // ---- 阈值 64MiB 的边界 ----
     // 这里把分片请求全部在本地应答，只观察前端选了哪条通道，不真占带宽和存储
     const sid = 'f'.repeat(32);
     await ui.route('**/api/upload/chunk/**', (route) => {
       const u = route.request().url();
-      const body = u.includes('/init') ? { session: sid, code: '9999', part_size: PART, total_parts: 3 }
-        : u.includes('/status/') ? { session: sid, total_parts: 3, done: [] }
-        : u.includes('/complete/') ? { code: '9999', filename: 'ui-17.bin', size: 17 * 1024 * 1024 }
+      const body = u.includes('/init') ? { session: sid, code: '9999', part_size: PART, total_parts: 5 }
+        : u.includes('/status/') ? { session: sid, total_parts: 5, done: [] }
+        : u.includes('/complete/') ? { code: '9999', filename: 'ui-66.bin', size: 66 * 1024 * 1024 }
         : { ok: true, part: Number(u.split('/').pop()) };
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
     });
@@ -305,16 +305,16 @@ export async function chunkedSuite(browser) {
     await ui.goto(`${BASE}/`, { waitUntil: 'networkidle' });
     await ui.evaluate(async () => {
       const dt = new DataTransfer();
-      dt.items.add(new File([new Uint8Array(17 * 1024 * 1024)], 'ui-17.bin', { type: 'application/octet-stream' }));
+      dt.items.add(new File([new Uint8Array(66 * 1024 * 1024)], 'ui-66.bin', { type: 'application/octet-stream' }));
       document.getElementById('dropZone').dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
     });
     await Promise.all([ui.waitForNavigation({ url: /\/r\/9999/, timeout: 30000 }), ui.click('#submitBtn')]);
     ui.off('request', onMid);
     await ui.unroute('**/api/upload/chunk/**');
-    s.ok('17MiB 的文件也切到分片通道（3 片 + 收尾）',
+    s.ok('66MiB（>64MiB 阈值）切到分片通道：init + status + 5 片 + complete',
       midUrls.filter((u) => u.includes('/init')).length === 1
       && midUrls.filter((u) => u.includes('/complete/')).length === 1
-      && midUrls.length === 6,
+      && midUrls.length === 8,
       midUrls.map((u) => u.split('/chunk/')[1]).join(' → '));
 
     // ---- 分片传败了，前端必须自己 abort ----

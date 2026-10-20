@@ -1,5 +1,5 @@
 import type { ChunkTask, FileRecord } from '../types';
-import { CHUNK_THRESHOLD } from '../chunk';
+import { CHUNK_PART_SIZE, CHUNK_THRESHOLD } from '../chunk';
 import { formatFileSize, escapeHtml } from '../utils';
 import { FALLBACK_MAX_FILE_SIZE } from '../shared';
 import { layout } from './layout';
@@ -1361,7 +1361,7 @@ export function adminSettingsPage(config: AdminConfig, saved?: string): string {
           <div class="setting-title">单文件大小上限（MB）</div>
           <div class="setting-desc">
             <div>单位 MB（可填小数，如 0.5）。生效优先级：此处填写值 &gt; wrangler 变量 ${mb(config.varsMaxFileSize)} MB &gt; 内置兜底 100 MB；清空保存即回退到变量值。</div>
-            <div>超过 ${Math.round(CHUNK_THRESHOLD / 1048576)} MiB 的文件会自动走分片上传（每片 8 MiB，由 R2 合并成一个对象，仍然只有一个取件码），所以这里填多大都能传 —— 既不受 Cloudflare 单次请求体上限（Free/Pro 100 MB、Business 200 MB）约束，也不会因为上行慢、单个请求拖太久而被边缘掐断。分片仍受「R2 总占用上限」以及单次会话 1000 片（约 8 GiB）的限制。</div>
+            <div>超过 ${Math.round(CHUNK_THRESHOLD / 1048576)} MiB 的文件会自动走分片上传（每片 ${Math.round(CHUNK_PART_SIZE / 1048576)} MiB，由 R2 合并成一个对象，仍然只有一个取件码），所以这里填多大都能传 —— 不受 Cloudflare 单次请求体上限（Free/Pro 100 MB、Business 200 MB）约束。分片仍受「R2 总占用上限」以及单次会话 1000 片（约 16 GiB）的限制。</div>
           </div>
         </div>
         <input type="number" name="maxFileSizeMb" class="input setting-control" min="0.1" max="5120" step="0.1" value="${toMb(config.maxFileSize)}" placeholder="${toMb(config.varsMaxFileSize)}">

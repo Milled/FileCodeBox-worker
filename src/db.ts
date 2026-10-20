@@ -275,7 +275,13 @@ export async function insertChunkTask(db: D1Database, t: ChunkTask): Promise<voi
 
 /** 按客户端句柄取会话。句柄是服务端自生成的 32 位十六进制，不含 R2 的原始 uploadId */
 export async function getChunkTaskBySession(db: D1Database, sessionId: string): Promise<ChunkTask | null> {
-  return db.prepare('SELECT * FROM fc_chunk_uploads WHERE session_id = ?').bind(sessionId).first<ChunkTask>();
+  const row = await getChunkTaskStatement(db, sessionId).first<ChunkTask>();
+  return row ?? null;
+}
+
+/** 语句版本：分片路径要把「取会话」和「读限流窗口」并进同一次 batch */
+export function getChunkTaskStatement(db: D1Database, sessionId: string): D1PreparedStatement {
+  return db.prepare('SELECT * FROM fc_chunk_uploads WHERE session_id = ?').bind(sessionId);
 }
 
 export async function getChunkTask(db: D1Database, uploadId: string): Promise<ChunkTask | null> {
@@ -284,10 +290,14 @@ export async function getChunkTask(db: D1Database, uploadId: string): Promise<Ch
 
 /** 记录一片的 etag。重复上传同一片（客户端重试）用 REPLACE 覆盖，幂等 */
 export async function saveChunkPart(db: D1Database, uploadId: string, partNumber: number, etag: string): Promise<void> {
-  await db
+  await saveChunkPartStatement(db, uploadId, partNumber, etag).run();
+}
+
+/** 语句版本：分片路径要把记账和限流写回塞进同一次 batch，见 chunkPut */
+export function saveChunkPartStatement(db: D1Database, uploadId: string, partNumber: number, etag: string): D1PreparedStatement {
+  return db
     .prepare('INSERT OR REPLACE INTO fc_chunk_parts(upload_id, part_number, etag, created_at) VALUES (?, ?, ?, ?)')
-    .bind(uploadId, partNumber, etag, new Date().toISOString())
-    .run();
+    .bind(uploadId, partNumber, etag, new Date().toISOString());
 }
 
 export async function listChunkParts(
@@ -505,10 +515,12 @@ export async function setSetting(
   key: string,
   value: string,
 ): Promise<void> {
-  await db
-    .prepare('INSERT OR REPLACE INTO fc_settings(key, value) VALUES(?, ?)')
-    .bind(key, value)
-    .run();
+  await setSettingStatement(db, key, value).run();
+}
+
+/** 语句版本：可与别的写合成一次 batch */
+export function setSettingStatement(db: D1Database, key: string, value: string): D1PreparedStatement {
+  return db.prepare('INSERT OR REPLACE INTO fc_settings(key, value) VALUES(?, ?)').bind(key, value);
 }
 
 // ---- 速率限制（D1 存储） ----
@@ -520,16 +532,16 @@ const RATE_WINDOW = 60_000; // 60 秒窗口
  * 关键：无论是否通过，只要窗口未过期都会递增计数，
  *       防止攻击者在窗口重置后获得额外尝试次数。
  */
-export async function checkRateLimit(
-  db: D1Database,
-  keyPrefix: string,
-  ip: string,
+/**
+ * 限流窗口的纯计算部分：给分片路径用。
+ * 那里「读窗口」要并进别的读、「写窗口」要并进别的写，中间还夹着一次 R2 写入，
+ * 不能像 checkRateLimit 那样读一趟写一趟地串起来（每片多两趟往返）
+ */
+export function rateVerdict(
+  raw: string | null,
   max: number,
-): Promise<boolean> {
-  const key = `${keyPrefix}:${ip}`;
-  const now = Date.now();
-  const raw = await getSetting(db, key);
-
+  now = Date.now(),
+): { allowed: boolean; value: string } {
   let count = 0;
   let windowStart = now;
   if (raw) {
@@ -541,11 +553,21 @@ export async function checkRateLimit(
       }
     } catch { /* 损坏则重置 */ }
   }
+  const next = count + 1;
+  return { allowed: next <= max, value: JSON.stringify({ count: next, windowStart }) };
+}
 
-  const newCount = count + 1;
-  await setSetting(db, key, JSON.stringify({ count: newCount, windowStart }));
-
-  return newCount <= max;
+export async function checkRateLimit(
+  db: D1Database,
+  keyPrefix: string,
+  ip: string,
+  max: number,
+): Promise<boolean> {
+  const key = `${keyPrefix}:${ip}`;
+  const raw = await getSetting(db, key);
+  const verdict = rateVerdict(raw, max);
+  await setSetting(db, key, verdict.value);
+  return verdict.allowed;
 }
 
 /**

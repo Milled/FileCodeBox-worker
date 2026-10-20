@@ -25,28 +25,37 @@ import {
   deleteChunkTask,
   getChunkTask,
   getChunkTaskBySession,
+  getChunkTaskStatement,
   hasFileRecord,
   insertChunkTask,
   insertFile,
   listChunkParts,
   listChunkTasks,
   listStaleChunkTasks,
+  rateVerdict,
   releaseCode,
-  saveChunkPart,
+  saveChunkPartStatement,
+  setSettingStatement,
   checkRateLimit,
 } from './db';
 
-/** 每片 8 MiB：远高于 S3 兼容接口「非末片最小 5 MiB」的要求，又远小于最窄套餐的请求体上限 */
-export const CHUNK_PART_SIZE = 8 * 1024 * 1024;
+/** 分片自己的限流额度（每 60 秒）：一次会话可能有上百片，共用上传桶会把自己掐死 */
+const CHUNK_RATE_MAX = 300;
+
+/**
+ * 每片 16 MiB。
+ * 片大小的真实成本不是带宽而是每片的固定开销（一次取会话 + 一次记账的 D1 往返，
+ * 在你这档账号上一趟就是百来毫秒），所以片越大越省；代价是一片失败要重传整片，
+ * 以及 `分片 x/N` 的计数变粗。16 MiB 同时满足 R2「非末片 ≥5 MiB」并远离 100 MB 请求体上限。
+ */
+export const CHUNK_PART_SIZE = 16 * 1024 * 1024;
 /**
  * 超过这个大小才走分片。
- * 曾经是 64 MiB（只为绕开 Cloudflare 的单次请求体上限），但慢上行还有一条时间线：
- * 一个 50MB 的 PUT 在 500KB/s 上要用满 100 秒，边缘会在传输中途掐断连接，
- * 而单请求没有重试粒度 —— 用户看到的就是一次「网络错误」加 50MB 白传。
- * 按两片算，常见大文件都能拆成可重传的短请求。
+ * 小于它的文件仍是单次请求：零拷贝之后 Worker 不再逐块搬字节，单请求既不吃 CPU 也不吃内存，
+ * 64 MiB 距离套餐的 100 MB 请求体上限还有余量，不值得为它多付两次往返。
  */
-export const CHUNK_THRESHOLD = 16 * 1024 * 1024;
-/** R2 单次会话允许 10,000 片，这里收紧到 1000（≈ 8 GiB），越界直接拒绝而不是静默截断 */
+export const CHUNK_THRESHOLD = 64 * 1024 * 1024;
+/** R2 单次会话允许 10,000 片，这里收紧到 1000（≈ 16 GiB），越界直接拒绝而不是静默截断 */
 const MAX_PARTS = 1000;
 /** 未完成会话的保留时长。超时必须 abort —— 已上传但未 complete 的分片会持续计费 */
 export const CHUNK_STALE_MS = 6 * 3600_000;
@@ -157,34 +166,40 @@ export async function chunkInit(
 /**
  * 收一片：请求体原样交给 R2，字节不进 JS。
  * R2 接受带 Content-Length 的 request.body（长度已知），转发在平台内部完成；
- * 自己 read/write 搬运会把 8 MiB 跑成一段不中断的执行，撞上免费计划 10ms 的连续 CPU 上限。
+ * 自己 read/write 搬运会把整片跑成一段不中断的执行，撞上免费计划 10ms 的连续 CPU 上限。
  */
 export async function chunkPut(
   c: Context<{ Bindings: Env }>,
   env: Env,
-): Promise<{ ok: true; part: number; skipped?: boolean }> {
+): Promise<{ ok: true; part: number }> {
   const part = parseInt(c.req.param('part') ?? '');
+  const session = sessionIdOf(c);
+  const rateKey = `chunk_ratelimit:${getClientIp(c.req.raw.headers)}`;
 
-  // 分片必须用独立限流桶：一次会话可能有上百片，共用上传桶会把自己掐死；
+  // 每片的成本主要是串行往返次数（这一档账号上一趟 D1 就是百来毫秒），所以：
+  // 读限流窗口与取会话行合成一次 batch；写限流与记账再合成一次 batch —— 每片两趟往返顶天。
+  // 「这片是不是已经传过」的预查直接去掉：它只能省一次冗余写，却要在每片的路上多插一趟往返，
+  // 而重复片由 R2 的覆盖语义接住（同内容同 etag），真正省带宽的跳过在 status 接口那边。
+  // 代价要说清楚：限流计数因此在 R2 写成功之后才累加，所以反复失败（比如片长不对）的请求
+  // 不会把桶填满 —— 挡住无限刷片靠的是句柄本身（128 位随机），每次尝试仍要付一趟读的成本
+  const [rateRes, taskRes] = await env.DB.batch([
+    env.DB.prepare('SELECT value FROM fc_settings WHERE key = ?').bind(rateKey),
+    getChunkTaskStatement(env.DB, session),
+  ]);
+
+  const raw = (rateRes.results as Array<{ value?: string } | undefined> | undefined)?.[0]?.value ?? null;
+  const verdict = rateVerdict(raw, CHUNK_RATE_MAX);
+  // 限流用独立桶：一次会话可能有上百片，共用上传桶会把自己掐死；
   // 反过来没有它，拿到会话句柄的人就能无限刷片
-  const ip = getClientIp(c.req.raw.headers);
-  if (!(await checkRateLimit(env.DB, 'chunk_ratelimit', ip, 300))) {
-    throw { status: 429 as const, message: '分片上传过于频繁，请稍后再试' };
-  }
+  if (!verdict.allowed) throw { status: 429 as const, message: '分片上传过于频繁，请稍后再试' };
 
-  const task = await resolveTask(c, env);
-  const uploadId = task.upload_id;
+  const task = (taskRes.results as ChunkTask[] | undefined)?.[0];
+  if (!task) throw { status: 404 as const, message: '上传会话不存在或已结束' };
   if (!Number.isInteger(part) || part < 1 || part > task.total_parts) {
     throw { status: 422 as const, message: '分片序号超出范围' };
   }
 
-  // 客户端重试同一片时直接放过：R2 那边已经有一个同序号的 part，重复传只会白烧带宽
-  const existing = await listChunkParts(env.DB, uploadId);
-  if (existing.some((p) => p.part_number === part)) return { ok: true, part, skipped: true };
-
-  // 每片该有多少字节由会话行算出来，不信任客户端：第 1..N-1 片恒等于 part_size，末片是余数。
-  // Content-Length 只用来一次性对账，字节本身不进 JS —— 免费计划每请求 10ms 连续 CPU，
-  // 自己搬运 8 MiB 正好会跑成一段不中断的执行，线上表现为随机某几片 1102
+  // 片长由会话行算出来，不信任客户端：第 1..N-1 片恒等于 part_size，末片是余数
   const expected = part < task.total_parts ? task.part_size : task.size - task.part_size * (task.total_parts - 1);
   const declared = Number(c.req.header('Content-Length'));
   if (declared !== expected) {
@@ -192,7 +207,7 @@ export async function chunkPut(
   }
   if (!c.req.raw.body) throw { status: 422 as const, message: '分片内容为空' };
 
-  const mp = env.FILE_STORE.resumeMultipartUpload(`file:${task.code}`, uploadId);
+  const mp = env.FILE_STORE.resumeMultipartUpload(`file:${task.code}`, task.upload_id);
   let etag = '';
   try {
     ({ etag } = await mp.uploadPart(part, c.req.raw.body));
@@ -204,7 +219,10 @@ export async function chunkPut(
     throw e;
   }
 
-  await saveChunkPart(env.DB, uploadId, part, etag);
+  await env.DB.batch([
+    setSettingStatement(env.DB, rateKey, verdict.value),
+    saveChunkPartStatement(env.DB, task.upload_id, part, etag),
+  ]);
   return { ok: true, part };
 }
 

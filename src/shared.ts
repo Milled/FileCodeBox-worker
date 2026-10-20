@@ -139,7 +139,7 @@ export function quotaMessage(limits: { maxTotalStorage: number }): string {
  * 文件字节不进 JS：直接把 request.body 交给 R2。
  *
  * 为什么不能自己搬运：曾经用 FixedLengthStream + read/write 循环把 body 一段段喂给 R2，
- * 8 MiB 的一页就是几百次不中断的 isolate 唤醒。Workers 的 CPU 上限掐的是"连续执行的一段"
+ * 一片（8 或 16 MiB 都一样）就是几百次不中断的 isolate 唤醒。Workers 的 CPU 上限掐的是"连续执行的一段"
  * （await I/O 时计时会停），免费计划每请求只有 10ms —— 线上表现就是同一份文件一次成功
  * 一次 1102「exceededCpu」（失败的 cpuTimeMs 正好停在 10，成功的那条累计 386ms 反而没事：
  * 它的数据是陆续到达的，每读一块都挂起一次）。
