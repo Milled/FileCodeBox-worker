@@ -15,7 +15,7 @@ export async function initDB(db: D1Database): Promise<void> {
       created_at TEXT NOT NULL,
       ip TEXT DEFAULT ''
     )`,
-    'CREATE INDEX IF NOT EXISTS idx_fc_code ON fc_files(code)',
+    // code 本身是 UNIQUE，已有自动索引；不再重复建 idx_fc_code
     'CREATE INDEX IF NOT EXISTS idx_fc_expire ON fc_files(expire_at)',
     `CREATE TABLE IF NOT EXISTS fc_settings (
       key TEXT PRIMARY KEY,
@@ -64,6 +64,9 @@ export async function initDB(db: D1Database): Promise<void> {
     'ALTER TABLE fc_files ADD COLUMN is_text INTEGER DEFAULT 0',
     'ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0',
     ADD_SESSION_COLUMN,
+    // 必须在 ADD_SESSION_COLUMN 之后建，老库否则引用不存在的列
+    'CREATE INDEX IF NOT EXISTS idx_chunk_session ON fc_chunk_uploads(session_id)',
+    'CREATE INDEX IF NOT EXISTS idx_chunk_created ON fc_chunk_uploads(created_at)',
     ADD_USED_CODES_TS,
   ];
   // 一次 batch 建完全部表/索引：Free 计划每次调用只有 50 个子请求，
@@ -96,9 +99,10 @@ export async function getFileByCode(
   db: D1Database,
   code: string,
 ): Promise<FileRecord | null> {
+  // expire_at 统一是 ISO（UTC）字符串；直接比较可避免函数包列，保留索引/谓词能力
   return db
-    .prepare("SELECT * FROM fc_files WHERE code = ? AND datetime(expire_at) > datetime('now')")
-    .bind(code)
+    .prepare('SELECT * FROM fc_files WHERE code = ? AND expire_at > ?')
+    .bind(code, new Date().toISOString())
     .first<FileRecord>();
 }
 
@@ -121,10 +125,10 @@ export async function isCodeTaken(db: D1Database, code: string): Promise<boolean
     .prepare(`
       SELECT 1 FROM fc_used_codes WHERE code = ?
       UNION ALL
-      SELECT 1 FROM fc_files WHERE code = ? AND datetime(expire_at) > datetime('now')
+      SELECT 1 FROM fc_files WHERE code = ? AND expire_at > ?
       LIMIT 1
     `)
-    .bind(code, code)
+    .bind(code, code, new Date().toISOString())
     .first();
   return row !== null;
 }
@@ -177,9 +181,9 @@ export async function findCodeRun(db: D1Database, count: number): Promise<string
       .prepare(`
         SELECT code FROM fc_used_codes WHERE code IN (${placeholders})
         UNION
-        SELECT code FROM fc_files WHERE code IN (${placeholders}) AND datetime(expire_at) > datetime('now')
+        SELECT code FROM fc_files WHERE code IN (${placeholders}) AND expire_at > ?
       `)
-      .bind(...run, ...run)
+      .bind(...run, ...run, new Date().toISOString())
       .all<{ code: string }>();
     if ((taken.results ?? []).length === 0) return run;
   }
@@ -394,11 +398,16 @@ export async function listChunkTasks(db: D1Database): Promise<Array<ChunkTask & 
 }
 
 /** 超时未完成的会话（供 cron abort，避免已传分片一直计费） */
-export async function listStaleChunkTasks(db: D1Database, olderThanMs: number): Promise<ChunkTask[]> {
+export async function listStaleChunkTasks(
+  db: D1Database,
+  olderThanMs: number,
+  limit = 5,
+): Promise<ChunkTask[]> {
   const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  // LIMIT：每个会话 abort 要花数次子请求，一次 Cron 不能无限处理
   const rows = await db
-    .prepare('SELECT * FROM fc_chunk_uploads WHERE datetime(created_at) <= datetime(?)')
-    .bind(cutoff)
+    .prepare('SELECT * FROM fc_chunk_uploads WHERE created_at <= ? ORDER BY created_at LIMIT ?')
+    .bind(cutoff, limit)
     .all<ChunkTask>();
   return rows.results ?? [];
 }
@@ -447,7 +456,7 @@ export async function cleanupUsedCodes(
         WHERE code NOT IN (SELECT code FROM fc_files)
           AND code NOT IN (SELECT code FROM fc_chunk_uploads)
           AND created_at IS NOT NULL
-          AND datetime(created_at) <= datetime(?)
+          AND created_at <= ?
       `)
       .bind(cutoff);
   try {
@@ -550,7 +559,7 @@ export async function countActiveChunkSessions(
   const row = await db
     .prepare(`
       SELECT COUNT(*) AS n FROM fc_chunk_uploads
-      WHERE ip = ? AND datetime(created_at) > datetime(?)
+      WHERE ip = ? AND created_at > ?
     `)
     .bind(ip, cutoff)
     .first<{ n: number }>();
@@ -648,12 +657,17 @@ export async function getDashboardStats(db: D1Database): Promise<{
 
 // ---- 过期清理 ----
 
+/** 每轮最多处理多少过期文件；R2 批删 + DB batch + 计数要控制在子请求预算内 */
+const CLEANUP_EXPIRED_LIMIT = 2000;
+
 export async function cleanupExpired(
   db: D1Database,
   bucket: R2Bucket,
 ): Promise<{ expiredCount: number }> {
+  const cutoff = new Date().toISOString();
   const expired = await db
-    .prepare("SELECT * FROM fc_files WHERE datetime(expire_at) <= datetime('now')")
+    .prepare('SELECT * FROM fc_files WHERE expire_at <= ? ORDER BY expire_at LIMIT ?')
+    .bind(cutoff, CLEANUP_EXPIRED_LIMIT)
     .all<FileRecord>();
   const files = expired.results ?? [];
   if (files.length === 0) return { expiredCount: 0 };
@@ -668,10 +682,19 @@ export async function cleanupExpired(
   // 不在这里逐个 releaseCode：过期文件一多，N 次 D1 调用会直接撞上 Free 计划
   // 每次 50 个子请求的上限。cleanupUsedCodes 用一条 SQL 统一回收，
   // 并且在 scheduled/admin 清理里独立执行，不再依赖“本次确实有文件过期”。
-  // 记录删除与容量计数放同一个 batch，避免半套状态
-  const remove = db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')");
+  // 按 id 精确删除本轮选中的行，并和容量计数放同一个 batch；D1 每条 SQL 最多 100 个绑定参数
+  const stmts: D1PreparedStatement[] = [];
+  for (let i = 0; i < files.length; i += 100) {
+    const ids = files.slice(i, i + 100).map((f) => f.id);
+    stmts.push(
+      db
+        .prepare(`DELETE FROM fc_files WHERE id IN (${ids.map(() => '?').join(',')})`)
+        .bind(...ids),
+    );
+  }
   const adjust = adjustStorageUsedStatement(db, -files.reduce((s, f) => s + (f.size || 0), 0));
-  await db.batch(adjust ? [remove, adjust] : [remove]);
+  if (adjust) stmts.push(adjust);
+  await db.batch(stmts);
 
   return { expiredCount: files.length };
 }
@@ -824,6 +847,9 @@ export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
 
 // ---- 孤儿 R2 对象清理 ----
 
+/** 每轮最多删多少个孤儿对象；剩余的下轮继续，避免一次 Cron 打满子请求预算 */
+const CLEANUP_ORPHAN_DELETE_LIMIT = 2000;
+
 /**
  * 列出 R2 中 file: / thumb: 前缀的对象，对比 D1 记录，删除孤儿对象。
  * 每批最多处理 1000 个键（R2 list 上限），超量时保留到下次 scheduled。
@@ -865,9 +891,11 @@ export async function cleanupOrphanedR2Objects(
   const now = Date.now();
   const orphanKeys = objects
     .filter((o) => !activeCodes.has(o.code) && now - o.uploaded.getTime() > GRACE_MS)
-    .map((o) => o.key);
+    .map((o) => o.key)
+    .slice(0, CLEANUP_ORPHAN_DELETE_LIMIT);
   const removedSet = new Set(orphanKeys);
-  // 顺带得出实测占用，供 scheduled 回写计数器做对账（不额外多扫一遍桶）
+  // 顺带得出实测占用，供 scheduled 回写计数器做对账（不额外多扫一遍桶）。
+  // 本轮没删的孤儿仍计入占用，避免为了“删不完”而把计数器压低。
   const usedBytes = objects.reduce((s, o) => s + (removedSet.has(o.key) ? 0 : o.size), 0);
   if (orphanKeys.length === 0) return { scanned: objects.length, removed: 0, usedBytes };
 

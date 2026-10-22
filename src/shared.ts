@@ -19,6 +19,7 @@ import {
   releaseCode,
   checkRateLimit,
   consumeDailyUpload,
+  adjustStorageUsed,
   getPendingChunkBytes,
   getSetting,
   getStorageUsed,
@@ -438,17 +439,79 @@ export async function downloadFile(
  * 这里只负责收下并落 R2，因此校验的是「别拿它当免费图床」。
  */
 const THUMB_MAX_BYTES = 128 * 1024;
+const THUMB_MAX_EDGE = 1024;
+const THUMB_MAX_PIXELS = 1024 * 1024;
 
-/** 只认这三种容器格式的头，不信任客户端声明的 Content-Type */
-function sniffImageType(buf: ArrayBuffer): string | null {
-  const b = new Uint8Array(buf, 0, Math.min(buf.byteLength, 12));
+/**
+ * 只认这三种容器格式的头，不信任客户端声明的 Content-Type。
+ * 同时解析真实宽高：128KB 的 PNG 可以声明成几万像素的“解压炸弹”，
+ * 收件人浏览器一渲染就会吃满内存。客户端 canvas 的产物只有 480px，1024 上限足够。
+ */
+function sniffThumb(buf: ArrayBuffer): { type: string; width: number; height: number } | null {
+  const b = new Uint8Array(buf);
   const ascii = (o: number, s: string) => {
     for (let i = 0; i < s.length; i++) if (b[o + i] !== s.charCodeAt(i)) return false;
     return true;
   };
-  if (b.length >= 12 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) return 'image/webp';
-  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
-  if (b.length >= 6 && b[0] === 0x89 && ascii(1, 'PNG') && b[4] === 0x0d && b[5] === 0x0a) return 'image/png';
+  const u32be = (o: number) =>
+    ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+  const le24 = (o: number) => b[o] | (b[o + 1] << 8) | (b[o + 2] << 16);
+
+  // WebP：浏览器 canvas 主要输出 VP8 / VP8L，带 alpha 时是 VP8X
+  if (b.length >= 30 && ascii(0, 'RIFF') && ascii(8, 'WEBP')) {
+    const chunk = String.fromCharCode(b[12], b[13], b[14], b[15]);
+    if (chunk === 'VP8X') {
+      return { type: 'image/webp', width: 1 + le24(24), height: 1 + le24(27) };
+    }
+    if (chunk === 'VP8 ') {
+      if (b[23] !== 0x9d || b[24] !== 0x01 || b[25] !== 0x2a) return null;
+      return {
+        type: 'image/webp',
+        width: (b[26] | (b[27] << 8)) & 0x3fff,
+        height: (b[28] | (b[29] << 8)) & 0x3fff,
+      };
+    }
+    if (chunk === 'VP8L' && b.length >= 25 && b[20] === 0x2f) {
+      const bits = (b[21] | (b[22] << 8) | (b[23] << 16) | (b[24] << 24)) >>> 0;
+      return {
+        type: 'image/webp',
+        width: 1 + (bits & 0x3fff),
+        height: 1 + ((bits >>> 14) & 0x3fff),
+      };
+    }
+    return null;
+  }
+
+  // JPEG：遍历段找 SOFn，读到宽高即停
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+    let i = 2;
+    while (i + 3 < b.length) {
+      if (b[i] !== 0xff) { i++; continue; }
+      while (i < b.length && b[i] === 0xff) i++;
+      if (i >= b.length) return null;
+      const marker = b[i++];
+      // 无长度段的标记
+      if (marker === 0xd8 || marker === 0xd9 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (marker === 0xda) return null;
+      if (i + 1 >= b.length) return null;
+      const len = (b[i] << 8) | b[i + 1];
+      if (len < 2 || i + len > b.length) return null;
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        if (i + 7 > b.length) return null;
+        return {
+          type: 'image/jpeg',
+          height: (b[i + 3] << 8) | b[i + 4],
+          width: (b[i + 5] << 8) | b[i + 6],
+        };
+      }
+      i += len;
+    }
+    return null;
+  }
+
+  if (b.length >= 24 && b[0] === 0x89 && ascii(1, 'PNG') && b[4] === 0x0d && b[5] === 0x0a && ascii(12, 'IHDR')) {
+    return { type: 'image/png', width: u32be(16), height: u32be(20) };
+  }
   return null;
 }
 
@@ -487,11 +550,37 @@ export async function saveThumb(
   if (body.byteLength === 0) throw { status: 422 as const, message: '缩略图为空' };
   if (body.byteLength > THUMB_MAX_BYTES) throw { status: 413 as const, message: '缩略图过大' };
 
-  const contentType = sniffImageType(body);
-  if (!contentType) throw { status: 415 as const, message: '缩略图仅支持 WebP/JPEG/PNG' };
+  const image = sniffThumb(body);
+  if (!image) throw { status: 415 as const, message: '缩略图仅支持 WebP/JPEG/PNG' };
+  if (
+    !Number.isInteger(image.width) ||
+    !Number.isInteger(image.height) ||
+    image.width <= 0 ||
+    image.height <= 0 ||
+    image.width > THUMB_MAX_EDGE ||
+    image.height > THUMB_MAX_EDGE ||
+    image.width * image.height > THUMB_MAX_PIXELS
+  ) {
+    throw { status: 415 as const, message: `缩略图尺寸过大（最大 ${THUMB_MAX_EDGE}px 长边 / 1MP）` };
+  }
 
-  await env.FILE_STORE.put(`thumb:${code}`, body, { httpMetadata: { contentType } });
+  // 已有缩略图不允许覆盖：任何知道取件码的人都能改图，会导致展示内容被替换
+  if (file.has_thumb === 1) {
+    throw { status: 409 as const, message: '缩略图已存在，不能覆盖' };
+  }
+
+  // 缩略图同样落 R2，必须占配额；它是独立对象，不与主文件共享容量计数
+  const limits = await resolveLimits(env);
+  if (body.byteLength > (await remainingQuota(env, limits.maxTotalStorage))) {
+    throw { status: 507 as const, message: quotaMessage(limits) };
+  }
+
+  await env.FILE_STORE.put(`thumb:${code}`, body, { httpMetadata: { contentType: image.type } });
   await markThumb(env.DB, code);
+  // 立即计入计数器；删除/过期时未同步扣减的缩略图由 30 分钟一次的对账修正
+  await adjustStorageUsed(env.DB, body.byteLength).catch((e) => {
+    console.error('[thumb] storage adjust failed:', String((e as any)?.message ?? e));
+  });
   return { code, size: body.byteLength };
 }
 

@@ -1268,7 +1268,7 @@ export function adminPanel(
           <button type="submit" class="btn btn-secondary btn-sm">全部放弃</button>
         </form>
       </div>
-      <div class="setting-desc">这些是还没传完的分片，不占文件列表也不出现在 R2 面板里，只有放弃（abort）才会释放其存储占用。若有人正在上传请勿误点。</div>
+      <div class="setting-desc">这些是还没传完的分片，不占文件列表也不出现在 R2 面板里，只有放弃（abort）才会释放其存储占用。若有人正在上传请勿误点。「全部放弃」每批最多处理 8 个，列表仍有残留时再点一次。</div>
       ${sessionRows}
     </div>`
     : '';

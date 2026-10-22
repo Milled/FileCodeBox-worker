@@ -549,14 +549,14 @@ app.post('/admin/cleanup', async (c) => {
     ['used_codes', () => cleanupUsedCodes(env.DB)],
     // 也要扫超时未完成的分片会话：它们不是对象，孤儿扫描看不见
     ['stale_chunks', () => cleanupStaleChunkUploads(env)],
+    // 限流/配额行先清，成本低且不该被后面的全桶扫描拖累
+    ['rate_limits', () => cleanupRateLimitEntries(env.DB)],
     // 与 Cron 同一条路径：顺带清孤儿对象并把 storage_used 对账成 R2 实测值。
     // 新部署或计数器漂移时，管理员点一次就能拿到准确数字，不必等半小时
     ['orphans', async () => {
       const { usedBytes, scanned } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
       if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
     }],
-    // 顺带清限流键与旧的每日上传配额行
-    ['rate_limits', () => cleanupRateLimitEntries(env.DB)],
   ];
   let budgetExhausted = false;
   for (const [name, run] of stages) {
@@ -643,17 +643,19 @@ export default {
         await stage('stale_chunks', async () => {
           summary.staleChunks = await cleanupStaleChunkUploads(env);
         });
+        // 限流/配额行先清，成本低且不该被后面的全桶扫描拖累
+        await stage('rate_limits', async () => {
+          summary.rateLimitCleaned = await cleanupRateLimitEntries(env.DB);
+        });
         // 对账：孤儿扫描已经逐页累加了实测占用，直接改写计数器，
-        // 修掉增量计数器在异常路径上可能攒出的漂移（0 表示桶确实空了，不是"没扫到"）
+        // 修掉增量计数器在异常路径上可能攒出的漂移（0 表示桶确实空了，不是"没扫到"）。
+        // 放在最后：10,000 个对象时 list 页数最多，若撞到子请求上限也只影响对账
         await stage('orphans', async () => {
           const { scanned, removed, usedBytes } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
           summary.r2Scanned = scanned;
           summary.r2Removed = removed;
           summary.storageUsed = usedBytes;
           if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
-        });
-        await stage('rate_limits', async () => {
-          summary.rateLimitCleaned = await cleanupRateLimitEntries(env.DB);
         });
         console.log(JSON.stringify(summary));
       })(),

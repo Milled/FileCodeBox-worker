@@ -65,6 +65,35 @@ export async function thumbnailSuite(browser) {
     thumb.headers()['cache-control']);
   s.note(`原图 900x600 噪声 PNG → 缩略图 ${fmtBytes(thumbBytes.length)}`);
 
+  // 已有缩略图不能被任何知道取件码的人覆盖
+  const overwrite = await page.evaluate(async (code) => {
+    const r = await fetch('/api/thumb/' + code);
+    const bytes = await r.arrayBuffer();
+    const p = await fetch('/api/thumb/' + code, {
+      method: 'POST',
+      body: new Blob([bytes], { type: 'image/webp' }),
+    });
+    return p.status;
+  }, photo);
+  s.ok('已有缩略图不能被覆盖', overwrite === 409, String(overwrite));
+
+  // 128KB 的 PNG 可以声明成几万像素；必须在落 R2 前按真实宽高拒绝
+  const bomb = await page.evaluate(async (code) => {
+    const b = new Uint8Array(33);
+    b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    b.set([0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52], 8);
+    const dv = new DataView(b.buffer);
+    dv.setUint32(16, 10000);
+    dv.setUint32(20, 10000);
+    b.set([8, 6, 0, 0, 0], 24);
+    const r = await fetch('/api/thumb/' + code, {
+      method: 'POST',
+      body: new Blob([b], { type: 'image/png' }),
+    });
+    return r.status;
+  }, photo);
+  s.ok('超大尺寸缩略图被拒', bomb === 415 || bomb === 413, String(bomb));
+
   // ---- 收件人页面同样预览 ----
   await page.goto(`${BASE}/r/${photo}`, { waitUntil: 'networkidle' });
   s.ok('收件人取件页显示缩略图', (await page.locator('img.file-thumb').count()) === 1);

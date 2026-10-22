@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS fc_files (
   has_thumb INTEGER DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_fc_code ON fc_files(code);
 CREATE INDEX IF NOT EXISTS idx_fc_expire ON fc_files(expire_at);
 
 CREATE TABLE IF NOT EXISTS fc_settings (
@@ -71,3 +70,6 @@ CREATE TABLE IF NOT EXISTS fc_chunk_parts (
   created_at TEXT NOT NULL,
   PRIMARY KEY (upload_id, part_number)
 );
+
+CREATE INDEX IF NOT EXISTS idx_chunk_session ON fc_chunk_uploads(session_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_created ON fc_chunk_uploads(created_at);

@@ -433,9 +433,9 @@ export async function abortChunkSession(env: Env, uploadId: string): Promise<boo
   return forceAbort(env, task);
 }
 
-/** 后台「放弃全部进行中会话」 */
+/** 后台「放弃全部进行中会话」：每次最多 8 个，剩余的再点一次（每个 abort 都要花子请求） */
 export async function abortAllChunkSessions(env: Env): Promise<number> {
-  const tasks = await listChunkTasks(env.DB);
+  const tasks = (await listChunkTasks(env.DB)).slice(0, 8);
   let closed = 0;
   for (const task of tasks) {
     try {
