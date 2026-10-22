@@ -164,7 +164,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 | POST | `/api/upload/chunk/abort/:session` | 放弃会话，释放预留的取件码与配额 |
 | GET | `/api/text/:code` · `/api/download/:code` | 取文本 / 下载文件（支持 HEAD） |
 | GET | `/api/info/:code` | 文件信息（JSON） |
-| GET | `/api/codes/:count` | 为多文件批次取一段未被占用的连号码（2–20） |
+| GET | `/api/codes/:count` | 为多文件批次取一段未被占用的连号码（2–10） |
 | GET / POST | `/api/thumb/:code` | 读取 / 写入图片缩略图 |
 | GET | `/qrcode/:code` | 取件链接二维码（GIF） |
 | GET | `/admin` · `/admin/settings` | 后台面板（含进行中的分片会话列表）与设置页 |
@@ -234,7 +234,7 @@ npm run dev           # http://localhost:8787
 
 改代码时有两个坑：
 
-- 样式是 `src/templates/style.ts` 里的一个字符串，且响应带 `immutable` 长缓存 —— 改完必须递增 `src/templates/layout.ts` 里的 `style.css?v=N`，否则浏览器与 CDN 会一直命中旧样式。
+- 样式是 `src/templates/style.ts` 里的一个字符串，且响应带 `immutable` 长缓存；`layout.ts` 会用内容哈希自动生成 `style.css?v=...`，改样式无需手工递增版本号。
 - 页面脚本写在 JS 模板字符串里，正则中的 `\/` 会被模板吃掉一层转义，容易生成非法正则；改用不含斜杠的写法或再转义一次。
 
 已知工具链问题：本地 `wrangler dev` 的 miniflare proxy 遇到 **chunked 请求体**（无 Content-Length）会整体崩掉，日志里只有一条空 ERROR。这是 wrangler 的问题不是应用缺陷，但也意味着"没有 Content-Length 时走缓冲回退"这条分支在本地测不到。
@@ -244,7 +244,7 @@ npm run dev           # http://localhost:8787
 ```bash
 npm run typecheck     # tsc --noEmit
 npm test              # 主流程冒烟（Playwright 无头）
-npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片 / 安全加固，共 174 项断言
+npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片 / 安全加固，共 181 项断言
 ```
 
 用例假设本地服务已启动且表已建好：
@@ -258,7 +258,7 @@ BASE_URL=http://127.0.0.1:8790 npm run test:ui
 
 这些用例会**真实上传文件并修改后台设置**，因此默认只允许打本机地址；测自己的线上环境需显式加 `ALLOW_REMOTE=1`。可用环境变量：`BASE_URL`、`ADMIN_PASSWORD`、`SHOT_DIR`（输出全页截图）。
 
-本地测试会给每个页面上下文分配独立的伪 `CF-Connecting-IP`，让上传/查询限流桶互不干扰，因此默认不再每次等待 60 秒限流窗口；完整的 174 项回归通常 2–4 分钟跑完。测远程时 Cloudflare 会覆盖这个头，需要加 `REAL_RATE_LIMITS=1` 恢复「共享真实 IP + 等待窗口」的串行模式；`SKIP_RATE_WAIT=1` 只在该模式下跳过等待。
+本地测试会给每个页面上下文分配独立的伪 `CF-Connecting-IP`，让上传/查询限流桶互不干扰，因此默认不再每次等待 60 秒限流窗口；完整的 181 项回归通常 2–4 分钟跑完。测远程时 Cloudflare 会覆盖这个头，需要加 `REAL_RATE_LIMITS=1` 恢复「共享真实 IP + 等待窗口」的串行模式；`SKIP_RATE_WAIT=1` 只在该模式下跳过等待。
 
 ---
 

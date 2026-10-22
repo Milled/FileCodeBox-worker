@@ -92,6 +92,12 @@ export async function chunkedSuite(browser) {
       `${done.status} code=${done.json?.code} size=${done.json?.size}`);
     const code = done.json?.code;
 
+    // 响应丢失后的重试必须幂等：会话行已删，但短期回执还能返回同一个 code/size
+    const doneAgain = await call(`/api/upload/chunk/complete/${sess.session}`, { method: 'POST' });
+    s.ok('complete 重试幂等（返回同一取件码与大小）',
+      doneAgain.status === 200 && doneAgain.json?.code === code && doneAgain.json?.size === BIG,
+      `${doneAgain.status} code=${doneAgain.json?.code} size=${doneAgain.json?.size}`);
+
     const info = await apiJson(page, `/api/info/${code}`);
     s.ok('70MiB 文件在后台是一个文件、一个码', info.json?.size === BIG, `size=${info.json?.size} name=${info.json?.filename}`);
 

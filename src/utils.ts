@@ -27,6 +27,49 @@ export function escapeHtml(str: string): string {
     .replace(/'/g, '&#39;');
 }
 
+/**
+ * 清理孤立 UTF-16 代理字符，并按 code point 截断。
+ * 文件名的 X-Filename 可以 percent-encode 出孤立代理（如 %ED%A0%80），
+ * 直接存库后再 encodeURIComponent 会抛 URIError，整个下载变成 500。
+ */
+export function sanitizeFilename(name: string, maxChars = 200): string {
+  const chars = Array.from(name, (ch) => {
+    const cp = ch.codePointAt(0)!;
+    return cp >= 0xd800 && cp <= 0xdfff ? '\uFFFD' : ch;
+  });
+  return chars.slice(0, maxChars).join('');
+}
+
+/** Content-Disposition 的 RFC 5987 编码；对历史脏数据也做一次兜底清理 */
+export function encodeFilename(name: string): string {
+  return encodeURIComponent(sanitizeFilename(name, 512));
+}
+
+/** 页面上可安全展示的错误：4xx/5xx 业务错误保留文案，未知异常统一 500 */
+export function toPublicError(
+  e: unknown,
+  fallback = '服务器内部错误',
+): { status: number; message: string } {
+  const err = e as { status?: unknown; message?: unknown };
+  const status = typeof err?.status === 'number' ? err.status : 500;
+  if (status >= 400 && status < 600 && typeof err?.message === 'string') {
+    return { status, message: status === 500 ? fallback : err.message };
+  }
+  return { status: 500, message: fallback };
+}
+
+/** 解析分页/数量类 query，非法值回退，避免 NaN 直接传给 D1 变 500 */
+export function parseIntParam(
+  raw: string | undefined,
+  fallback: number,
+  min = 1,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const n = parseInt(raw ?? '', 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
 /** PBKDF2 哈希密码（固定盐 + 10 万次迭代，抗暴力破解） */
 const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_SALT = new TextEncoder().encode('filecodebox-admin-v1');

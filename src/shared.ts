@@ -6,7 +6,7 @@ import type { Context } from 'hono';
 import { getCookie } from 'hono/cookie';
 import type { Env } from './types';
 import type { FileRecord } from './types';
-import { isValidCode, generateCode, getClientIp, formatFileSize } from './utils';
+import { isValidCode, generateCode, getClientIp, formatFileSize, sanitizeFilename } from './utils';
 import { adminAuth } from './auth';
 import {
   getFileByCode,
@@ -326,7 +326,7 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   } catch {
     /* 保留原始值 */
   }
-  filename = filename.slice(0, 200);
+  filename = sanitizeFilename(filename || '未命名', 200);
   const mimeType = c.req.header('Content-Type') || 'application/octet-stream';
 
   const maxSize = limits.maxSize;
@@ -528,8 +528,8 @@ export async function readThumb(
 
 // ===================== 连号取件码 =====================
 
-/** 一次批次能要多少个连号码：与前端多选规模一致，也防止这个端点被当枚举器刷 */
-const MAX_CODE_RUN = 20;
+/** 一次批次能要多少个连号码：与前端多选/上传限流（10 次/分钟）一致，也防止被当枚举器刷 */
+const MAX_CODE_RUN = 10;
 
 /**
  * 给多文件批次分配一段连号且未被占用的取件码。
@@ -606,7 +606,11 @@ export async function uploadText(
 
   await consumeUploadQuota(c, env, isAdmin);
   const code = await ensureCodeAvailable(rawCode, env);
-  const title = text.replace(/\s+/g, ' ').slice(0, 50) + (text.length > 50 ? '…' : '');
+  // 标题会作为 filename 用于下载头；同样要清理孤立代理字符
+  const title = sanitizeFilename(
+    text.replace(/\s+/g, ' ').slice(0, 50) + (text.length > 50 ? '…' : ''),
+    60,
+  );
 
   try {
     await env.FILE_STORE.put(`file:${code}`, text, {

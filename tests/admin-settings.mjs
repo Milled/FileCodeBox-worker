@@ -76,6 +76,10 @@ export async function adminSettingsSuite(browser) {
     const asAdmin = await apiJson(page, '/api/upload', { method: 'POST', body: '管理员内容', headers: { 'X-Filename': 'admin.txt' } });
     s.ok('管理员会话仍可上传', asAdmin.status === 200 && /^\d{4}$/.test(asAdmin.json?.code || ''), asAdmin.body);
 
+    await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+    s.ok('关闭游客上传后管理员首页仍显示上传区',
+      (await page.locator('#uploadForm').count()) === 1 && (await page.locator('.empty-state').count()) === 0);
+
     // ---- 上限覆盖与回退（先恢复游客上传，否则匿名请求会先撞上 openUpload 的 401） ----
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
     await page.selectOption('select[name="openUpload"]', '1');

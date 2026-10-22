@@ -32,6 +32,7 @@ export async function securityHardeningSuite(browser) {
   let capPage = null;
   let textCode = '';
   let hugeCode = '';
+  let weirdCode = '';
   let session = '';
 
   try {
@@ -201,6 +202,60 @@ export async function securityHardeningSuite(browser) {
     s.ok('被限流期间，有效取件码仍可正常查询',
       validAfterBlock.status === 200 && validAfterBlock2.status === 200,
       `${validAfterBlock.status}/${validAfterBlock2.status}`);
+
+    // ---- 7. openUpload 布尔值与后台非法分页 ----
+    const setFalse = await call('/api/admin/config/update', {
+      method: 'PATCH',
+      headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ openUpload: false }),
+    }, adminIp);
+    // 安全套件的页面在登录接口后已经带上 admin cookie，必须用无 Cookie 的 Node 请求验证游客视角
+    const blocked = await fetch(`${BASE}/api/upload?expire_value=1`, {
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': bodyIp, 'X-Filename': 'blocked.txt' },
+      body: 'x',
+    });
+    const blockedBody = await blocked.text();
+    const setTrue = await call('/api/admin/config/update', {
+      method: 'PATCH',
+      headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ openUpload: true }),
+    }, adminIp);
+    s.ok('布尔 false 真正关闭游客上传',
+      setFalse.status === 200 && setFalse.json?.detail?.openUpload === '0'
+      && blocked.status === 401 && /游客上传已关闭/.test(blockedBody),
+      `${setFalse.status}/${blocked.status} ${blockedBody.slice(0, 50)}`);
+    s.ok('布尔 true 恢复游客上传',
+      setTrue.status === 200 && setTrue.json?.detail?.openUpload === '1', setTrue.body.slice(0, 80));
+
+    const badPage = await call('/api/admin/file/list?page=abc&size=abc', { headers: adminHeaders }, adminIp);
+    const adminPageRes = await fetch(`${BASE}/admin?page=abc`, {
+      headers: { 'CF-Connecting-IP': adminIp, ...adminHeaders },
+    });
+    await adminPageRes.text();
+    s.ok('非法分页参数回退而不是 500',
+      badPage.status === 200 && badPage.json?.detail?.page === 1 && badPage.json?.detail?.size === 10,
+      `${badPage.status} ${badPage.body.slice(0, 80)}`);
+    s.ok('后台非法分页参数返回 200', adminPageRes.status === 200, String(adminPageRes.status));
+
+    // ---- 8. 孤立代理文件名不能把下载变成 500 ----
+    const weird = await call('/api/upload?expire_value=1', {
+      method: 'POST',
+      headers: { 'X-Filename': '%ED%A0%80evil.bin' },
+      body: 'x',
+    }, bodyIp);
+    weirdCode = weird.json?.code || '';
+    let weirdDownload = { status: 0, disposition: '' };
+    if (weirdCode) {
+      const dl = await fetch(`${BASE}/api/download/${weirdCode}`, { headers: { 'CF-Connecting-IP': bodyIp } });
+      weirdDownload.status = dl.status;
+      weirdDownload.disposition = dl.headers.get('content-disposition') || '';
+      await dl.arrayBuffer();
+    }
+    s.ok('孤立代理文件名的文件仍可下载',
+      weird.status === 200 && weirdDownload.status === 200 && /filename\*=UTF-8''/.test(weirdDownload.disposition),
+      `${weird.status}/${weirdDownload.status} ${weirdDownload.disposition}`);
+
     await s.assertClean(page);
   } finally {
     if (session) await call(`/api/upload/chunk/abort/${session}`, { method: 'POST' }, chunkIp).catch(() => {});
@@ -212,8 +267,14 @@ export async function securityHardeningSuite(browser) {
       await capPage.close().catch(() => {});
     }
     if (Object.keys(adminHeaders).length) {
+      // 若前面的断言中途失败，确保不把本地环境留在“关闭游客上传”状态
+      await call('/api/admin/config/update', {
+        method: 'PATCH',
+        headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ openUpload: true }),
+      }, adminIp).catch(() => {});
       const list = await call('/api/admin/file/list?size=100', { headers: adminHeaders }, adminIp).catch(() => null);
-      for (const code of [textCode, hugeCode]) {
+      for (const code of [textCode, hugeCode, weirdCode]) {
         const row = (list?.json?.detail?.data || []).find((f) => f.code === code);
         if (row) {
           await call(`/api/admin/file/delete?id=${row.id}`, { method: 'DELETE', headers: adminHeaders }, adminIp).catch(() => {});

@@ -1,3 +1,15 @@
+import { STYLE } from './style';
+
+/** CSS 内容哈希：改样式自动换 URL，不再依赖手工递增 style.css?v=N */
+const STYLE_VERSION = (() => {
+  let h = 2166136261;
+  for (let i = 0; i < STYLE.length; i++) {
+    h ^= STYLE.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+})();
+
 /**
  * 通用 HTML 布局包装器：只负责容器宽度与页脚。
  * 卡片由页面自己包（首页是三张，其余页面一张），所以这里不再套 .card。
@@ -20,7 +32,7 @@ export function layout(title: string, content: string, showFooter = true, wide =
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${title}</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2318181b'/><path d='M7 12h18v11a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2z' fill='%23f4f4f5'/><path d='M6 8h20v4H6z' fill='%23e4e4e7'/><path d='M14 8h4v18h-4z' fill='%23a1a1aa'/></svg>">
-  <link rel="stylesheet" href="/static/style.css?v=21">
+  <link rel="stylesheet" href="/static/style.css?v=${STYLE_VERSION}">
 </head>
 <body>
   <div class="container${wide ? ' container-wide' : ''}">

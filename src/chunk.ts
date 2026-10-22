@@ -12,7 +12,7 @@
  */
 import type { Context } from 'hono';
 import type { ChunkTask, Env } from './types';
-import { getClientIp } from './utils';
+import { getClientIp, sanitizeFilename } from './utils';
 import {
   assertBodyWithinLimit,
   assertUploadAllowed,
@@ -27,6 +27,8 @@ import {
   countActiveChunkSessions,
   checkRateLimit,
   deleteChunkTask,
+  getFileByCode,
+  getChunkReceipt,
   getChunkTask,
   getChunkTaskBySession,
   getChunkTaskStatement,
@@ -40,6 +42,7 @@ import {
   rateLimitStatementFor,
   releaseCode,
   saveChunkPartStatement,
+  saveChunkReceipt,
 } from './db';
 
 /** 分片自己的限流额度（每 60 秒）：一次会话可能有上百片，共用上传桶会把自己掐死 */
@@ -146,7 +149,7 @@ export async function chunkInit(
   } catch {
     /* 保留原始值 */
   }
-  filename = (filename || '未命名').slice(0, 200);
+  filename = sanitizeFilename(filename || '未命名', 200);
   const mimeType = (typeof body.content_type === 'string' && body.content_type) || 'application/octet-stream';
   const { expireAt, maxDownloads } = expireFrom(body, limits.defaultExpireDays);
 
@@ -263,7 +266,37 @@ export async function chunkComplete(
   env: Env,
 ): Promise<{ code: string; filename: string; size: number }> {
   await assertChunkMetaRate(c, env);
-  const task = await resolveTask(c, env);
+  const sessionId = sessionIdOf(c);
+  const task = await getChunkTaskBySession(env.DB, sessionId);
+  if (!task) {
+    // complete 成功但响应丢失/收尾失败：用短期回执返回同一结果，而不是 404
+    const receipt = await getChunkReceipt(env.DB, sessionId);
+    const file = receipt ? await getFileByCode(env.DB, receipt.code) : null;
+    if (receipt && file) {
+      return { code: file.code, filename: file.filename, size: file.size };
+    }
+    throw { status: 404 as const, message: '上传会话不存在或已结束' };
+  }
+
+  // 文件已经落库但会话行还在（上次收尾/删行失败）：直接补收尾并返回已有结果
+  if (await hasFileRecord(env.DB, task.code)) {
+    const file = await getFileByCode(env.DB, task.code);
+    const result = {
+      code: task.code,
+      filename: file?.filename ?? task.filename,
+      size: file?.size ?? task.size,
+    };
+    let receiptSaved = false;
+    try {
+      await saveChunkReceipt(env.DB, task.session_id, result);
+      receiptSaved = true;
+    } catch (e) {
+      console.error('[chunk] receipt save failed:', String((e as any)?.message ?? e));
+    }
+    if (receiptSaved) await deleteChunkTask(env.DB, task.upload_id);
+    return result;
+  }
+
   const uploadId = task.upload_id;
 
   const parts = await listChunkParts(env.DB, uploadId);
@@ -303,8 +336,18 @@ export async function chunkComplete(
     throw e;
   }
 
-  await deleteChunkTask(env.DB, uploadId);
-  return { code: task.code, filename: task.filename, size };
+  const result = { code: task.code, filename: task.filename, size };
+  let receiptSaved = false;
+  try {
+    await saveChunkReceipt(env.DB, task.session_id, result);
+    receiptSaved = true;
+  } catch (e) {
+    // 回执只是幂等缓存；写失败不能把已经成功的文件判成失败
+    console.error('[chunk] receipt save failed:', String((e as any)?.message ?? e));
+  }
+  // 回执没写成时保留会话行：重试会走“已有文件记录”分支补回执
+  if (receiptSaved) await deleteChunkTask(env.DB, uploadId);
+  return result;
 }
 
 /** 客户端主动放弃：清会话、释放取件码。已经结束的会话重复放弃也返回成功（页面卸载会兜底再发一次） */
@@ -329,8 +372,18 @@ const NO_SUCH_UPLOAD_RE = /no such upload|nosuchupload|does not exist|not found/
  * 它会永久计费且 R2 面板/孤儿扫描都看不见。保留后 Cron/管理员可以重试。
  */
 async function forceAbort(env: Env, task: ChunkTask): Promise<boolean> {
-  // 已有同名文件记录：complete 已经成功，multipart 已结束，只清理会话行，绝不能 abort 对象
+  // 已有同名文件记录：complete 已经成功，multipart 已结束，只清理会话行，绝不能 abort 对象。
+  // 顺便留一份回执，客户端丢响应后重试 complete 仍能拿到结果
   if (await hasFileRecord(env.DB, task.code)) {
+    try {
+      await saveChunkReceipt(env.DB, task.session_id, {
+        code: task.code,
+        filename: task.filename,
+        size: task.size,
+      });
+    } catch (e) {
+      console.error('[chunk] receipt save failed:', String((e as any)?.message ?? e));
+    }
     await deleteChunkTask(env.DB, task.upload_id);
     return true;
   }

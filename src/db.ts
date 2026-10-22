@@ -154,8 +154,12 @@ export async function claimCode(db: D1Database, code: string): Promise<boolean> 
 }
 
 /** 释放取件码（删除/过期后允许复用） */
+export function releaseCodeStatement(db: D1Database, code: string): D1PreparedStatement {
+  return db.prepare('DELETE FROM fc_used_codes WHERE code = ?').bind(code);
+}
+
 export async function releaseCode(db: D1Database, code: string): Promise<void> {
-  await db.prepare('DELETE FROM fc_used_codes WHERE code = ?').bind(code).run();
+  await releaseCodeStatement(db, code).run();
 }
 
 /**
@@ -197,7 +201,7 @@ export async function insertFile(
     clientIp?: string;
   },
 ): Promise<void> {
-  await db
+  const insert = db
     .prepare(
       'INSERT INTO fc_files(code, filename, size, mime_type, expire_at, max_downloads, created_at, ip, is_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
     )
@@ -211,11 +215,10 @@ export async function insertFile(
       new Date().toISOString(),
       file.clientIp ?? '',
       file.isText ?? 0,
-    )
-    .run();
-  // 新记录即新占用。计数器只在 insertFile / deleteFileRecord / cleanupExpired
-  // 这三个唯一出入口上增减，避免漏记与重复记
-  await adjustStorageUsed(db, file.size);
+    );
+  // 插入与容量计数必须同一个事务：否则第二步失败会留下“有记录、无对象”的悬挂文件
+  const adjust = adjustStorageUsedStatement(db, file.size);
+  await db.batch(adjust ? [insert, adjust] : [insert]);
 }
 
 // ---- 下载计数 ----
@@ -241,16 +244,20 @@ export async function incrementDownload(
  * 用 SQL 表达式做读改写而不是先查再写，避免并发上传互相覆盖计数；
  * 下限夹到 0，防止异常路径把计数器压成负数后配额形同虚设。
  */
-export async function adjustStorageUsed(db: D1Database, delta: number): Promise<void> {
-  if (!Number.isFinite(delta) || delta === 0) return;
-  await db
+export function adjustStorageUsedStatement(db: D1Database, delta: number): D1PreparedStatement | null {
+  if (!Number.isFinite(delta) || delta === 0) return null;
+  return db
     .prepare(`
       INSERT INTO fc_settings(key, value) VALUES('storage_used', ?)
       ON CONFLICT(key) DO UPDATE SET value = CAST(
         MAX(0, CAST(COALESCE(fc_settings.value, '0') AS INTEGER) + ?) AS TEXT)
     `)
-    .bind(String(delta), delta)
-    .run();
+    .bind(String(delta), delta);
+}
+
+export async function adjustStorageUsed(db: D1Database, delta: number): Promise<void> {
+  const stmt = adjustStorageUsedStatement(db, delta);
+  if (stmt) await stmt.run();
 }
 
 /** 当前计数器值；未初始化或对账前可能为 0 */
@@ -356,8 +363,11 @@ export async function listChunkParts(
 }
 
 export async function deleteChunkTask(db: D1Database, uploadId: string): Promise<void> {
-  await db.prepare('DELETE FROM fc_chunk_parts WHERE upload_id = ?').bind(uploadId).run();
-  await db.prepare('DELETE FROM fc_chunk_uploads WHERE upload_id = ?').bind(uploadId).run();
+  // 片记录与会话行同一事务，避免只删掉一半留下孤儿 parts
+  await db.batch([
+    db.prepare('DELETE FROM fc_chunk_parts WHERE upload_id = ?').bind(uploadId),
+    db.prepare('DELETE FROM fc_chunk_uploads WHERE upload_id = ?').bind(uploadId),
+  ]);
 }
 
 /**
@@ -398,13 +408,18 @@ export async function listStaleChunkTasks(db: D1Database, olderThanMs: number): 
 export async function deleteFileRecord(
   db: D1Database,
   id: number,
+  knownFile?: FileRecord | null,
 ): Promise<FileRecord | null> {
-  const file = await getFileById(db, id);
-  if (file) {
-    await db.prepare('DELETE FROM fc_files WHERE id = ?').bind(id).run();
-    await releaseCode(db, file.code);
-    await adjustStorageUsed(db, -file.size);
-  }
+  const file = knownFile ?? (await getFileById(db, id));
+  if (!file) return null;
+  const stmts: D1PreparedStatement[] = [
+    db.prepare('DELETE FROM fc_files WHERE id = ?').bind(id),
+    releaseCodeStatement(db, file.code),
+  ];
+  const adjust = adjustStorageUsedStatement(db, -file.size);
+  if (adjust) stmts.push(adjust);
+  // 记录、取件码、容量计数同一事务，避免删除中途失败留下半套状态
+  await db.batch(stmts);
   return file;
 }
 
@@ -482,6 +497,49 @@ export async function consumeDailyUpload(
   }
 }
 
+/** complete 成功后保留 1 小时的回执：客户端丢响应重试时返回同一 code/size，而不是 404 */
+export const CHUNK_RECEIPT_TTL_MS = 3_600_000;
+export interface ChunkReceipt {
+  code: string;
+  filename: string;
+  size: number;
+}
+
+function chunkReceiptKey(sessionId: string): string {
+  return `chunk_receipt:${sessionId}`;
+}
+
+export async function saveChunkReceipt(
+  db: D1Database,
+  sessionId: string,
+  receipt: ChunkReceipt,
+): Promise<void> {
+  await setSetting(db, chunkReceiptKey(sessionId), JSON.stringify({ ...receipt, at: Date.now() }));
+}
+
+export async function getChunkReceipt(
+  db: D1Database,
+  sessionId: string,
+): Promise<ChunkReceipt | null> {
+  const raw = await getSetting(db, chunkReceiptKey(sessionId));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ChunkReceipt> & { at?: number };
+    if (
+      typeof parsed.code !== 'string' ||
+      typeof parsed.filename !== 'string' ||
+      typeof parsed.size !== 'number' ||
+      typeof parsed.at !== 'number' ||
+      Date.now() - parsed.at > CHUNK_RECEIPT_TTL_MS
+    ) {
+      return null;
+    }
+    return { code: parsed.code, filename: parsed.filename, size: parsed.size };
+  } catch {
+    return null;
+  }
+}
+
 /** 该 IP 在最近 activeMs 内创建的未完成分片会话数：限制并发会话，避免只 init 不传就刷码 */
 export async function countActiveChunkSessions(
   db: D1Database,
@@ -523,12 +581,13 @@ export async function listFilesAdvanced(
     conditions.push('filename LIKE ?');
     bindArgs.push(`%${kw}%`);
   }
+  // created_at 存 UTC；后台日期选择器按中国时区（UTC+8）理解
   if (dateFrom) {
-    conditions.push("date(created_at) >= ?");
+    conditions.push("date(created_at, '+8 hours') >= ?");
     bindArgs.push(dateFrom);
   }
   if (dateTo) {
-    conditions.push("date(created_at) <= ?");
+    conditions.push("date(created_at, '+8 hours') <= ?");
     bindArgs.push(dateTo);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -570,10 +629,11 @@ export async function getDashboardStats(db: D1Database): Promise<{
       .prepare('SELECT COUNT(*) as count, COALESCE(SUM(size),0) as size FROM fc_files')
       .first<{ count: number; size: number }>(),
     db
-      .prepare("SELECT COUNT(*) as count, COALESCE(SUM(size),0) as size FROM fc_files WHERE date(created_at) = date('now')")
+      // 后台“今日/昨日”按 UTC+8 统计；created_at 本身仍是 UTC
+      .prepare("SELECT COUNT(*) as count, COALESCE(SUM(size),0) as size FROM fc_files WHERE date(created_at, '+8 hours') = date('now', '+8 hours')")
       .first<{ count: number; size: number }>(),
     db
-      .prepare("SELECT COUNT(*) as count, COALESCE(SUM(size),0) as size FROM fc_files WHERE date(created_at) = date('now', '-1 day')")
+      .prepare("SELECT COUNT(*) as count, COALESCE(SUM(size),0) as size FROM fc_files WHERE date(created_at, '+8 hours') = date('now', '+8 hours', '-1 day')")
       .first<{ count: number; size: number }>(),
   ]);
   return {
@@ -607,9 +667,11 @@ export async function cleanupExpired(
 
   // 不在这里逐个 releaseCode：过期文件一多，N 次 D1 调用会直接撞上 Free 计划
   // 每次 50 个子请求的上限。cleanupUsedCodes 用一条 SQL 统一回收，
-  // 并且在 scheduled/admin 清理里独立执行，不再依赖“本次确实有文件过期”
-  await db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')").run();
-  await adjustStorageUsed(db, -files.reduce((s, f) => s + (f.size || 0), 0));
+  // 并且在 scheduled/admin 清理里独立执行，不再依赖“本次确实有文件过期”。
+  // 记录删除与容量计数放同一个 batch，避免半套状态
+  const remove = db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')");
+  const adjust = adjustStorageUsedStatement(db, -files.reduce((s, f) => s + (f.size || 0), 0));
+  await db.batch(adjust ? [remove, adjust] : [remove]);
 
   return { expiredCount: files.length };
 }
@@ -746,6 +808,17 @@ export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
     // 老库还没跑到 initDB 时表可能不存在，由下一次 Cron 再清
     if (!/no such table/i.test(String(e?.message ?? e))) throw e;
   }
+
+  // 分片 complete 回执过期后回收
+  const receipt = await db
+    .prepare(`
+      DELETE FROM fc_settings
+      WHERE key LIKE 'chunk_receipt:%'
+        AND COALESCE(CAST(json_extract(value, '$.at') AS INTEGER), 0) <= ?
+    `)
+    .bind(Date.now() - CHUNK_RECEIPT_TTL_MS)
+    .run();
+  removed += receipt.meta?.changes ?? 0;
   return removed;
 }
 

@@ -9,7 +9,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env } from './types';
-import { formatFileSize } from './utils';
+import { formatFileSize, encodeFilename, parseIntParam, toPublicError } from './utils';
 import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, getStorageUsed, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
 import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits, displayFilename, assertBodyWithinLimit } from './shared';
@@ -24,6 +24,13 @@ function ok(c: Context<Bindings>, detail: unknown, msg = 'success') {
 
 function fail(c: Context<Bindings>, status: ContentfulStatusCode, msg: string) {
   return c.json({ code: status, msg }, status);
+}
+
+/** 兼容 JSON 布尔、数字与字符串；返回 null 表示值非法 */
+function normalizeOpenUpload(value: unknown): '0' | '1' | null {
+  if (value === false || value === 0 || value === '0' || value === 'false' || value === 'off') return '0';
+  if (value === true || value === 1 || value === '1' || value === 'true' || value === 'on') return '1';
+  return null;
 }
 
 /**
@@ -73,7 +80,8 @@ const shareText = async (c: Context<Bindings>) => {
     const result = await uploadText(c, c.env);
     return ok(c, { code: result.code });
   } catch (e: any) {
-    return fail(c, e?.status ?? 500, e?.message ?? '服务器内部错误');
+    const { status, message } = toPublicError(e);
+    return fail(c, status as ContentfulStatusCode, message);
   }
 };
 api.post('/share/text/', shareText);
@@ -85,7 +93,8 @@ const shareFile = async (c: Context<Bindings>) => {
     const result = await uploadFile(c, c.env);
     return ok(c, { code: result.code, name: result.filename });
   } catch (e: any) {
-    return fail(c, e?.status ?? 500, e?.message ?? '服务器内部错误');
+    const { status, message } = toPublicError(e);
+    return fail(c, status as ContentfulStatusCode, message);
   }
 };
 api.post('/share/file/', shareFile);
@@ -108,7 +117,8 @@ async function selectFile(c: Context<Bindings>, countAsDownload: boolean) {
       text: result.text,
     });
   } catch (e: any) {
-    return fail(c, e?.status ?? 500, e?.message ?? '服务器内部错误');
+    const { status, message } = toPublicError(e);
+    return fail(c, status as ContentfulStatusCode, message);
   }
 }
 
@@ -128,12 +138,14 @@ api.get('/share/download', async (c) => {
     return new Response(result.isHead ? null : result.obj?.body, {
       headers: {
         'Content-Type': result.file!.mime_type || 'application/octet-stream',
-        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file!.filename)}`,
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeFilename(result.file!.filename)}`,
         'Content-Length': String(result.obj?.size ?? 0),
+        'X-Content-Type-Options': 'nosniff',
       },
     });
   } catch (e: any) {
-    return fail(c, e?.status ?? 500, e?.message ?? '服务器内部错误');
+    const { status, message } = toPublicError(e);
+    return fail(c, status as ContentfulStatusCode, message);
   }
 });
 
@@ -164,8 +176,8 @@ adminApi.get('/dashboard', async (c) => {
 
 adminApi.get('/file/list', async (c) => {
   const env = c.env;
-  const page = Math.max(1, parseInt(c.req.query('page') || '1'));
-  const size = Math.min(100, Math.max(1, parseInt(c.req.query('size') || '10')));
+  const page = parseIntParam(c.req.query('page'), 1, 1, 1_000_000);
+  const size = parseIntParam(c.req.query('size'), 10, 1, 100);
   const keyword = c.req.query('keyword') || '';
   const dateFrom = c.req.query('date_from') || '';
   const dateTo = c.req.query('date_to') || '';
@@ -199,7 +211,7 @@ adminApi.delete('/file/delete', async (c) => {
   try {
     await env.FILE_STORE.delete([`file:${file.code}`, `thumb:${file.code}`]);
   } finally {
-    await deleteFileRecord(env.DB, id);
+    await deleteFileRecord(env.DB, id, file);
   }
   return ok(c, { id });
 });
@@ -215,7 +227,11 @@ adminApi.patch('/config/update', async (c) => {
     const body = await c.req.json().catch(() => null);
     if (!body) return fail(c, 422, '请求体不能为空');
 
-    if (body.openUpload !== undefined) await setSetting(env.DB, 'open_upload', String(body.openUpload));
+    if (body.openUpload !== undefined) {
+      const open = normalizeOpenUpload(body.openUpload);
+      if (open === null) return fail(c, 422, 'openUpload 只能是 true/false 或 1/0');
+      await setSetting(env.DB, 'open_upload', open);
+    }
     if (body.maxFileSize !== undefined) await setSetting(env.DB, 'max_file_size', String(body.maxFileSize));
     if (body.defaultExpireDays !== undefined) {
       // 非法值写空串回退到 vars；上限 3650 天，避免一个值让全站上传构造日期越界

@@ -3,7 +3,7 @@
  * 像取快递一样取文件
  */
 import { Hono } from 'hono';
-import { cors } from 'hono/cors';
+import { getCookie } from 'hono/cookie';
 import type { Context } from 'hono';
 
 import type { Env, FileRecord } from './types';
@@ -45,6 +45,7 @@ import {
 import { generateQRCodeGIF } from './qr';
 import { chunkInit, chunkPut, chunkStatus, chunkComplete, chunkAbort, abortChunkSession, abortAllChunkSessions, cleanupStaleChunkUploads } from './chunk';
 import { STYLE } from './templates/style';
+import { encodeFilename, parseIntParam, toPublicError } from './utils';
 import type { HomeOptions } from './templates/pages';
 import type { AdminConfig } from './templates/pages';
 import {
@@ -62,7 +63,6 @@ import {
 
 const app = new Hono<{ Bindings: Env }>();
 
-app.use('*', cors({ origin: 'self', allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'HEAD'] }));
 app.use('*', async (c, next) => {
   await next();
   c.res.headers.set('Referrer-Policy', 'no-referrer');
@@ -95,11 +95,13 @@ function getBaseUrl(c: Context<{ Bindings: Env }>): string {
  * 全新数据库尚未建表时（initDB 由 Cron 或 provision 完成）必须降级为默认值，
  * 否则首页会从「可用静态页」退化成 500。
  */
-async function homeOptions(env: Env): Promise<HomeOptions> {
+async function homeOptions(env: Env, isAdmin = false): Promise<HomeOptions> {
   try {
     const [openUpload, limits] = await Promise.all([getSetting(env.DB, 'open_upload'), resolveLimits(env)]);
     return {
-      uploadAllowed: (openUpload ?? '1') !== '0',
+      // 管理员始终保留上传区：后端 assertUploadAllowed 本来就允许管理员上传，
+      // 页面不能因为 open_upload=0 把管理员也挡在外面
+      uploadAllowed: isAdmin || (openUpload ?? '1') !== '0',
       defaultExpireDays: limits.defaultExpireDays,
       maxFileSize: limits.maxSize,
     };
@@ -161,7 +163,10 @@ app.get('/static/bg.webp', async (c) => {
 // 首页（需读一次生效设置，决定上传区还是登录引导；DB 未就绪时降级为默认可上传）
 app.get('/', async (c) => {
   c.header('Cache-Control', 'no-store');
-  return c.html(homePage(await homeOptions(c.env)));
+  // 只有带凭据时才多查一次 token；普通访客不会为管理员判断多付 D1
+  const hasCredential = Boolean(getCookie(c, 'admin_token') || c.req.header('Authorization'));
+  const isAdmin = hasCredential ? await adminAuth(c, c.env) : false;
+  return c.html(homePage(await homeOptions(c.env, isAdmin)));
 });
 
 // 取件页（静态，但需避免错误响应被 CDN 缓存，使用 no-store）
@@ -200,8 +205,8 @@ app.post('/api/upload', async (c) => {
     const result = await uploadFile(c, c.env);
     return c.json(result);
   } catch (e: any) {
-    const status = e?.status ?? 500;
-    return c.json({ error: e?.message ?? '服务器内部错误' }, status);
+    const { status, message } = toPublicError(e);
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -214,7 +219,8 @@ app.post('/api/upload/chunk/init', async (c) => {
   try {
     return c.json(await chunkInit(c, c.env));
   } catch (e: any) {
-    return c.json({ error: e?.message ?? '初始化失败' }, e?.status ?? 500);
+    const { status, message } = toPublicError(e, '初始化失败');
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -222,7 +228,8 @@ app.put('/api/upload/chunk/:session/:part', async (c) => {
   try {
     return c.json(await chunkPut(c, c.env));
   } catch (e: any) {
-    return c.json({ error: e?.message ?? '分片保存失败' }, e?.status ?? 500);
+    const { status, message } = toPublicError(e, '分片保存失败');
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -230,7 +237,8 @@ app.get('/api/upload/chunk/status/:session', async (c) => {
   try {
     return c.json(await chunkStatus(c, c.env));
   } catch (e: any) {
-    return c.json({ error: e?.message ?? '查询失败' }, e?.status ?? 500);
+    const { status, message } = toPublicError(e, '查询失败');
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -238,7 +246,8 @@ app.post('/api/upload/chunk/complete/:session', async (c) => {
   try {
     return c.json(await chunkComplete(c, c.env));
   } catch (e: any) {
-    return c.json({ error: e?.message ?? '合并失败' }, e?.status ?? 500);
+    const { status, message } = toPublicError(e, '合并失败');
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -246,7 +255,8 @@ app.post('/api/upload/chunk/abort/:session', async (c) => {
   try {
     return c.json(await chunkAbort(c, c.env));
   } catch (e: any) {
-    return c.json({ error: e?.message ?? '放弃失败' }, e?.status ?? 500);
+    const { status, message } = toPublicError(e, '放弃失败');
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -262,13 +272,15 @@ app.post('/api/upload/text', async (c) => {
       meta: { size: result.textSize, download_count: 0, max_downloads: result.maxDownloads, expire_at: result.expireAt },
     }));
   } catch (e: any) {
-    return c.html(errorPage(e?.message ?? '保存失败', '服务器内部错误'), e?.status ?? 500);
+    const { status, message } = toPublicError(e, '保存失败');
+    return c.html(errorPage(message, ''), status as any);
   }
 });
 
 app.get('/api/text/:code', async (c) => {
   // 查看次数决定可见性，不能被浏览器/边缘缓存留在额度用完之后
   c.header('Cache-Control', 'no-store');
+  c.header('X-Content-Type-Options', 'nosniff');
   const code = c.req.param('code').trim();
   const file = await getFileByCode(c.env.DB, code);
   if (!file || file.is_text !== 1) {
@@ -296,12 +308,14 @@ app.get('/api/download/:code', async (c) => {
 
     const headers: Record<string, string> = {
       'Content-Type': result.file!.mime_type || 'application/octet-stream',
-      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.file!.filename)}`,
+      'Content-Disposition': `attachment; filename*=UTF-8''${encodeFilename(result.file!.filename)}`,
       'Content-Length': String(result.obj?.size ?? 0),
+      'X-Content-Type-Options': 'nosniff',
     };
     return new Response(result.isHead ? null : result.obj?.body, { headers });
   } catch (e: any) {
-    return c.html(errorPage(e?.message ?? '未找到文件', ''), e?.status ?? 404);
+    const { status, message } = toPublicError(e, '服务器内部错误');
+    return c.html(errorPage(message, ''), status as any);
   }
 });
 
@@ -311,8 +325,8 @@ app.post('/api/thumb/:code', async (c) => {
   try {
     return c.json(await saveThumb(c, c.env));
   } catch (e: any) {
-    const status = e?.status ?? 500;
-    return c.json({ error: e?.message ?? '保存失败' }, status);
+    const { status, message } = toPublicError(e, '保存失败');
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -340,7 +354,8 @@ app.get('/api/codes/:count', async (c) => {
   try {
     return c.json(await allocateCodeRun(c, c.env));
   } catch (e: any) {
-    return c.json({ error: e?.message ?? '服务器内部错误' }, e?.status ?? 500);
+    const { status, message } = toPublicError(e);
+    return c.json({ error: message }, status as any);
   }
 });
 
@@ -367,7 +382,8 @@ app.get('/qrcode/:code', async (c) => {
     });
   } catch (e) {
     console.error('[QR] Error:', e);
-    return c.text(`QR Error: ${e instanceof Error ? e.message : String(e)}`, 500);
+    const { status, message } = toPublicError(e, '二维码生成失败');
+    return c.text(message, status as any);
   }
 });
 
@@ -400,7 +416,7 @@ app.get('/admin', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.html(adminLoginPage());
 
-  const page = Math.max(1, parseInt(c.req.query('page') || '1'));
+  const page = parseIntParam(c.req.query('page'), 1, 1, 1_000_000);
   const keyword = (c.req.query('keyword') || '').trim();
   const dateFrom = c.req.query('date_from') || '';
   const dateTo = c.req.query('date_to') || '';
@@ -453,8 +469,10 @@ app.post('/admin/settings', async (c) => {
   return c.redirect('/admin/settings?saved=1');
 });
 
-// 兼容旧路径 /console
+// 兼容旧路径 /console；尾斜杠统一跳到规范路径，避免落到兜底 404
 app.get('/console', (c) => c.redirect('/admin'));
+app.get('/admin/', (c) => c.redirect('/admin'));
+app.get('/r/', (c) => c.redirect('/r'));
 
 // Web 表单登录（HTML 页面）；JSON 登录见 /api/admin/login（兼容 API）
 app.post('/admin/login', async (c) => {
@@ -493,7 +511,7 @@ app.post('/admin/delete/:id', async (c) => {
   try {
     await env.FILE_STORE.delete([`file:${file.code}`, `thumb:${file.code}`]);
   } finally {
-    await deleteFileRecord(env.DB, id);
+    await deleteFileRecord(env.DB, id, file);
   }
   return c.redirect('/admin');
 });
@@ -582,7 +600,8 @@ app.all('/signal', (c) => new Response(null, { status: 404 }));
 
 // ===================== 兜底 =====================
 
-app.all('*', async (c) => c.html(homePage(await homeOptions(c.env))));
+// 未知路径返回真正的 404，而不是 200 首页；否则拼错的地址/静态路径会伪装成正常页面
+app.all('*', (c) => c.html(errorPage('页面不存在', '请检查地址是否正确'), 404));
 
 // ===================== 导出 =====================
 // fetch: Hono 处理所有 HTTP 请求

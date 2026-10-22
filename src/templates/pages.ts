@@ -296,6 +296,8 @@ function homeScript(): string {
   return `
     <script>
     var MAX_TEXT_BYTES = 524288;
+    // 上传限流是 10 次/分钟，批量再多也只会撞 429；前后端统一到 10
+    var MAX_BATCH_FILES = 10;
     var pendingFiles = [];
 
     function switchTab(name) {
@@ -346,13 +348,18 @@ function homeScript(): string {
 
     function addFiles(list) {
       var seen = {};
+      var truncated = false;
       pendingFiles.forEach(function (f) { seen[f.name + ':' + f.size] = true; });
       Array.prototype.forEach.call(list, function (f) {
         var key = f.name + ':' + f.size;
-        if (!seen[key]) { pendingFiles.push(f); seen[key] = true; }
+        if (seen[key]) return;
+        if (pendingFiles.length >= MAX_BATCH_FILES) { truncated = true; return; }
+        pendingFiles.push(f);
+        seen[key] = true;
       });
       renderChips();
       reportOverLimit();
+      if (truncated) notice('一次最多上传 ' + MAX_BATCH_FILES + ' 个文件；多出的已忽略');
     }
 
     function renderChips() {
@@ -682,8 +689,12 @@ function homeScript(): string {
             var got = {};
             (st && st.done ? st.done : []).forEach(function (n) { got[n] = true; });
             var todo = indexes.filter(function (n) { return !got[n]; });
-            // 已完成的片先计入，续传时进度条不从 0 开始
-            var base = (s.total_parts - todo.length) * s.part_size;
+            // 已完成的片按真实字节计入（末片通常不是完整 part_size），
+            // 否则续传时进度元信息会超过文件总大小
+            var base = 0;
+            (st && st.done ? st.done : []).forEach(function (n) {
+              base += n < s.total_parts ? s.part_size : file.size - s.part_size * (s.total_parts - 1);
+            });
             return runPartPool(s, todo, file, base, onProgress);
           })
           .then(function () {
@@ -870,10 +881,21 @@ function homeScript(): string {
       return true;
     }
 
-    // 浏览器后退会恢复表单页，需要把按钮还原
+    // 浏览器后退会从 bfcache 恢复表单页：按钮/进度条可能还停在「上传中」，
+    // 必须一起还原，否则看起来像卡死
     window.addEventListener('pageshow', function () {
       var b = document.getElementById('textSubmitBtn');
       if (b) { b.disabled = false; b.textContent = '发件并获取取件码'; }
+      var ub = document.getElementById('submitBtn');
+      if (ub) { ub.disabled = false; ub.textContent = '发件并获取取件码'; }
+      var wrap = document.getElementById('uploadProgress');
+      if (wrap) wrap.style.display = 'none';
+      var bar = document.getElementById('uploadProgressBar');
+      if (bar) bar.style.width = '0%';
+      var meta = document.getElementById('uploadMeta');
+      if (meta) meta.hidden = true;
+      var status = document.getElementById('uploadStatus');
+      if (status) status.textContent = '';
     });
 
     document.addEventListener('DOMContentLoaded', function () {
