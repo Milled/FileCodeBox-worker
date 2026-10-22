@@ -74,6 +74,10 @@ export async function handleAdminLogin(
   if (!(await checkRateLimit(env.DB, 'login_ratelimit', ip, 5))) {
     return { success: false, error: '尝试次数过多，请稍后再试' };
   }
+  // 计次之后再限长：长密码尝试也要计入登录配额，避免被当成免费请求刷
+  if (inputPassword.length > 256) {
+    return { success: false, error: '密码过长' };
+  }
 
   const inputHash = await hashPassword(inputPassword);
   const secretHash = await getSecretHash(env);

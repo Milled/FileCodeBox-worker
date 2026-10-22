@@ -51,6 +51,14 @@ export async function initDB(db: D1Database): Promise<void> {
       code TEXT PRIMARY KEY,
       created_at TEXT
     )`,
+    // 游客每日上传配额：4 位码只有 10,000 个，没有这层限制时单个 IP
+    // 以 10 次/分钟就能在一天内把码池占满。按 IP + UTC 日期计数，Cron 清理旧天
+    `CREATE TABLE IF NOT EXISTS fc_upload_quota (
+      ip TEXT NOT NULL,
+      day TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (ip, day)
+    )`,
   ];
   const migrations = [
     'ALTER TABLE fc_files ADD COLUMN is_text INTEGER DEFAULT 0',
@@ -280,6 +288,12 @@ export async function markThumb(db: D1Database, code: string): Promise<void> {
  */
 const ADD_SESSION_COLUMN = 'ALTER TABLE fc_chunk_uploads ADD COLUMN session_id TEXT';
 const ADD_USED_CODES_TS = 'ALTER TABLE fc_used_codes ADD COLUMN created_at TEXT';
+const CREATE_UPLOAD_QUOTA = `CREATE TABLE IF NOT EXISTS fc_upload_quota (
+  ip TEXT NOT NULL,
+  day TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (ip, day)
+)`;
 
 export async function insertChunkTask(db: D1Database, t: ChunkTask): Promise<void> {
   const stmt = () =>
@@ -438,6 +452,53 @@ export async function cleanupUsedCodes(
   }
 }
 
+/**
+ * 游客每日上传配额：原子递增并返回是否仍在额度内。
+ * 表缺失时自愈，部署后即使 Cron 还没跑也不会让上传全部 500。
+ */
+export async function consumeDailyUpload(
+  db: D1Database,
+  ip: string,
+  max: number,
+): Promise<boolean> {
+  const day = new Date().toISOString().slice(0, 10);
+  const run = () =>
+    db
+      .prepare(`
+        INSERT INTO fc_upload_quota(ip, day, count) VALUES (?, ?, 1)
+        ON CONFLICT(ip, day) DO UPDATE SET count = fc_upload_quota.count + 1
+        RETURNING count
+      `)
+      .bind(ip, day)
+      .first<{ count: number }>();
+  try {
+    const row = await run();
+    return Number(row?.count ?? 0) <= max;
+  } catch (e: any) {
+    if (!/no such table/i.test(String(e?.message ?? e))) throw e;
+    await db.prepare(CREATE_UPLOAD_QUOTA).run();
+    const row = await run();
+    return Number(row?.count ?? 0) <= max;
+  }
+}
+
+/** 该 IP 在最近 activeMs 内创建的未完成分片会话数：限制并发会话，避免只 init 不传就刷码 */
+export async function countActiveChunkSessions(
+  db: D1Database,
+  ip: string,
+  activeMs: number,
+): Promise<number> {
+  const cutoff = new Date(Date.now() - activeMs).toISOString();
+  const row = await db
+    .prepare(`
+      SELECT COUNT(*) AS n FROM fc_chunk_uploads
+      WHERE ip = ? AND datetime(created_at) > datetime(?)
+    `)
+    .bind(ip, cutoff)
+    .first<{ n: number }>();
+  return Number(row?.n ?? 0);
+}
+
 // ---- 分页 ----
 
 /**
@@ -584,51 +645,19 @@ export function setSettingStatement(db: D1Database, key: string, value: string):
 const RATE_WINDOW = 60_000; // 60 秒窗口
 
 /**
- * 检查并记录某类限流计数（登录/上传共用）。返回 true 表示允许继续，false 表示已限流。
- * 关键：无论是否通过，只要窗口未过期都会递增计数，
- *       防止攻击者在窗口重置后获得额外尝试次数。
- */
-/**
- * 限流窗口的纯计算部分：给分片路径用。
- * 那里「读窗口」要并进别的读、「写窗口」要并进别的写，中间还夹着一次 R2 写入，
- * 不能像 checkRateLimit 那样读一趟写一趟地串起来（每片多两趟往返）
- */
-export function rateVerdict(
-  raw: string | null,
-  max: number,
-  now = Date.now(),
-): { allowed: boolean; value: string } {
-  let count = 0;
-  let windowStart = now;
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw) as { count: number; windowStart: number };
-      if (now - parsed.windowStart < RATE_WINDOW) {
-        count = parsed.count;
-        windowStart = parsed.windowStart;
-      }
-    } catch { /* 损坏则重置 */ }
-  }
-  const next = count + 1;
-  return { allowed: next <= max, value: JSON.stringify({ count: next, windowStart }) };
-}
-
-/**
- * 原子限流：读窗口、判断、递增在一条 UPSERT 里完成。
+ * 原子限流语句：读窗口、判断、递增在一条 UPSERT 里完成。
  * 旧的“先 SELECT 再 SET”在并发下会互相覆盖计数，攻击者并发发起 N 个请求时
- * 可以同时读到旧值并全部放行 —— 对 4 位取件码的失败查询尤其致命。
- * 同时把两次 D1 调用压成一次，给 Free 计划的 50 子请求预算留余量。
+ * 可以同时读到旧值并全部放行。
  */
-export async function checkRateLimit(
+function buildRateLimitStatement(
   db: D1Database,
   keyPrefix: string,
   ip: string,
-  max: number,
-): Promise<boolean> {
+  now = Date.now(),
+): D1PreparedStatement {
   const key = `${keyPrefix}:${ip}`;
-  const now = Date.now();
   const cutoff = now - RATE_WINDOW;
-  const row = await db
+  return db
     .prepare(`
       INSERT INTO fc_settings(key, value)
       VALUES (?, json_object('count', 1, 'windowStart', ?))
@@ -643,14 +672,40 @@ export async function checkRateLimit(
       END
       RETURNING value
     `)
-    .bind(key, now, cutoff, now)
-    .first<{ value: string }>();
+    .bind(key, now, cutoff, now);
+}
+
+/** 解析原子限流语句的返回行 */
+export function rateLimitAllowed(row: { value?: string } | null | undefined, max: number): boolean {
   try {
     const count = Number(JSON.parse(row?.value ?? '').count);
     return Number.isFinite(count) && count <= max;
   } catch {
     return false;
   }
+}
+
+/** 语句版本：分片路径要把「读窗口并递增」和「取会话」并进同一个 batch */
+export function rateLimitStatementFor(
+  db: D1Database,
+  keyPrefix: string,
+  ip: string,
+): D1PreparedStatement {
+  return buildRateLimitStatement(db, keyPrefix, ip);
+}
+
+/**
+ * 检查并记录某类限流计数（登录/上传/查询共用）。返回 true 表示允许继续。
+ * 无论是否通过都会递增，防止窗口重置后获得额外尝试次数。
+ */
+export async function checkRateLimit(
+  db: D1Database,
+  keyPrefix: string,
+  ip: string,
+  max: number,
+): Promise<boolean> {
+  const row = await buildRateLimitStatement(db, keyPrefix, ip).first<{ value: string }>();
+  return rateLimitAllowed(row, max);
 }
 
 /**
@@ -668,6 +723,7 @@ export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
           OR key LIKE 'thumb_ratelimit:%'
           OR key LIKE 'code_ratelimit:%'
           OR key LIKE 'chunk_ratelimit:%'
+          OR key LIKE 'chunk_meta_ratelimit:%'
           OR key LIKE 'lookup_ratelimit:%')
         AND (
           NOT json_valid(value)
@@ -676,7 +732,21 @@ export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
     `)
     .bind(cutoff)
     .run();
-  return result.meta?.changes ?? 0;
+  let removed = result.meta?.changes ?? 0;
+
+  // 每日上传配额的旧日期行也一起回收；保留今天和昨天便于排查
+  try {
+    const dayCutoff = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+    const quota = await db
+      .prepare('DELETE FROM fc_upload_quota WHERE day < ?')
+      .bind(dayCutoff)
+      .run();
+    removed += quota.meta?.changes ?? 0;
+  } catch (e: any) {
+    // 老库还没跑到 initDB 时表可能不存在，由下一次 Cron 再清
+    if (!/no such table/i.test(String(e?.message ?? e))) throw e;
+  }
+  return removed;
 }
 
 // ---- 孤儿 R2 对象清理 ----

@@ -1,7 +1,7 @@
 /**
  * 公开页视觉与结构回归：设计 token、深色模式、取件链路、响应式、CSP
  */
-import { BASE, SHOT_DIR, newPage, Suite, dropFile, fillCodeBoxes, rateLimitBreather, hoverTip, expandExtra } from './helpers.mjs';
+import { BASE, SHOT_DIR, newPage, Suite, dropFile, fillCodeBoxes, rateLimitBreather, hoverTip, expandExtra, testClientIp } from './helpers.mjs';
 
 export async function publicUiSuite(browser) {
   const s = new Suite('公开页视觉 / 结构回归');
@@ -242,6 +242,7 @@ export async function publicUiSuite(browser) {
   // 结果页现在带正文，必须 no-store，否则 CDN 可能把私密内容留在边缘节点
   const cacheProbe = await light.context().request.post(`${BASE}/api/upload/text`, {
     form: { text: 'cache header probe', expire_style: 'day', expire_value: '1', max_downloads: '-1' },
+    headers: { 'CF-Connecting-IP': testClientIp() },
   });
   const cacheCtl = cacheProbe.headers()['cache-control'];
   s.ok('文本结果页禁止缓存（含正文）', cacheProbe.status() === 200 && cacheCtl === 'no-store', `${cacheProbe.status()} / ${cacheCtl}`);

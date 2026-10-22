@@ -12,7 +12,7 @@ import type { Env } from './types';
 import { formatFileSize } from './utils';
 import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, getStorageUsed, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
-import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits, displayFilename } from './shared';
+import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits, displayFilename, assertBodyWithinLimit } from './shared';
 
 type Bindings = { Bindings: Env };
 
@@ -50,15 +50,21 @@ const api = new Hono<Bindings>();
 
 // ---- 认证（公开） ----
 api.post('/admin/login', async (c) => {
-  const env = c.env;
-  const body = await c.req.json().catch(() => null);
-  const password = (body?.password as string) || '';
-  if (!password) return fail(c, 422, '密码不能为空');
+  try {
+    const env = c.env;
+    assertBodyWithinLimit(c, 4 * 1024);
+    const body = await c.req.json().catch(() => null);
+    const password = typeof body?.password === 'string' ? body.password : '';
+    if (!password) return fail(c, 422, '密码不能为空');
 
-  const result = await handleAdminLogin(c, env, password);
-  if (!result.success) return fail(c, 401, result.error);
+    const result = await handleAdminLogin(c, env, password);
+    if (!result.success) return fail(c, 401, result.error);
 
-  return ok(c, { token: result.token, token_type: 'Bearer' });
+    return ok(c, { token: result.token, token_type: 'Bearer' });
+  } catch (e: any) {
+    const status = e?.status ?? 500;
+    return fail(c, status, status === 500 ? '服务器内部错误' : e?.message ?? '请求失败');
+  }
 });
 
 // ---- 分享文本 ----
@@ -203,24 +209,30 @@ adminApi.get('/config/get', async (c) => {
 });
 
 adminApi.patch('/config/update', async (c) => {
-  const env = c.env;
-  const body = await c.req.json().catch(() => null);
-  if (!body) return fail(c, 422, '请求体不能为空');
+  try {
+    const env = c.env;
+    assertBodyWithinLimit(c, 64 * 1024);
+    const body = await c.req.json().catch(() => null);
+    if (!body) return fail(c, 422, '请求体不能为空');
 
-  if (body.openUpload !== undefined) await setSetting(env.DB, 'open_upload', String(body.openUpload));
-  if (body.maxFileSize !== undefined) await setSetting(env.DB, 'max_file_size', String(body.maxFileSize));
-  if (body.defaultExpireDays !== undefined) {
-    // 非法值写空串回退到 vars；上限 3650 天，避免一个值让全站上传构造日期越界
-    const days = parseInt(String(body.defaultExpireDays), 10);
-    await setSetting(
-      env.DB,
-      'default_expire_days',
-      Number.isFinite(days) && days >= 1 && days <= 3650 ? String(days) : '',
-    );
+    if (body.openUpload !== undefined) await setSetting(env.DB, 'open_upload', String(body.openUpload));
+    if (body.maxFileSize !== undefined) await setSetting(env.DB, 'max_file_size', String(body.maxFileSize));
+    if (body.defaultExpireDays !== undefined) {
+      // 非法值写空串回退到 vars；上限 3650 天，避免一个值让全站上传构造日期越界
+      const days = parseInt(String(body.defaultExpireDays), 10);
+      await setSetting(
+        env.DB,
+        'default_expire_days',
+        Number.isFinite(days) && days >= 1 && days <= 3650 ? String(days) : '',
+      );
+    }
+    if (body.maxTotalStorage !== undefined) await setSetting(env.DB, 'max_total_storage', String(body.maxTotalStorage));
+
+    return ok(c, await effectiveConfig(c));
+  } catch (e: any) {
+    const status = e?.status ?? 500;
+    return fail(c, status, status === 500 ? '服务器内部错误' : e?.message ?? '请求失败');
   }
-  if (body.maxTotalStorage !== undefined) await setSetting(env.DB, 'max_total_storage', String(body.maxTotalStorage));
-
-  return ok(c, await effectiveConfig(c));
 });
 
 api.route('/admin', adminApi);

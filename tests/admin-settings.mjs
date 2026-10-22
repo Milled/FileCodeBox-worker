@@ -12,12 +12,14 @@ const shot = async (page, name) => {
 
 export async function adminSettingsSuite(browser) {
   const s = new Suite('后台设置与统计回归');
+  const adminIp = testClientIp();
+  const anonIp = testClientIp();
   const admin = await browser.newContext({
     viewport: { width: 1280, height: 900 },
     deviceScaleFactor: 2,
-    extraHTTPHeaders: { 'CF-Connecting-IP': testClientIp() },
+    extraHTTPHeaders: { 'CF-Connecting-IP': adminIp },
   });
-  const anon = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': testClientIp() } });
+  const anon = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': anonIp } });
   const page = await admin.newPage();
   const problems = [];
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
@@ -66,9 +68,9 @@ export async function adminSettingsSuite(browser) {
     await shot(anonPage, 'home-guest-blocked');
     await anonPage.close();
 
-    const rHome = await anon.request.post(`${BASE}/api/upload`, { data: 'x', headers: { 'X-Filename': 'a.txt' } });
+    const rHome = await anon.request.post(`${BASE}/api/upload`, { data: 'x', headers: { 'X-Filename': 'a.txt', 'CF-Connecting-IP': anonIp } });
     s.ok('首页 /api/upload 被拦（此前不受该开关控制）', rHome.status() === 401, `${rHome.status()} ${await rHome.text()}`);
-    const rShare = await anon.request.post(`${BASE}/api/share/file`, { data: 'x' });
+    const rShare = await anon.request.post(`${BASE}/api/share/file`, { data: 'x', headers: { 'CF-Connecting-IP': anonIp } });
     s.ok('兼容 API /api/share/file 同样被拦', (await rShare.json())?.code === 401, await rShare.text());
 
     const asAdmin = await apiJson(page, '/api/upload', { method: 'POST', body: '管理员内容', headers: { 'X-Filename': 'admin.txt' } });
@@ -79,14 +81,14 @@ export async function adminSettingsSuite(browser) {
     await page.selectOption('select[name="openUpload"]', '1');
     await page.fill('input[name="maxFileSizeMb"]', '1');
     await save();
-    const rBig = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m.bin' } });
+    const rBig = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m.bin', 'CF-Connecting-IP': anonIp } });
     const bigText = await rBig.text();
     s.ok('上限改 1MB 后 2MB 立即被拒（无需重新部署）', rBig.status() === 413 && /最大 1MB/.test(bigText), `${rBig.status()} ${bigText}`);
 
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
     await page.fill('input[name="maxFileSizeMb"]', '');
     await save();
-    const rBack = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m-again.bin' } });
+    const rBack = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, { data: TWO_MB, headers: { 'X-Filename': 'big2m-again.bin', 'CF-Connecting-IP': anonIp } });
     s.ok('清空设置后回退到 wrangler vars', rBack.status() === 200, await rBack.text());
 
     // ---- R2 总占用配额 ----
@@ -99,13 +101,16 @@ export async function adminSettingsSuite(browser) {
     await page.fill('input[name="maxTotalStorageMb"]', '1');
     await save();
     const rQuota = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, {
-      data: '配额测试内容', headers: { 'X-Filename': 'quota.bin' },
+      data: '配额测试内容', headers: { 'X-Filename': 'quota.bin', 'CF-Connecting-IP': anonIp },
     });
     const quotaText = await rQuota.text();
     s.ok('撞到总占用上限时新上传被拒（507）', rQuota.status() === 507 && /存储空间已满/.test(quotaText),
       `${rQuota.status()} ${quotaText.slice(0, 40)}`);
 
-    const rTextQuota = await anon.request.post(`${BASE}/api/upload/text`, { form: { text: '配额下的文本', expire_value: '1' } });
+    const rTextQuota = await anon.request.post(`${BASE}/api/upload/text`, {
+      form: { text: '配额下的文本', expire_value: '1' },
+      headers: { 'CF-Connecting-IP': anonIp },
+    });
     s.ok('文本分享同样受总占用上限约束', rTextQuota.status() === 507, String(rTextQuota.status()));
 
     await page.goto(`${BASE}/admin/settings`, { waitUntil: 'networkidle' });
@@ -118,7 +123,7 @@ export async function adminSettingsSuite(browser) {
     await page.fill('input[name="maxTotalStorageMb"]', '');
     await save();
     const rFree = await postWithinRateLimit(anon.request, `${BASE}/api/upload`, {
-      data: '清空配额之后', headers: { 'X-Filename': 'free.bin' },
+      data: '清空配额之后', headers: { 'X-Filename': 'free.bin', 'CF-Connecting-IP': anonIp },
     });
     s.ok('清空总占用上限即恢复不限制', rFree.status() === 200, await rFree.text());
 

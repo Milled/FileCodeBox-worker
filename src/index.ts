@@ -38,6 +38,7 @@ import {
   resolveLimits,
   registerLookupFailure,
   displayFilename,
+  assertBodyWithinLimit,
   LOOKUP_RATE_MESSAGE,
   FALLBACK_MAX_FILE_SIZE,
 } from './shared';
@@ -104,6 +105,16 @@ async function homeOptions(env: Env): Promise<HomeOptions> {
     };
   } catch {
     return { uploadAllowed: true, defaultExpireDays: 7, maxFileSize: FALLBACK_MAX_FILE_SIZE };
+  }
+}
+
+/** 后台表单在 parseBody 之前限长；超限直接回错误页，别抛到 Hono 变成 500 */
+function guardFormBody(c: Context<{ Bindings: Env }>, maxBytes: number): Response | null {
+  try {
+    assertBodyWithinLimit(c, maxBytes);
+    return null;
+  } catch (e: any) {
+    return c.html(errorPage('请求无效', e?.message ?? '请求体过大'), e?.status ?? 413);
   }
 }
 
@@ -418,6 +429,8 @@ app.get('/admin/settings', async (c) => {
 app.post('/admin/settings', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
+  const bad = guardFormBody(c, 64 * 1024);
+  if (bad) return bad;
   const body = await c.req.parseBody();
   const field = (k: string) => (typeof body[k] === 'string' ? (body[k] as string).trim() : '');
   // 表单以 MB 为单位（字节数对人不直观），落库仍是字节：
@@ -446,6 +459,8 @@ app.get('/console', (c) => c.redirect('/admin'));
 // Web 表单登录（HTML 页面）；JSON 登录见 /api/admin/login（兼容 API）
 app.post('/admin/login', async (c) => {
   const env = c.env;
+  const bad = guardFormBody(c, 8 * 1024);
+  if (bad) return bad;
   const body = await c.req.parseBody();
   const password = typeof body['password'] === 'string' ? body['password'] : '';
 
@@ -491,6 +506,8 @@ app.post('/admin/delete/:id', async (c) => {
 app.post('/admin/chunk/abort', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
+  const bad = guardFormBody(c, 4 * 1024);
+  if (bad) return bad;
   const body = await c.req.parseBody();
   await abortChunkSession(env, typeof body['upload_id'] === 'string' ? body['upload_id'] : '');
   return c.redirect('/admin');
@@ -520,6 +537,8 @@ app.post('/admin/cleanup', async (c) => {
       const { usedBytes, scanned } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
       if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
     }],
+    // 顺带清限流键与旧的每日上传配额行
+    ['rate_limits', () => cleanupRateLimitEntries(env.DB)],
   ];
   let budgetExhausted = false;
   for (const [name, run] of stages) {

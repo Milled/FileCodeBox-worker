@@ -14,7 +14,13 @@ async function test() {
     console.log('⚠️ 目标为远端部署，测试会向其 D1 / R2 真实写入文件（可事后到 /admin 删除）');
   }
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  // 独立伪 IP：避免连续跑 smoke 时共享 127.0.0.1 的上传/每日配额
+  const clientIp = `198.18.${20 + Math.floor(Math.random() * 200)}.${20 + Math.floor(Math.random() * 200)}`;
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    extraHTTPHeaders: { 'CF-Connecting-IP': clientIp },
+  });
+  const page = await context.newPage();
 
   const consoleErrors = [];
   const failedRequests = [];

@@ -1,7 +1,8 @@
 /**
  * 安全回归：文本查看次数、参数校验、清理竞态、查询失败限流
  *
- * 每个子场景用独立的 CF-Connecting-IP，避免与其它套件共享上传/查询限流桶。
+ * 每个页面上下文会拿到独立的伪 CF-Connecting-IP，与其它套件的限流桶隔离；
+ * 需要额外上传额度的场景（如并发会话上限）单独开新页面。
  * 注意：这组 header 只在本地 Miniflare 生效；线上 Cloudflare 会覆盖它。
  */
 import { BASE, ADMIN_PASSWORD, newPage, Suite, apiJson } from './helpers.mjs';
@@ -17,6 +18,8 @@ export async function securityHardeningSuite(browser) {
   const chunkIp = ip(13);
   const limitIp = ip(14);
   const adminIp = ip(15);
+  const bodyIp = ip(16);
+  const thumbIp = ip(17);
 
   const call = (path, init = {}, who = textIp) =>
     apiJson(page, path, {
@@ -25,6 +28,8 @@ export async function securityHardeningSuite(browser) {
     });
 
   const adminHeaders = {};
+  const capSessions = [];
+  let capPage = null;
   let textCode = '';
   let hugeCode = '';
   let session = '';
@@ -119,7 +124,72 @@ export async function securityHardeningSuite(browser) {
     }, chunkIp);
     s.ok('清理后同一取件码仍被分片会话占用（单文件上传 409）', steal.status === 409, `${steal.status} ${steal.body}`);
 
-    // ---- 4. 失败查询 5 次/分钟；成功查询不受影响 ----
+    // ---- 4. 整体缓冲接口在读取 body 前限长 ----
+    const bigJson = await call('/api/upload/chunk/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: 'x'.repeat(70 * 1024), size: 73400320, expire_value: '1' }),
+    }, bodyIp);
+    s.ok('超大 JSON init 在解析前 413',
+      bigJson.status === 413 && /请求体过大/.test(bigJson.body), `${bigJson.status} ${bigJson.body.slice(0, 50)}`);
+
+    const thumbNoCl = await fetch(`${BASE}/api/thumb/9999`, {
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': thumbIp, 'Content-Type': 'image/png' },
+      body: new ReadableStream({ start(c) { c.enqueue(new Uint8Array(16)); c.close(); } }),
+      duplex: 'half',
+    });
+    const thumbNoClText = await thumbNoCl.text();
+    s.ok('无 Content-Length 的缩略图请求 411',
+      thumbNoCl.status === 411 && /Content-Length/.test(thumbNoClText), `${thumbNoCl.status} ${thumbNoClText.slice(0, 50)}`);
+
+    const bigText = await fetch(`${BASE}/api/share/text`, {
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': bodyIp, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'text=' + 'a'.repeat(1100 * 1024),
+    });
+    const bigTextBody = await bigText.text();
+    s.ok('超大文本表单 413',
+      bigText.status === 413 && /请求体过大/.test(bigTextBody), `${bigText.status} ${bigTextBody.slice(0, 50)}`);
+
+    const longPw = await call('/api/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'x'.repeat(300) }),
+    }, bodyIp);
+    s.ok('超长密码 401 密码过长',
+      longPw.status === 401 && /密码过长/.test(longPw.body), `${longPw.status} ${longPw.body.slice(0, 50)}`);
+
+    // ---- 5. 同一 IP 最多 5 个并发分片会话 ----
+    // Playwright 的 context 级 CF-Connecting-IP 会覆盖页面内 fetch 的同名头，
+    // 因此这里单独开一个页面上下文，确保它有独立的上传/分片桶
+    capPage = await newPage(browser, { tag: 'cap' });
+    await capPage.goto(`${BASE}/`, { waitUntil: 'domcontentloaded' });
+    const capCall = (path, init = {}) => apiJson(capPage, path, init);
+    for (let i = 0; i < 5; i++) {
+      const r = await capCall('/api/upload/chunk/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: `cap-${i}.bin`, size: 73400320, expire_value: '1' }),
+      });
+      if (r.status === 200 && r.json?.session) capSessions.push(r.json.session);
+    }
+    const sixth = await capCall('/api/upload/chunk/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: 'cap-6.bin', size: 73400320, expire_value: '1' }),
+    });
+    s.ok('同一 IP 前 5 个分片会话允许', capSessions.length === 5, `sessions=${capSessions.length}`);
+    s.ok('第 6 个并发分片会话被 429',
+      sixth.status === 429 && /最多 5 个/.test(sixth.body), `${sixth.status} ${sixth.body}`);
+    while (capSessions.length) {
+      const sid = capSessions.pop();
+      await capCall(`/api/upload/chunk/abort/${sid}`, { method: 'POST' }).catch(() => {});
+    }
+    await capPage.close();
+    capPage = null;
+
+    // ---- 6. 失败查询 5 次/分钟；成功查询不受影响 ----
     const freeCodes = (await call('/api/codes/6', {}, limitIp)).json?.codes || [];
     const failures = [];
     for (const c of freeCodes) failures.push((await call(`/api/info/${c}`, {}, limitIp)).status);
@@ -134,6 +204,13 @@ export async function securityHardeningSuite(browser) {
     await s.assertClean(page);
   } finally {
     if (session) await call(`/api/upload/chunk/abort/${session}`, { method: 'POST' }, chunkIp).catch(() => {});
+    if (capPage) {
+      while (capSessions.length) {
+        const sid = capSessions.pop();
+        await apiJson(capPage, `/api/upload/chunk/abort/${sid}`, { method: 'POST' }).catch(() => {});
+      }
+      await capPage.close().catch(() => {});
+    }
     if (Object.keys(adminHeaders).length) {
       const list = await call('/api/admin/file/list?size=100', { headers: adminHeaders }, adminIp).catch(() => null);
       for (const code of [textCode, hugeCode]) {

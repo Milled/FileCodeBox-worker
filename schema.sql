@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS fc_used_codes (
   created_at TEXT
 );
 
+-- 游客每日上传配额（按 IP + UTC 日期），防止单个 IP 在一天内耗尽 4 位取件码空间
+CREATE TABLE IF NOT EXISTS fc_upload_quota (
+  ip TEXT NOT NULL,
+  day TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (ip, day)
+);
+
 -- 分片上传：会话与已传片分两张表。
 -- 每片一行而不是把 etag 存成 JSON 数组，是因为前端会并发上传同一次会话的多片，
 -- JSON 的读改写会互相覆盖丢 etag（丢了就没法 complete）。

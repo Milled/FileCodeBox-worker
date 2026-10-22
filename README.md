@@ -147,7 +147,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
   -d '{"openUpload":"1","maxFileSize":"26214400","defaultExpireDays":"7","maxTotalStorage":"536870912"}'
 ```
 
-上传相关的错误码：`413` 单个文件超上限、`507` R2 总占用已满、`429` 触发上传/查询失败限流（分片用独立的桶，一次会话几十片不会把上传配额吃光）、`401` 游客上传被关、`411` 请求没有 `Content-Length`（长度未知，Worker 不接收）、`422` 分片序号越界 / 片长与账面对不上 / 缺片 / 有效期或下载次数非法（天数 1–3650，次数 1–1,000,000 或 -1）。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
+上传相关的错误码：`413` 单个文件超上限 / 请求体过大、`507` R2 总占用已满、`429` 触发上传/查询失败限流或游客配额（游客每 IP 每天最多 50 次上传，同一 IP 最多 5 个并发分片会话；分片用独立桶，一次会话几十片不会把上传配额吃光）、`401` 游客上传被关、`411` 请求没有 `Content-Length`（文件上传、文本表单、JSON 与缩略图都要求已知长度）、`422` 分片序号越界 / 片长与账面对不上 / 缺片 / 有效期或下载次数非法（天数 1–3650，次数 1–1,000,000 或 -1）。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
 
 ### 网页接口一览
 
@@ -244,7 +244,7 @@ npm run dev           # http://localhost:8787
 ```bash
 npm run typecheck     # tsc --noEmit
 npm test              # 主流程冒烟（Playwright 无头）
-npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片 / 安全加固，共 168 项断言
+npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片 / 安全加固，共 174 项断言
 ```
 
 用例假设本地服务已启动且表已建好：
@@ -258,7 +258,7 @@ BASE_URL=http://127.0.0.1:8790 npm run test:ui
 
 这些用例会**真实上传文件并修改后台设置**，因此默认只允许打本机地址；测自己的线上环境需显式加 `ALLOW_REMOTE=1`。可用环境变量：`BASE_URL`、`ADMIN_PASSWORD`、`SHOT_DIR`（输出全页截图）。
 
-本地测试会给每个页面上下文分配独立的伪 `CF-Connecting-IP`，让上传/查询限流桶互不干扰，因此默认不再每次等待 60 秒限流窗口；完整的 168 项回归通常 2–4 分钟跑完。测远程时 Cloudflare 会覆盖这个头，需要加 `REAL_RATE_LIMITS=1` 恢复「共享真实 IP + 等待窗口」的串行模式；`SKIP_RATE_WAIT=1` 只在该模式下跳过等待。
+本地测试会给每个页面上下文分配独立的伪 `CF-Connecting-IP`，让上传/查询限流桶互不干扰，因此默认不再每次等待 60 秒限流窗口；完整的 174 项回归通常 2–4 分钟跑完。测远程时 Cloudflare 会覆盖这个头，需要加 `REAL_RATE_LIMITS=1` 恢复「共享真实 IP + 等待窗口」的串行模式；`SKIP_RATE_WAIT=1` 只在该模式下跳过等待。
 
 ---
 

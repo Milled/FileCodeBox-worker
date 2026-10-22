@@ -14,7 +14,9 @@ import type { Context } from 'hono';
 import type { ChunkTask, Env } from './types';
 import { getClientIp } from './utils';
 import {
+  assertBodyWithinLimit,
   assertUploadAllowed,
+  consumeUploadQuota,
   ensureCodeAvailable,
   quotaMessage,
   remainingQuota,
@@ -22,6 +24,8 @@ import {
   resolveLimits,
 } from './shared';
 import {
+  countActiveChunkSessions,
+  checkRateLimit,
   deleteChunkTask,
   getChunkTask,
   getChunkTaskBySession,
@@ -32,15 +36,20 @@ import {
   listChunkParts,
   listChunkTasks,
   listStaleChunkTasks,
-  rateVerdict,
+  rateLimitAllowed,
+  rateLimitStatementFor,
   releaseCode,
   saveChunkPartStatement,
-  setSettingStatement,
-  checkRateLimit,
 } from './db';
 
 /** 分片自己的限流额度（每 60 秒）：一次会话可能有上百片，共用上传桶会把自己掐死 */
 const CHUNK_RATE_MAX = 300;
+/** 同一 IP 同时挂起的未完成会话上限（管理员不受限），防止只 init 不传就刷码 */
+const CHUNK_MAX_ACTIVE_PER_IP = 5;
+/** status/complete/abort 的独立桶：状态轮询不能吃分片额度，也不能无限读 D1 */
+const CHUNK_META_RATE_MAX = 120;
+/** init 的 JSON 只有几个字段，超过这个大小直接 413 */
+const MAX_CHUNK_INIT_BYTES = 64 * 1024;
 
 /**
  * 每片 16 MiB。
@@ -84,6 +93,14 @@ function sessionIdOf(c: Context<{ Bindings: Env }>): string {
   return session;
 }
 
+/** status/complete/abort 的独立限流：这些接口会读 D1，不能让未知句柄无限刷 */
+async function assertChunkMetaRate(c: Context<{ Bindings: Env }>, env: Env): Promise<void> {
+  const ip = getClientIp(c.req.raw.headers);
+  if (!(await checkRateLimit(env.DB, 'chunk_meta_ratelimit', ip, CHUNK_META_RATE_MAX))) {
+    throw { status: 429 as const, message: '操作过于频繁，请稍后再试' };
+  }
+}
+
 /** 与 uploadFile 一致的过期参数解析（兼容旧参数名 expire_days） */
 function expireFrom(body: Record<string, unknown>, defaultExpireDays: number): { expireAt: string; maxDownloads: number } {
   return resolveExpire({
@@ -99,7 +116,8 @@ export async function chunkInit(
   c: Context<{ Bindings: Env }>,
   env: Env,
 ): Promise<{ session: string; code: string; part_size: number; total_parts: number }> {
-  await assertUploadAllowed(c, env);
+  assertBodyWithinLimit(c, MAX_CHUNK_INIT_BYTES);
+  const isAdmin = await assertUploadAllowed(c, env);
 
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
@@ -131,6 +149,17 @@ export async function chunkInit(
   filename = (filename || '未命名').slice(0, 200);
   const mimeType = (typeof body.content_type === 'string' && body.content_type) || 'application/octet-stream';
   const { expireAt, maxDownloads } = expireFrom(body, limits.defaultExpireDays);
+
+  if (!isAdmin) {
+    const active = await countActiveChunkSessions(env.DB, ip, CHUNK_STALE_MS);
+    if (active >= CHUNK_MAX_ACTIVE_PER_IP) {
+      throw {
+        status: 429 as const,
+        message: `同时进行的上传会话过多（最多 ${CHUNK_MAX_ACTIVE_PER_IP} 个），请先完成或放弃已有上传`,
+      };
+    }
+  }
+  await consumeUploadQuota(c, env, isAdmin);
 
   const code = await ensureCodeAvailable(String(body.code ?? '').trim(), env);
   const key = `file:${code}`;
@@ -171,24 +200,21 @@ export async function chunkPut(
 ): Promise<{ ok: true; part: number }> {
   const part = parseInt(c.req.param('part') ?? '');
   const session = sessionIdOf(c);
-  const rateKey = `chunk_ratelimit:${getClientIp(c.req.raw.headers)}`;
+  const ip = getClientIp(c.req.raw.headers);
 
-  // 每片的成本主要是串行往返次数（这一档账号上一趟 D1 就是百来毫秒），所以：
-  // 读限流窗口与取会话行合成一次 batch；写限流与记账再合成一次 batch —— 每片两趟往返顶天。
-  // 「这片是不是已经传过」的预查直接去掉：它只能省一次冗余写，却要在每片的路上多插一趟往返，
-  // 而重复片由 R2 的覆盖语义接住（同内容同 etag），真正省带宽的跳过在 status 接口那边。
-  // 代价要说清楚：限流计数因此在 R2 写成功之后才累加，所以反复失败（比如片长不对）的请求
-  // 不会把桶填满 —— 挡住无限刷片靠的是句柄本身（128 位随机），每次尝试仍要付一趟读的成本
+  // 限流 UPSERT 与取会话合成一个 batch：每片仍只付一趟读往返。
+  // 计数在 UPSERT 里原子递增，失败片（片长不对、会话不存在）也会计入，
+  // 不会留下“拿到句柄就能无限刷无效片”的缺口。
+  // 「这片是不是已经传过」的预查仍然不做：重复片由 R2 覆盖语义接住，
+  // 真正省带宽的跳过在 status 接口那边。
   const [rateRes, taskRes] = await env.DB.batch([
-    env.DB.prepare('SELECT value FROM fc_settings WHERE key = ?').bind(rateKey),
+    rateLimitStatementFor(env.DB, 'chunk_ratelimit', ip),
     getChunkTaskStatement(env.DB, session),
   ]);
-
-  const raw = (rateRes.results as Array<{ value?: string } | undefined> | undefined)?.[0]?.value ?? null;
-  const verdict = rateVerdict(raw, CHUNK_RATE_MAX);
-  // 限流用独立桶：一次会话可能有上百片，共用上传桶会把自己掐死；
-  // 反过来没有它，拿到会话句柄的人就能无限刷片
-  if (!verdict.allowed) throw { status: 429 as const, message: '分片上传过于频繁，请稍后再试' };
+  const rateRow = (rateRes.results as Array<{ value?: string } | undefined> | undefined)?.[0];
+  if (!rateLimitAllowed(rateRow, CHUNK_RATE_MAX)) {
+    throw { status: 429 as const, message: '分片上传过于频繁，请稍后再试' };
+  }
 
   const task = (taskRes.results as ChunkTask[] | undefined)?.[0];
   if (!task) throw { status: 404 as const, message: '上传会话不存在或已结束' };
@@ -216,10 +242,7 @@ export async function chunkPut(
     throw e;
   }
 
-  await env.DB.batch([
-    setSettingStatement(env.DB, rateKey, verdict.value),
-    saveChunkPartStatement(env.DB, task.upload_id, part, etag),
-  ]);
+  await saveChunkPartStatement(env.DB, task.upload_id, part, etag).run();
   return { ok: true, part };
 }
 
@@ -228,6 +251,7 @@ export async function chunkStatus(
   c: Context<{ Bindings: Env }>,
   env: Env,
 ): Promise<{ session: string; total_parts: number; done: number[] }> {
+  await assertChunkMetaRate(c, env);
   const task = await resolveTask(c, env);
   const parts = await listChunkParts(env.DB, task.upload_id);
   return { session: task.session_id, total_parts: task.total_parts, done: parts.map((p) => p.part_number) };
@@ -238,6 +262,7 @@ export async function chunkComplete(
   c: Context<{ Bindings: Env }>,
   env: Env,
 ): Promise<{ code: string; filename: string; size: number }> {
+  await assertChunkMetaRate(c, env);
   const task = await resolveTask(c, env);
   const uploadId = task.upload_id;
 
@@ -284,37 +309,64 @@ export async function chunkComplete(
 
 /** 客户端主动放弃：清会话、释放取件码。已经结束的会话重复放弃也返回成功（页面卸载会兜底再发一次） */
 export async function chunkAbort(c: Context<{ Bindings: Env }>, env: Env): Promise<{ ok: true }> {
+  await assertChunkMetaRate(c, env);
   const task = await getChunkTaskBySession(env.DB, sessionIdOf(c));
-  if (task) await forceAbort(env, task);
+  if (task && !(await forceAbort(env, task))) {
+    throw { status: 502 as const, message: '会话清理失败，请稍后重试' };
+  }
   return { ok: true };
 }
 
+const NO_SUCH_UPLOAD_RE = /no such upload|nosuchupload|does not exist|not found/i;
+
 /**
- * 关掉一个会话。
+ * 关掉一个会话，返回是否已真正结束（可以安全删除记录）。
  * 只 abort multipart（未 complete 时不会留下对象），**绝不删 file:{code}** ——
  * 万一 complete 成功而清理行失败，删对象就会把用户的真文件抹掉。
  * 释放取件码之前也要确认没有对应文件记录，同理。
+ *
+ * abort 失败时保留会话行：一删行就再没有 API 能列出这个 multipart，
+ * 它会永久计费且 R2 面板/孤儿扫描都看不见。保留后 Cron/管理员可以重试。
  */
-async function forceAbort(env: Env, task: ChunkTask): Promise<void> {
+async function forceAbort(env: Env, task: ChunkTask): Promise<boolean> {
+  // 已有同名文件记录：complete 已经成功，multipart 已结束，只清理会话行，绝不能 abort 对象
+  if (await hasFileRecord(env.DB, task.code)) {
+    await deleteChunkTask(env.DB, task.upload_id);
+    return true;
+  }
+
+  let closed = false;
   try {
     await env.FILE_STORE.resumeMultipartUpload(`file:${task.code}`, task.upload_id).abort();
+    closed = true;
   } catch (e: any) {
-    // 会话可能已完成或本就不存在；但行一删就再没有 API 能列出它，所以失败必须留痕
-    console.error(`分片 abort 失败 code=${task.code} size=${task.size}: ${e?.message || e}`);
+    const msg = String(e?.message ?? e);
+    // 已完成或本就不存在：multipart 不在计费了，可以安全删行
+    if (NO_SUCH_UPLOAD_RE.test(msg)) closed = true;
+    else console.error(`分片 abort 失败，保留会话待重试 code=${task.code} size=${task.size}: ${msg}`);
   }
+  if (!closed) return false;
+
   await deleteChunkTask(env.DB, task.upload_id);
   if (!(await hasFileRecord(env.DB, task.code))) {
     await releaseCode(env.DB, task.code);
   }
+  return true;
 }
 
 /** 超时未完成的会话：abort 掉，否则已传的分片会一直计费 */
 export async function cleanupStaleChunkUploads(env: Env): Promise<number> {
   const stale = await listStaleChunkTasks(env.DB, CHUNK_STALE_MS);
+  let closed = 0;
   for (const task of stale) {
-    await forceAbort(env, task);
+    try {
+      if (await forceAbort(env, task)) closed++;
+    } catch (e) {
+      // 单个会话失败不影响其余会话；保留行下次重试
+      console.error(`清理过期分片会话失败 code=${task.code}: ${String((e as any)?.message ?? e)}`);
+    }
   }
-  return stale.length;
+  return closed;
 }
 
 /**
@@ -325,15 +377,19 @@ export async function cleanupStaleChunkUploads(env: Env): Promise<number> {
 export async function abortChunkSession(env: Env, uploadId: string): Promise<boolean> {
   const task = await getChunkTask(env.DB, uploadId);
   if (!task) return false;
-  await forceAbort(env, task);
-  return true;
+  return forceAbort(env, task);
 }
 
 /** 后台「放弃全部进行中会话」 */
 export async function abortAllChunkSessions(env: Env): Promise<number> {
   const tasks = await listChunkTasks(env.DB);
+  let closed = 0;
   for (const task of tasks) {
-    await forceAbort(env, task);
+    try {
+      if (await forceAbort(env, task)) closed++;
+    } catch (e) {
+      console.error(`放弃分片会话失败 code=${task.code}: ${String((e as any)?.message ?? e)}`);
+    }
   }
-  return tasks.length;
+  return closed;
 }

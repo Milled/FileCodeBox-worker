@@ -3,6 +3,7 @@
  * 避免两套路由体系维护同一份上传/下载/过期处理代码。
  */
 import type { Context } from 'hono';
+import { getCookie } from 'hono/cookie';
 import type { Env } from './types';
 import type { FileRecord } from './types';
 import { isValidCode, generateCode, getClientIp, formatFileSize } from './utils';
@@ -17,6 +18,7 @@ import {
   markThumb,
   releaseCode,
   checkRateLimit,
+  consumeDailyUpload,
   getPendingChunkBytes,
   getSetting,
   getStorageUsed,
@@ -29,6 +31,7 @@ export const FALLBACK_MAX_FILE_SIZE = 104857600;
 const FALLBACK_EXPIRE_DAYS = 7;
 const MAX_EXPIRE_DAYS = 3650;
 const MAX_DOWNLOADS = 1_000_000;
+const MAX_TEXT_FORM_BYTES = 1024 * 1024;
 /** 失败取件码查询：每 IP 每分钟最多 5 次，超过后连正常查询也先停一分钟 */
 export const LOOKUP_RATE_MAX = 5;
 export const LOOKUP_RATE_MESSAGE = '查询失败次数过多，请稍后再试';
@@ -181,15 +184,68 @@ export async function ensureCodeAvailable(rawCode: string, env: Env): Promise<st
 
 // ===================== 上传门控 =====================
 
+/** 游客每个 IP 每天最多成功发起多少次上传（含分片 init）；管理员不受限 */
+export const GUEST_DAILY_UPLOAD_LIMIT = 50;
+
 /**
  * open_upload 开关：为 '0' 时仅管理员可上传。
- * 放在 shared.ts 而非路由中间件，是为了让首页 /api/upload、/api/upload/text
- * 与兼容 API /api/share/* 共用同一道闸 —— 之前只拦兼容 API，后台开关形同虚设。
+ * 返回是否为管理员：游客配额/并发会话限制需要据此豁免。
+ * 只有请求带凭据时才多查一次 token，普通游客不会为这个判断多付 D1。
  */
-export async function assertUploadAllowed(c: Context<{ Bindings: Env }>, env: Env): Promise<void> {
-  if (((await getSetting(env.DB, 'open_upload')) ?? '1') !== '0') return;
-  if (await adminAuth(c, env)) return;
+export async function assertUploadAllowed(c: Context<{ Bindings: Env }>, env: Env): Promise<boolean> {
+  const hasCredential = Boolean(getCookie(c, 'admin_token') || c.req.header('Authorization'));
+  if (((await getSetting(env.DB, 'open_upload')) ?? '1') !== '0') {
+    return hasCredential ? await adminAuth(c, env) : false;
+  }
+  if (await adminAuth(c, env)) return true;
   throw { status: 401 as const, message: '游客上传已关闭，请先登录' };
+}
+
+/**
+ * 游客每日上传配额：防止单个 IP 在一天内把 10,000 个 4 位取件码占满。
+ * 只对通过基础校验、即将抢码的请求计数；管理员（有效 token）直接放行。
+ */
+export async function consumeUploadQuota(
+  c: Context<{ Bindings: Env }>,
+  env: Env,
+  isAdmin: boolean,
+): Promise<void> {
+  if (isAdmin) return;
+  const allowed = await consumeDailyUpload(
+    env.DB,
+    getClientIp(c.req.raw.headers),
+    GUEST_DAILY_UPLOAD_LIMIT,
+  );
+  if (!allowed) {
+    throw {
+      status: 429 as const,
+      message: `游客每日上传次数已达上限（${GUEST_DAILY_UPLOAD_LIMIT} 次/IP），请明天再试`,
+    };
+  }
+}
+
+/**
+ * 需要整体缓冲的接口（文本表单 / JSON / 缩略图）必须在碰 body 之前限长：
+ * 100MB 的请求体接近 isolate 的 128MB 内存上限，不能读完再检查。
+ * 这些接口都要求 Content-Length；拿不到长度时拒绝，避免退化成无界 arrayBuffer/parseBody。
+ */
+export function assertBodyWithinLimit(
+  c: Context<{ Bindings: Env }>,
+  maxBytes: number,
+  requireLength = true,
+): void {
+  const raw = c.req.header('Content-Length');
+  const n = Number(raw);
+  const known = raw !== undefined && Number.isInteger(n) && n >= 0;
+  if (!known) {
+    if (requireLength) {
+      throw { status: 411 as const, message: '请求必须带 Content-Length' };
+    }
+    return;
+  }
+  if (n > maxBytes) {
+    throw { status: 413 as const, message: '请求体过大' };
+  }
 }
 
 // ===================== 存储配额与流式写入 =====================
@@ -244,7 +300,7 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   filename: string;
   size: number;
 }> {
-  await assertUploadAllowed(c, env);
+  const isAdmin = await assertUploadAllowed(c, env);
 
   // 上传速率限制：60 秒内同一 IP 最多 10 次上传
   const ip = getClientIp(c.req.raw.headers);
@@ -290,6 +346,8 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   }
   if (declared > quotaLeft) throw { status: 507 as const, message: quotaMessage(limits) };
 
+  // 到这里才算一次有效上传尝试；管理员（有效 token）跳过每日配额
+  await consumeUploadQuota(c, env, isAdmin);
   const code = await ensureCodeAvailable(rawCode, env);
   const key = `file:${code}`;
 
@@ -403,6 +461,9 @@ export async function saveThumb(
   const code = (c.req.param('code') || '').trim();
   if (!code) throw { status: 422 as const, message: '缺少取件码' };
 
+  // 必须在 arrayBuffer 之前限长；拿不到长度就拒绝，避免 100MB chunked 请求进内存
+  assertBodyWithinLimit(c, THUMB_MAX_BYTES);
+
   // 单独限流：与上传共用一个桶的话，一张图片会吃掉两次上传配额
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'thumb_ratelimit', ip, 30))) {
@@ -422,10 +483,6 @@ export async function saveThumb(
     throw { status: 415 as const, message: '仅图片文件支持缩略图' };
   }
 
-  const declared = Number(c.req.header('Content-Length'));
-  if (Number.isFinite(declared) && declared > THUMB_MAX_BYTES) {
-    throw { status: 413 as const, message: '缩略图过大' };
-  }
   const body = await c.req.arrayBuffer();
   if (body.byteLength === 0) throw { status: 422 as const, message: '缩略图为空' };
   if (body.byteLength > THUMB_MAX_BYTES) throw { status: 413 as const, message: '缩略图过大' };
@@ -516,7 +573,9 @@ export async function uploadText(
   expireAt: string;
   maxDownloads: number;
 }> {
-  await assertUploadAllowed(c, env);
+  // parseBody 会把整个表单读进内存，必须在碰 body 之前限长
+  assertBodyWithinLimit(c, MAX_TEXT_FORM_BYTES);
+  const isAdmin = await assertUploadAllowed(c, env);
 
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
@@ -545,6 +604,7 @@ export async function uploadText(
     throw { status: 507 as const, message: quotaMessage(limits) };
   }
 
+  await consumeUploadQuota(c, env, isAdmin);
   const code = await ensureCodeAvailable(rawCode, env);
   const title = text.replace(/\s+/g, ' ').slice(0, 50) + (text.length > 50 ? '…' : '');
 
