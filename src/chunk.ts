@@ -18,10 +18,10 @@ import {
   assertUploadAllowed,
   consumeUploadQuota,
   ensureCodeAvailable,
+  loadUploadPolicy,
   quotaMessage,
   remainingQuota,
   resolveExpire,
-  resolveLimits,
 } from './shared';
 import {
   countActiveChunkSessions,
@@ -120,7 +120,7 @@ export async function chunkInit(
   env: Env,
 ): Promise<{ session: string; code: string; part_size: number; total_parts: number }> {
   assertBodyWithinLimit(c, MAX_CHUNK_INIT_BYTES);
-  const isAdmin = await assertUploadAllowed(c, env);
+  const { isAdmin, limits } = await loadUploadPolicy(c, env);
 
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
@@ -133,7 +133,6 @@ export async function chunkInit(
   const size = Number(body.size);
   if (!Number.isInteger(size) || size <= 0) throw { status: 422 as const, message: '无效的文件大小' };
 
-  const limits = await resolveLimits(env);
   if (size > limits.maxSize) {
     throw { status: 413 as const, message: `文件过大，最大 ${Math.floor(limits.maxSize / 1048576)}MB` };
   }

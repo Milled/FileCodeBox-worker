@@ -326,6 +326,20 @@ select.input { appearance: none; padding-right: 32px; cursor: pointer; }
   transition: width 0.2s var(--ease-out);
   width: 0;
 }
+.turnstile-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 14px;
+}
+.turnstile-status {
+  font-size: 12px;
+  color: var(--color-ink-2);
+  text-align: center;
+  min-height: 16px;
+}
+
 .upload-status {
   font-size: 12px;
   color: var(--color-ink-2);

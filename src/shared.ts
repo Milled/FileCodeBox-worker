@@ -3,11 +3,15 @@
  * 避免两套路由体系维护同一份上传/下载/过期处理代码。
  */
 import type { Context } from 'hono';
-import { getCookie } from 'hono/cookie';
 import type { Env } from './types';
 import type { FileRecord } from './types';
 import { isValidCode, generateCode, getClientIp, formatFileSize, sanitizeFilename } from './utils';
-import { adminAuth } from './auth';
+import { adminAuth, hasAdminCredential, verifyAdminToken } from './auth';
+import {
+  TURNSTILE_SETTING_KEY,
+  turnstileConfigured,
+  verifyGuestVerifiedCookie,
+} from './turnstile';
 import {
   getFileByCode,
   findCodeRun,
@@ -22,6 +26,7 @@ import {
   adjustStorageUsed,
   getPendingChunkBytes,
   getSetting,
+  getSettings,
   getStorageUsed,
 } from './db';
 
@@ -37,36 +42,42 @@ const MAX_TEXT_FORM_BYTES = 1024 * 1024;
 export const LOOKUP_RATE_MAX = 5;
 export const LOOKUP_RATE_MESSAGE = '查询失败次数过多，请稍后再试';
 
-/**
- * 解析当前生效的文件大小上限与默认过期天数。
- * 管理员后台 PATCH /api/admin/config/update 写入 fc_settings 的值优先于 wrangler vars，
- * 两者都缺失或非法（非正整数）时回退到内置默认，避免 NaN 导致校验被绕过。
- */
-export async function resolveLimits(
+export interface RuntimeLimits {
+  maxSize: number;
+  defaultExpireDays: number;
+  maxTotalStorage: number;
+}
+
+const positiveInt = (v: string | null | undefined): number => {
+  const n = parseInt(v ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
+/** 把已经读到的设置行解析成生效上限；纯函数，供合并查询后的各路径复用 */
+export function limitsFromValues(
+  values: Record<string, string | undefined>,
   env: Env,
-): Promise<{ maxSize: number; defaultExpireDays: number; maxTotalStorage: number }> {
-  const positiveInt = (v: string | null | undefined): number => {
-    const n = parseInt(v ?? '', 10);
-    return Number.isFinite(n) && n > 0 ? n : 0;
-  };
-
-  const [dbMaxSize, dbExpireDays, dbMaxTotal] = await Promise.all([
-    getSetting(env.DB, 'max_file_size'),
-    getSetting(env.DB, 'default_expire_days'),
-    getSetting(env.DB, 'max_total_storage'),
-  ]);
-
+): RuntimeLimits {
   return {
-    maxSize: positiveInt(dbMaxSize) || positiveInt(env.MAX_FILE_SIZE) || FALLBACK_MAX_FILE_SIZE,
+    maxSize: positiveInt(values['max_file_size']) || positiveInt(env.MAX_FILE_SIZE) || FALLBACK_MAX_FILE_SIZE,
     // 后台/变量值也夹到 3650 天：否则一个错误的默认值会让所有未显式指定有效期的上传
     // 在构造 Date 时越界，表现为全站上传 500
     defaultExpireDays: Math.min(
       MAX_EXPIRE_DAYS,
-      positiveInt(dbExpireDays) || positiveInt(env.DEFAULT_EXPIRE_DAYS) || FALLBACK_EXPIRE_DAYS,
+      positiveInt(values['default_expire_days']) || positiveInt(env.DEFAULT_EXPIRE_DAYS) || FALLBACK_EXPIRE_DAYS,
     ),
     // 总占用上限：0 = 不限制（清空后台设置即回到不限）
-    maxTotalStorage: positiveInt(dbMaxTotal),
+    maxTotalStorage: positiveInt(values['max_total_storage']),
   };
+}
+
+/**
+ * 解析当前生效的文件大小上限与默认过期天数。
+ * 三个键用一次 IN 查询读完，避免为每个键各付一趟 D1。
+ */
+export async function resolveLimits(env: Env): Promise<RuntimeLimits> {
+  const values = await getSettings(env.DB, ['max_file_size', 'default_expire_days', 'max_total_storage']);
+  return limitsFromValues(values, env);
 }
 
 // ===================== 过期策略 =====================
@@ -194,12 +205,64 @@ export const GUEST_DAILY_UPLOAD_LIMIT = 50;
  * 只有请求带凭据时才多查一次 token，普通游客不会为这个判断多付 D1。
  */
 export async function assertUploadAllowed(c: Context<{ Bindings: Env }>, env: Env): Promise<boolean> {
-  const hasCredential = Boolean(getCookie(c, 'admin_token') || c.req.header('Authorization'));
+  const hasCredential = hasAdminCredential(c);
   if (((await getSetting(env.DB, 'open_upload')) ?? '1') !== '0') {
     return hasCredential ? await adminAuth(c, env) : false;
   }
   if (await adminAuth(c, env)) return true;
   throw { status: 401 as const, message: '游客上传已关闭，请先登录' };
+}
+
+const POLICY_SETTING_KEYS = [
+  'open_upload', 'max_file_size', 'default_expire_days', 'max_total_storage', TURNSTILE_SETTING_KEY,
+];
+
+/** 一次查询拿到「游客开关 + 三个上限 + 可选管理员 token」，供首页和上传路径复用 */
+async function readPolicySettings(
+  c: Context<{ Bindings: Env }>,
+  env: Env,
+): Promise<{ settings: Record<string, string>; isAdmin: boolean }> {
+  const hasCredential = hasAdminCredential(c);
+  const keys = hasCredential ? [...POLICY_SETTING_KEYS, 'admin_token'] : POLICY_SETTING_KEYS;
+  const settings = await getSettings(env.DB, keys);
+  const isAdmin = hasCredential ? verifyAdminToken(c, settings['admin_token'] ?? null) : false;
+  return { settings, isAdmin };
+}
+
+/** 上传门控 + 生效上限合并成一次 D1 查询；关闭游客上传时抛 401 */
+export async function loadUploadPolicy(
+  c: Context<{ Bindings: Env }>,
+  env: Env,
+): Promise<{ isAdmin: boolean; limits: RuntimeLimits }> {
+  const { settings, isAdmin } = await readPolicySettings(c, env);
+  if ((settings['open_upload'] ?? '1') === '0' && !isAdmin) {
+    throw { status: 401 as const, message: '游客上传已关闭，请先登录' };
+  }
+  if (settings[TURNSTILE_SETTING_KEY] === '1' && !isAdmin) {
+    if (!turnstileConfigured(env)) {
+      // 后台已开启但密钥不全：失败关闭，不能悄悄退化成无验证上传
+      throw { status: 503 as const, message: '人机验证未配置完整，请联系管理员' };
+    }
+    if (!(await verifyGuestVerifiedCookie(c, env))) {
+      throw { status: 403 as const, message: '请先完成人机验证' };
+    }
+  }
+  return { isAdmin, limits: limitsFromValues(settings, env) };
+}
+
+/** 首页展示用：不抛 401，只告诉页面要不要渲染上传区 / Turnstile */
+export async function loadHomePolicy(
+  c: Context<{ Bindings: Env }>,
+  env: Env,
+): Promise<{ uploadAllowed: boolean; isAdmin: boolean; limits: RuntimeLimits; turnstileRequired: boolean }> {
+  const { settings, isAdmin } = await readPolicySettings(c, env);
+  return {
+    uploadAllowed: isAdmin || (settings['open_upload'] ?? '1') !== '0',
+    isAdmin,
+    limits: limitsFromValues(settings, env),
+    turnstileRequired:
+      settings[TURNSTILE_SETTING_KEY] === '1' && !isAdmin && turnstileConfigured(env),
+  };
 }
 
 /**
@@ -301,7 +364,7 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   filename: string;
   size: number;
 }> {
-  const isAdmin = await assertUploadAllowed(c, env);
+  const { isAdmin, limits } = await loadUploadPolicy(c, env);
 
   // 上传速率限制：60 秒内同一 IP 最多 10 次上传
   const ip = getClientIp(c.req.raw.headers);
@@ -310,7 +373,6 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   }
 
   const rawCode = (c.req.query('code') || '').trim();
-  const limits = await resolveLimits(env);
   // 兼容旧参数名 (expire_days/max_downloads) 和新参数名 (expire_value/expire_style)。
   // 必须在 ensureCodeAvailable 之前校验：这里抛 422 时还没有占码
   const { expireAt, maxDownloads: effectiveMaxDownloads } = resolveExpire({
@@ -664,7 +726,7 @@ export async function uploadText(
 }> {
   // parseBody 会把整个表单读进内存，必须在碰 body 之前限长
   assertBodyWithinLimit(c, MAX_TEXT_FORM_BYTES);
-  const isAdmin = await assertUploadAllowed(c, env);
+  const { isAdmin, limits } = await loadUploadPolicy(c, env);
 
   const ip = getClientIp(c.req.raw.headers);
   if (!(await checkRateLimit(env.DB, 'upload_ratelimit', ip, 10))) {
@@ -679,7 +741,6 @@ export async function uploadText(
   if (textSize > 512 * 1024) throw { status: 400 as const, message: '文本过长，最大支持 512KB' };
 
   const rawCode = typeof body['code'] === 'string' ? body['code'] : '';
-  const limits = await resolveLimits(env);
   // 同 uploadFile：校验必须在抢码之前
   const { expireAt, maxDownloads: effectiveMaxDownloads } = resolveExpire({
     value: body['expire_value'] ?? body['expire_days'],

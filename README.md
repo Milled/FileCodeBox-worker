@@ -79,6 +79,22 @@ Cloudflare Dashboard → **Workers & Pages → Create → Import a Git repositor
 
 不设这个变量时上传与取件照常，但后台无法登录。密码请存成 Secret，不要写成明文 Variable。
 
+### 3.1 可选：Turnstile 人机验证
+
+如需给游客上传加一道人机验证，在 Cloudflare Dashboard → Turnstile 创建一个站点，然后给 Worker 配置：
+
+| 名称 | 建议类型 | 值 |
+|------|----------|----|
+| `TURNSTILE_SITE_KEY` | Variable 或 Secret | Turnstile 的 Site Key（公开） |
+| `TURNSTILE_SECRET_KEY` | Secret | Turnstile 的 Secret Key |
+
+部署后在 **后台 → 设置 → Turnstile 人机验证** 选择开启即可。开启后：
+
+- 游客在网页完成一次验证，会得到一个绑定当前 IP、1 小时有效的签名 cookie；之后的多文件上传、分片 init、文本分享都复用它，不会每个请求都弹验证。
+- 验证服务端只在 `/api/turnstile/verify` 调一次 Cloudflare siteverify；上传路径只做 HMAC cookie 校验，不额外访问外部服务或 D1。
+- 管理员（有效 cookie/Bearer token）不受影响；**纯 API 游客上传会需要浏览器完成过验证**，没有浏览器自动化时请保持关闭，或改用管理员 Bearer token。
+- 两个密钥缺任意一个时，后台无法真正开启；若开启后密钥被移除，游客上传会失败关闭（503），管理员仍可上传。
+
 ### 4. 首次访问：等一次建表
 
 数据表由 Worker 自己创建（`initDB()`），触发时机是**每 30 分钟一次的 Cron**（`triggers.crons` 已配好）。所以刚部署完立刻打开 `/admin` 可能报错，等半小时即正常。
@@ -199,6 +215,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
 | 单文件大小上限（MB） | 覆盖 `MAX_FILE_SIZE`；清空即回退到配置文件里的值 |
 | 默认过期天数 | 覆盖 `DEFAULT_EXPIRE_DAYS` |
 | R2 总占用上限（MB） | 已用空间达到上限后拒绝新的上传与文本分享（返回 507），已有文件不受影响；留空或 0 = 不限制 |
+| Turnstile 人机验证 | 开启后游客上传需要先完成验证（1 小时内复用）；需先配置 `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` |
 
 两个大小设置都以 **MB** 为单位填写（可填小数），落库仍是字节 —— `fc_settings`、服务端比较与兼容 API 的 `maxFileSize` / `maxTotalStorage` 字段都按字节走，只有表单换算了单位。
 
@@ -219,6 +236,8 @@ R2 免费额度为 10 GiB 存储，超出部分按量计费且**不会自动熔�
 | `ADMIN_PASSWORD` | Secret | 无 | 管理员密码；未设置则无法登录后台 |
 | `MAX_FILE_SIZE` | `vars` | `104857600` | 单文件上限（字节），即 100 MB |
 | `DEFAULT_EXPIRE_DAYS` | `vars` | `7` | 未指定过期参数时的默认天数 |
+| `TURNSTILE_SITE_KEY` | Secret/Variable | 无 | 可选；Turnstile 公开 Site Key |
+| `TURNSTILE_SECRET_KEY` | Secret | 无 | 可选；Turnstile Secret Key，同时用于签名游客验证 cookie |
 | `triggers.crons` | `wrangler.jsonc` | `*/30 * * * *` | 建表、清理过期文件与孤儿对象、清理限流记录 |
 
 ### 本地开发

@@ -33,20 +33,34 @@ function timingSafeCompare(a: string, b: string): boolean {
   return result === 0;
 }
 
+/** 请求是否带了管理员凭据（用于决定要不要多查一次 token） */
+export function hasAdminCredential(c: Context<{ Bindings: Env }>): boolean {
+  return Boolean(getCookie(c, 'admin_token') || c.req.header('Authorization'));
+}
+
 /**
- * 验证管理员是否已登录。
- * 返回 true 表示已认证，false 需要登录。
- * 使用常数时间比较防止时序攻击。
+ * 用已经读到的 stored token 做常数时间校验，不再自己查 D1。
+ * 供「token + 其他设置合并成一次查询」的路径使用。
  */
-export async function adminAuth(c: Context<{ Bindings: Env }>, env: Env): Promise<boolean> {
+export function verifyAdminToken(c: Context<{ Bindings: Env }>, stored: string | null): boolean {
   const token =
     getCookie(c, 'admin_token') ??
     c.req.header('Authorization')?.replace('Bearer ', '');
   if (!token) return false;
-
   try {
-    const stored = await getSetting(env.DB, 'admin_token');
     return timingSafeCompare(token, stored ?? '');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 验证管理员是否已登录。
+ * 返回 true 表示已认证，false 需要登录。
+ */
+export async function adminAuth(c: Context<{ Bindings: Env }>, env: Env): Promise<boolean> {
+  try {
+    return verifyAdminToken(c, await getSetting(env.DB, 'admin_token'));
   } catch {
     return false;
   }

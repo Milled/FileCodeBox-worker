@@ -3,7 +3,6 @@
  * 像取快递一样取文件
  */
 import { Hono } from 'hono';
-import { getCookie } from 'hono/cookie';
 import type { Context } from 'hono';
 
 import type { Env, FileRecord } from './types';
@@ -21,12 +20,12 @@ import {
   incrementDownload,
   getDashboardStats,
   listChunkTasks,
-  getSetting,
-  getStorageUsed,
+  getSettings,
+  checkRateLimit,
   setSetting,
   setStorageUsed,
 } from './db';
-import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
+import { adminAuth, handleAdminLogin, handleAdminLogout, hasAdminCredential, verifyAdminToken } from './auth';
 import api from './api';
 import {
   uploadFile,
@@ -35,17 +34,26 @@ import {
   saveThumb,
   readThumb,
   allocateCodeRun,
-  resolveLimits,
+  loadHomePolicy,
+  limitsFromValues,
   registerLookupFailure,
   displayFilename,
   assertBodyWithinLimit,
   LOOKUP_RATE_MESSAGE,
   FALLBACK_MAX_FILE_SIZE,
 } from './shared';
+import type { RuntimeLimits } from './shared';
 import { generateQRCodeGIF } from './qr';
 import { chunkInit, chunkPut, chunkStatus, chunkComplete, chunkAbort, abortChunkSession, abortAllChunkSessions, cleanupStaleChunkUploads } from './chunk';
 import { STYLE } from './templates/style';
-import { encodeFilename, parseIntParam, toPublicError } from './utils';
+import { encodeFilename, getClientIp, parseIntParam, toPublicError } from './utils';
+import {
+  TURNSTILE_SETTING_KEY,
+  turnstileConfigured,
+  verifyTurnstileToken,
+  issueGuestVerifiedCookie,
+  verifyGuestVerifiedCookie,
+} from './turnstile';
 import type { HomeOptions } from './templates/pages';
 import type { AdminConfig } from './templates/pages';
 import {
@@ -70,7 +78,9 @@ app.use('*', async (c, next) => {
   c.res.headers.set(
     'Content-Security-Policy',
     "default-src 'self'; " +
-      "script-src 'self' 'unsafe-inline'; " +
+      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; " +
+      "connect-src 'self' https://challenges.cloudflare.com; " +
+      "frame-src https://challenges.cloudflare.com; " +
       "style-src 'self' 'unsafe-inline'; " +
       "img-src 'self' https: data:; " +
       "object-src 'none'; " +
@@ -91,19 +101,19 @@ function getBaseUrl(c: Context<{ Bindings: Env }>): string {
 }
 
 /**
- * 首页所需的生效设置。
- * 全新数据库尚未建表时（initDB 由 Cron 或 provision 完成）必须降级为默认值，
- * 否则首页会从「可用静态页」退化成 500。
+ * 首页所需的生效设置：token 校验 + 开放开关 + 三个上限一次查完。
+ * 全新数据库尚未建表时必须降级为默认值，否则首页会从「可用静态页」退化成 500。
  */
-async function homeOptions(env: Env, isAdmin = false): Promise<HomeOptions> {
+async function homeOptions(c: Context<{ Bindings: Env }>): Promise<HomeOptions> {
   try {
-    const [openUpload, limits] = await Promise.all([getSetting(env.DB, 'open_upload'), resolveLimits(env)]);
+    const policy = await loadHomePolicy(c, c.env);
     return {
-      // 管理员始终保留上传区：后端 assertUploadAllowed 本来就允许管理员上传，
-      // 页面不能因为 open_upload=0 把管理员也挡在外面
-      uploadAllowed: isAdmin || (openUpload ?? '1') !== '0',
-      defaultExpireDays: limits.defaultExpireDays,
-      maxFileSize: limits.maxSize,
+      // 管理员始终保留上传区：后端 loadUploadPolicy 本来就允许管理员上传
+      uploadAllowed: policy.uploadAllowed,
+      defaultExpireDays: policy.limits.defaultExpireDays,
+      maxFileSize: policy.limits.maxSize,
+      turnstileRequired: policy.turnstileRequired,
+      turnstileSiteKey: policy.turnstileRequired ? (c.env.TURNSTILE_SITE_KEY ?? '') : undefined,
     };
   } catch {
     return { uploadAllowed: true, defaultExpireDays: 7, maxFileSize: FALLBACK_MAX_FILE_SIZE };
@@ -120,23 +130,52 @@ function guardFormBody(c: Context<{ Bindings: Env }>, maxBytes: number): Respons
   }
 }
 
+const ADMIN_SETTING_KEYS = [
+  'admin_token', 'open_upload', 'max_file_size', 'default_expire_days', 'max_total_storage',
+  'storage_used', TURNSTILE_SETTING_KEY,
+];
+
+interface AdminState {
+  openUpload: string;
+  limits: RuntimeLimits;
+  storageUsed: number;
+  turnstileEnabled: string;
+}
+
+/**
+ * 后台首屏一次查询完成「token 校验 + 生效设置 + 用量」。
+ * 无凭据时不打 DB；带凭据才读 admin_token 合并校验。
+ */
+async function readAdminState(c: Context<{ Bindings: Env }>): Promise<AdminState | null> {
+  if (!hasAdminCredential(c)) return null;
+  const settings = await getSettings(c.env.DB, ADMIN_SETTING_KEYS);
+  if (!verifyAdminToken(c, settings['admin_token'] ?? null)) return null;
+  const used = parseInt(settings['storage_used'] ?? '', 10);
+  return {
+    openUpload: settings['open_upload'] ?? '1',
+    limits: limitsFromValues(settings, c.env),
+    storageUsed: Number.isFinite(used) && used > 0 ? used : 0,
+    turnstileEnabled: settings[TURNSTILE_SETTING_KEY] === '1' ? '1' : '0',
+  };
+}
+
 /** 后台设置页所需的当前值（生效值 + vars 回退值） */
-async function adminConfig(env: Env): Promise<AdminConfig> {
-  const [openUpload, limits, used] = await Promise.all([
-    getSetting(env.DB, 'open_upload'), resolveLimits(env), getStorageUsed(env.DB),
-  ]);
+function adminConfigFromState(state: AdminState, env: Env): AdminConfig {
   const toInt = (v: string | undefined, fallback: number) => {
     const n = parseInt(v ?? '', 10);
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
   return {
-    openUpload: openUpload ?? '1',
-    maxFileSize: limits.maxSize,
-    defaultExpireDays: limits.defaultExpireDays,
-    maxTotalStorage: limits.maxTotalStorage,
-    storageUsed: used,
+    openUpload: state.openUpload,
+    maxFileSize: state.limits.maxSize,
+    defaultExpireDays: state.limits.defaultExpireDays,
+    maxTotalStorage: state.limits.maxTotalStorage,
+    storageUsed: state.storageUsed,
     varsMaxFileSize: toInt(env.MAX_FILE_SIZE, 104857600),
     varsDefaultExpireDays: toInt(env.DEFAULT_EXPIRE_DAYS, 7),
+    turnstileEnabled: state.turnstileEnabled,
+    turnstileConfigured: turnstileConfigured(env),
+    turnstileSiteKey: env.TURNSTILE_SITE_KEY ?? '',
   };
 }
 
@@ -163,10 +202,7 @@ app.get('/static/bg.webp', async (c) => {
 // 首页（需读一次生效设置，决定上传区还是登录引导；DB 未就绪时降级为默认可上传）
 app.get('/', async (c) => {
   c.header('Cache-Control', 'no-store');
-  // 只有带凭据时才多查一次 token；普通访客不会为管理员判断多付 D1
-  const hasCredential = Boolean(getCookie(c, 'admin_token') || c.req.header('Authorization'));
-  const isAdmin = hasCredential ? await adminAuth(c, c.env) : false;
-  return c.html(homePage(await homeOptions(c.env, isAdmin)));
+  return c.html(homePage(await homeOptions(c)));
 });
 
 // 取件页（静态，但需避免错误响应被 CDN 缓存，使用 no-store）
@@ -256,6 +292,50 @@ app.post('/api/upload/chunk/abort/:session', async (c) => {
     return c.json(await chunkAbort(c, c.env));
   } catch (e: any) {
     const { status, message } = toPublicError(e, '放弃失败');
+    return c.json({ error: message }, status as any);
+  }
+});
+
+// ===================== Turnstile =====================
+
+// 首页在服务端已确认需要验证时才调用；cookie 有效就不重复出题
+app.get('/api/turnstile/status', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  try {
+    const settings = await getSettings(c.env.DB, [TURNSTILE_SETTING_KEY]);
+    if (settings[TURNSTILE_SETTING_KEY] !== '1' || !turnstileConfigured(c.env)) {
+      return c.json({ verified: false });
+    }
+    return c.json({ verified: await verifyGuestVerifiedCookie(c, c.env) });
+  } catch {
+    return c.json({ verified: false });
+  }
+});
+
+app.post('/api/turnstile/verify', async (c) => {
+  try {
+    assertBodyWithinLimit(c, 8 * 1024);
+    const ip = getClientIp(c.req.raw.headers);
+    if (!(await checkRateLimit(c.env.DB, 'turnstile_ratelimit', ip, 10))) {
+      return c.json({ error: '验证过于频繁，请稍后再试' }, 429);
+    }
+    const settings = await getSettings(c.env.DB, [TURNSTILE_SETTING_KEY]);
+    if (settings[TURNSTILE_SETTING_KEY] !== '1') {
+      return c.json({ error: '人机验证未开启' }, 404);
+    }
+    if (!turnstileConfigured(c.env)) {
+      return c.json({ error: '人机验证未配置完整' }, 503);
+    }
+    const body = await c.req.json().catch(() => null);
+    const token = typeof body?.token === 'string' ? body.token : '';
+    if (!token) return c.json({ error: '缺少验证 token' }, 422);
+    if (!(await verifyTurnstileToken(c.env, token, ip))) {
+      return c.json({ error: '人机验证失败，请重试' }, 403);
+    }
+    await issueGuestVerifiedCookie(c, c.env);
+    return c.json({ ok: true });
+  } catch (e: any) {
+    const { status, message } = toPublicError(e, '人机验证失败');
     return c.json({ error: message }, status as any);
   }
 });
@@ -414,7 +494,9 @@ app.get('/api/info/:code', async (c) => {
 app.get('/admin', async (c) => {
   c.header('Cache-Control', 'no-store');
   const env = c.env;
-  if (!(await adminAuth(c, env))) return c.html(adminLoginPage());
+  // 一次查询同时完成 token 校验、上限与 storage_used 读取
+  const state = await readAdminState(c);
+  if (!state) return c.html(adminLoginPage());
 
   const page = parseIntParam(c.req.query('page'), 1, 1, 1_000_000);
   const keyword = (c.req.query('keyword') || '').trim();
@@ -422,24 +504,22 @@ app.get('/admin', async (c) => {
   const dateTo = c.req.query('date_to') || '';
   const sort = c.req.query('sort') || 'newest';
 
-  const [{ files, total }, stats, limits, used, chunkTasks] = await Promise.all([
+  const [{ files, total }, stats, chunkTasks] = await Promise.all([
     listFilesAdvanced(env.DB, page, 50, keyword, dateFrom, dateTo, sort),
     getDashboardStats(env.DB),
-    resolveLimits(env),
-    getStorageUsed(env.DB),
     listChunkTasks(env.DB),
   ]);
   return c.html(adminPanel(files, total, page, undefined, { keyword, dateFrom, dateTo, sort }, stats,
-    { used, limit: limits.maxTotalStorage, sessions: chunkTasks }));
+    { used: state.storageUsed, limit: state.limits.maxTotalStorage, sessions: chunkTasks }));
 });
 
 // 后台设置页：写入 fc_settings 覆盖 wrangler vars（resolveLimits 中 DB 优先），保存即生效
 app.get('/admin/settings', async (c) => {
   c.header('Cache-Control', 'no-store');
-  const env = c.env;
-  if (!(await adminAuth(c, env))) return c.redirect('/admin');
+  const state = await readAdminState(c);
+  if (!state) return c.redirect('/admin');
   const saved = c.req.query('saved') ? '设置已保存，立即生效' : undefined;
-  return c.html(adminSettingsPage(await adminConfig(env), saved));
+  return c.html(adminSettingsPage(adminConfigFromState(state, c.env), saved));
 });
 
 app.post('/admin/settings', async (c) => {
@@ -466,6 +546,12 @@ app.post('/admin/settings', async (c) => {
     Number.isFinite(defaultDays) && defaultDays >= 1 && defaultDays <= 3650 ? String(defaultDays) : '',
   );
   await setSetting(env.DB, 'max_total_storage', mbField('maxTotalStorageMb'));
+  // 密钥不全时强制保持关闭；开启后游客上传走 Turnstile cookie 校验
+  await setSetting(
+    env.DB,
+    TURNSTILE_SETTING_KEY,
+    field('turnstileEnabled') === '1' && turnstileConfigured(env) ? '1' : '0',
+  );
   return c.redirect('/admin/settings?saved=1');
 });
 

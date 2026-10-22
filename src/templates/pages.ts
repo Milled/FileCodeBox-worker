@@ -16,6 +16,10 @@ export interface HomeOptions {
   defaultExpireDays?: number;
   /** 当前生效的单文件上限，前端据此拦截超限文件 */
   maxFileSize?: number;
+  /** 游客上传前是否需要 Turnstile（管理员不显示） */
+  turnstileRequired?: boolean;
+  /** Turnstile 公开 site key */
+  turnstileSiteKey?: string;
 }
 
 /** 有效期选择器：后端 parseExpire 已支持 day/hour/minute/count/forever，UI 全部开放 */
@@ -85,6 +89,9 @@ export function homePage(opts: HomeOptions = {}): string {
   const uploadAllowed = opts.uploadAllowed !== false;
   const days = typeof opts.defaultExpireDays === 'number' && opts.defaultExpireDays > 0 ? opts.defaultExpireDays : 7;
   const maxBytes = typeof opts.maxFileSize === 'number' && opts.maxFileSize > 0 ? opts.maxFileSize : FALLBACK_MAX_FILE_SIZE;
+  const turnstile = opts.turnstileRequired && opts.turnstileSiteKey
+    ? { siteKey: opts.turnstileSiteKey }
+    : null;
 
   // ① 标题 + 管理入口 + 取件
   const pickupCard = `
@@ -104,8 +111,8 @@ ${codeBoxes({ groupId: 'pickupBoxes', hiddenId: 'pickupCode', name: 'code', auto
 
   // ② 发件
   const sendCard = `
-    ${uploadAllowed ? uploadUi(days, maxBytes) : guestBlockedUi()}
-    ${uploadAllowed ? homeScript() : ''}
+    ${uploadAllowed ? uploadUi(days, maxBytes, turnstile) : guestBlockedUi()}
+    ${uploadAllowed ? homeScript(turnstile) : ''}
     ${codeGroupsScript()}`;
 
   return layout('FileCodeBox', card(pickupCard) + card(sendCard));
@@ -202,12 +209,18 @@ function codeGroupsScript(): string {
 }
 
 /** 上传面板（文件 + 文本），仅在允许游客上传时渲染 */
-function uploadUi(days: number, maxBytes: number): string {
+function uploadUi(days: number, maxBytes: number, turnstile: { siteKey: string } | null): string {
   return `
     <div class="tabs">
       <button class="tab active" data-tab="file" onclick="switchTab('file')">文件</button>
       <button class="tab" data-tab="text" onclick="switchTab('text')">文本</button>
     </div>
+${turnstile ? `
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
+    <div class="turnstile-slot">
+      <div id="turnstileWidget"></div>
+      <div class="turnstile-status" id="turnstileStatus">上传前请完成人机验证</div>
+    </div>` : ''}
 
     <!-- 文件上传面板 -->
     <div id="tab-file" class="tab-panel active">
@@ -291,10 +304,13 @@ function guestBlockedUi(): string {
     </div>`;
 }
 
-/** 首页交互脚本：拖拽/粘贴/多文件上传、字节与速度进度、有效期选择器 */
-function homeScript(): string {
+/** 首页交互脚本：拖拽/粘贴/多文件上传、字节与速度进度、有效期选择器、Turnstile */
+function homeScript(turnstile: { siteKey: string } | null): string {
   return `
     <script>
+    var TURNSTILE_REQUIRED = ${Boolean(turnstile)};
+    var TURNSTILE_SITE_KEY = ${JSON.stringify(turnstile?.siteKey ?? '')};
+    var turnstileReady = !TURNSTILE_REQUIRED;
     var MAX_TEXT_BYTES = 524288;
     // 上传限流是 10 次/分钟，批量再多也只会撞 429；前后端统一到 10
     var MAX_BATCH_FILES = 10;
@@ -722,6 +738,7 @@ function homeScript(): string {
 
     function handleUpload(e) {
       e.preventDefault();
+      if (TURNSTILE_REQUIRED && !turnstileReady) { alert('请先完成人机验证'); return false; }
       var btn = document.getElementById('submitBtn');
       var bar = document.getElementById('uploadProgressBar');
       var wrap = document.getElementById('uploadProgress');
@@ -869,6 +886,11 @@ function homeScript(): string {
     }
 
     function prepareTextSubmit(e) {
+      if (TURNSTILE_REQUIRED && !turnstileReady) {
+        e.preventDefault();
+        alert('请先完成人机验证');
+        return false;
+      }
       var el = document.getElementById('textInput');
       var bytes = el ? new TextEncoder().encode(el.value).length : 0;
       if (bytes > MAX_TEXT_BYTES) {
@@ -879,6 +901,70 @@ function homeScript(): string {
       var b = document.getElementById('textSubmitBtn');
       if (b) { b.disabled = true; b.textContent = '保存中…'; }
       return true;
+    }
+
+    function setTurnstileStatus(msg) {
+      var el = document.getElementById('turnstileStatus');
+      if (el) el.textContent = msg;
+    }
+
+    function renderTurnstile(attempt) {
+      attempt = attempt || 0;
+      if (!window.turnstile) {
+        if (attempt < 20) setTimeout(function () { renderTurnstile(attempt + 1); }, 300);
+        else setTurnstileStatus('人机验证加载失败，请刷新重试');
+        return;
+      }
+      try {
+        window.turnstile.render('#turnstileWidget', {
+          sitekey: TURNSTILE_SITE_KEY,
+          action: 'upload',
+          theme: 'auto',
+          callback: function (token) {
+            setTurnstileStatus('人机验证中…');
+            fetch('/api/turnstile/verify', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: token })
+            }).then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            }).then(function () {
+              turnstileReady = true;
+              setTurnstileStatus('人机验证通过');
+            }).catch(function () {
+              setTurnstileStatus('人机验证失败，请刷新重试');
+            });
+          },
+          'expired-callback': function () {
+            turnstileReady = false;
+            setTurnstileStatus('验证已过期，请重新完成');
+          },
+          'error-callback': function () {
+            turnstileReady = false;
+            setTurnstileStatus('人机验证加载失败，请刷新重试');
+          }
+        });
+      } catch (e) {
+        setTurnstileStatus('人机验证加载失败，请刷新重试');
+      }
+    }
+
+    function setupTurnstile() {
+      if (!TURNSTILE_REQUIRED) return;
+      if (!document.getElementById('turnstileWidget')) return;
+      // 同 IP 的签名 cookie 还在有效期内时不必重复出题
+      fetch('/api/turnstile/status', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (d && d.verified) {
+            turnstileReady = true;
+            setTurnstileStatus('人机验证已通过');
+            return;
+          }
+          renderTurnstile(0);
+        })
+        .catch(function () { renderTurnstile(0); });
     }
 
     // 浏览器后退会从 bfcache 恢复表单页：按钮/进度条可能还停在「上传中」，
@@ -902,6 +988,7 @@ function homeScript(): string {
       initDropZone();
       bindExpire('fileExpireValue', 'fileExpireStyle', 'fileMaxDownloads');
       bindExpire('textExpireValue', 'textExpireStyle', 'textMaxDownloads');
+      setupTurnstile();
       // 页头「发件」带 ?send=1 回主页：默认焦点在取件框上，这里把视线挪到发件区
       if (/[?&]send=1/.test(location.search)) {
         var dz = document.getElementById('dropZone');
@@ -1351,6 +1438,10 @@ export interface AdminConfig {
   /** wrangler vars 的原始值，用于提示「未覆盖时的回退值」 */
   varsMaxFileSize: number;
   varsDefaultExpireDays: number;
+  /** Turnstile 开关与配置状态 */
+  turnstileEnabled: string;
+  turnstileConfigured: boolean;
+  turnstileSiteKey: string;
 }
 
 export function adminSettingsPage(config: AdminConfig, saved?: string): string {
@@ -1380,6 +1471,21 @@ export function adminSettingsPage(config: AdminConfig, saved?: string): string {
         <select name="openUpload" class="input setting-control">
           <option value="1"${config.openUpload !== '0' ? ' selected' : ''}>允许游客上传</option>
           <option value="0"${config.openUpload === '0' ? ' selected' : ''}>仅管理员可上传</option>
+        </select>
+      </div>
+      <div class="setting-row">
+        <div class="setting-text">
+          <div class="setting-title">Turnstile 人机验证</div>
+          <div class="setting-desc">
+            <div>开启后，游客上传前必须完成 Cloudflare Turnstile 验证；验证一次后 1 小时内有效。管理员与带 Bearer token 的请求不受影响。</div>
+            <div>${config.turnstileConfigured
+              ? `Site Key：${escapeHtml(config.turnstileSiteKey)}`
+              : '未配置 TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY，无法开启。'}</div>
+          </div>
+        </div>
+        <select name="turnstileEnabled" class="input setting-control">
+          <option value="1"${config.turnstileEnabled === '1' ? ' selected' : ''}>开启</option>
+          <option value="0"${config.turnstileEnabled !== '1' ? ' selected' : ''}>关闭</option>
         </select>
       </div>
       <div class="setting-row">

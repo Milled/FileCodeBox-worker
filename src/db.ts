@@ -712,6 +712,22 @@ export async function getSetting(
   return row?.value ?? null;
 }
 
+/** 一次查询多个设置键，避免首页/上传/后台为每个键各付一趟 D1 */
+export async function getSettings(
+  db: D1Database,
+  keys: string[],
+): Promise<Record<string, string>> {
+  if (keys.length === 0) return {};
+  const placeholders = keys.map(() => '?').join(',');
+  const rows = await db
+    .prepare(`SELECT key, value FROM fc_settings WHERE key IN (${placeholders})`)
+    .bind(...keys)
+    .all<{ key: string; value: string }>();
+  const out: Record<string, string> = {};
+  for (const row of rows.results ?? []) out[row.key] = row.value;
+  return out;
+}
+
 export async function setSetting(
   db: D1Database,
   key: string,
@@ -809,7 +825,8 @@ export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
           OR key LIKE 'code_ratelimit:%'
           OR key LIKE 'chunk_ratelimit:%'
           OR key LIKE 'chunk_meta_ratelimit:%'
-          OR key LIKE 'lookup_ratelimit:%')
+          OR key LIKE 'lookup_ratelimit:%'
+          OR key LIKE 'turnstile_ratelimit:%')
         AND (
           NOT json_valid(value)
           OR COALESCE(CAST(json_extract(value, '$.windowStart') AS INTEGER), 0) <= ?

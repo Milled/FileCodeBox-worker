@@ -46,4 +46,7 @@ export interface Env {
   ADMIN_PASSWORD?: string;
   MAX_FILE_SIZE: string;
   DEFAULT_EXPIRE_DAYS: string;
+  /** 可选：启用 Turnstile 时必填；site key 公开，secret 只走 wrangler secret */
+  TURNSTILE_SITE_KEY?: string;
+  TURNSTILE_SECRET_KEY?: string;
 }

@@ -10,9 +10,10 @@ import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { Env } from './types';
 import { formatFileSize, encodeFilename, parseIntParam, toPublicError } from './utils';
-import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, getStorageUsed, setSetting } from './db';
+import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSettings, getStorageUsed, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
-import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits, displayFilename, assertBodyWithinLimit } from './shared';
+import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, limitsFromValues, displayFilename, assertBodyWithinLimit } from './shared';
+import { TURNSTILE_SETTING_KEY, turnstileConfigured } from './turnstile';
 
 type Bindings = { Bindings: Env };
 
@@ -38,14 +39,22 @@ function normalizeOpenUpload(value: unknown): '0' | '1' | null {
  * 保证接口回报的值与上传时真正使用的值一致（DB 设置优先于 wrangler vars）。
  */
 async function effectiveConfig(c: Context<Bindings>) {
-  const limits = await resolveLimits(c.env);
+  // 配置读取也合并成一次查询：open_upload + 三个上限 + storage_used
+  const values = await getSettings(c.env.DB, [
+    'open_upload', 'max_file_size', 'default_expire_days', 'max_total_storage', 'storage_used',
+    TURNSTILE_SETTING_KEY,
+  ]);
+  const limits = limitsFromValues(values, c.env);
+  const used = parseInt(values['storage_used'] ?? '', 10);
   return {
-    openUpload: (await getSetting(c.env.DB, 'open_upload')) ?? '1',
+    openUpload: values['open_upload'] ?? '1',
     maxFileSize: String(limits.maxSize),
     defaultExpireDays: String(limits.defaultExpireDays),
     // '0' = 不限制总占用
     maxTotalStorage: String(limits.maxTotalStorage),
-    storageUsed: String(await getStorageUsed(c.env.DB)),
+    storageUsed: String(Number.isFinite(used) && used > 0 ? used : 0),
+    turnstileEnabled: values[TURNSTILE_SETTING_KEY] === '1' ? '1' : '0',
+    turnstileConfigured: String(turnstileConfigured(c.env)),
   };
 }
 
@@ -243,6 +252,11 @@ adminApi.patch('/config/update', async (c) => {
       );
     }
     if (body.maxTotalStorage !== undefined) await setSetting(env.DB, 'max_total_storage', String(body.maxTotalStorage));
+    if (body.turnstileEnabled !== undefined) {
+      const on = normalizeOpenUpload(body.turnstileEnabled);
+      if (on === null) return fail(c, 422, 'turnstileEnabled 只能是 true/false 或 1/0');
+      await setSetting(env.DB, TURNSTILE_SETTING_KEY, on === '1' && turnstileConfigured(env) ? '1' : '0');
+    }
 
     return ok(c, await effectiveConfig(c));
   } catch (e: any) {
