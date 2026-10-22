@@ -3,7 +3,7 @@
  *
  * 注意：本套件会修改 fc_settings（结束时恢复默认值），只应对本地或你自己的环境运行。
  */
-import { BASE, ADMIN_PASSWORD, SHOT_DIR, newPage, Suite, apiJson, postWithinRateLimit, rateLimitBreather } from './helpers.mjs';
+import { BASE, ADMIN_PASSWORD, SHOT_DIR, newPage, Suite, apiJson, postWithinRateLimit, rateLimitBreather, testClientIp } from './helpers.mjs';
 
 const TWO_MB = Buffer.alloc(2 * 1024 * 1024, 'x');
 const shot = async (page, name) => {
@@ -12,8 +12,12 @@ const shot = async (page, name) => {
 
 export async function adminSettingsSuite(browser) {
   const s = new Suite('后台设置与统计回归');
-  const admin = await browser.newContext({ viewport: { width: 1280, height: 900 }, deviceScaleFactor: 2 });
-  const anon = await browser.newContext();
+  const admin = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
+    deviceScaleFactor: 2,
+    extraHTTPHeaders: { 'CF-Connecting-IP': testClientIp() },
+  });
+  const anon = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': testClientIp() } });
   const page = await admin.newPage();
   const problems = [];
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));

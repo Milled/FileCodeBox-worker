@@ -256,7 +256,9 @@ npx wrangler dev --port 8790
 BASE_URL=http://127.0.0.1:8790 npm run test:ui
 ```
 
-这些用例会**真实上传文件并修改后台设置**，因此默认只允许打本机地址；测自己的线上环境需显式加 `ALLOW_REMOTE=1`。可用环境变量：`BASE_URL`、`ADMIN_PASSWORD`、`SHOT_DIR`（输出全页截图）、`SKIP_RATE_WAIT=1`（跳过限流等待）。
+这些用例会**真实上传文件并修改后台设置**，因此默认只允许打本机地址；测自己的线上环境需显式加 `ALLOW_REMOTE=1`。可用环境变量：`BASE_URL`、`ADMIN_PASSWORD`、`SHOT_DIR`（输出全页截图）。
+
+本地测试会给每个页面上下文分配独立的伪 `CF-Connecting-IP`，让上传/查询限流桶互不干扰，因此默认不再每次等待 60 秒限流窗口；完整的 168 项回归通常 2–4 分钟跑完。测远程时 Cloudflare 会覆盖这个头，需要加 `REAL_RATE_LIMITS=1` 恢复「共享真实 IP + 等待窗口」的串行模式；`SKIP_RATE_WAIT=1` 只在该模式下跳过等待。
 
 ---
 

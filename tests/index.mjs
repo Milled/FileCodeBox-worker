@@ -22,10 +22,13 @@ const SUITES = [publicUiSuite, uploadInteractionsSuite, adminSettingsSuite, thum
 
 const browser = await launchBrowser();
 const results = [];
+const timings = [];
+const startedAll = Date.now();
 
 console.log(`被测地址：${BASE}`);
 try {
   for (const factory of SUITES) {
+    const started = Date.now();
     try {
       results.push(await factory(browser));
     } catch (e) {
@@ -40,6 +43,7 @@ try {
         },
       });
     }
+    timings.push([factory.name, ((Date.now() - started) / 1000).toFixed(1)]);
   }
 } finally {
   await browser.close();
@@ -53,5 +57,7 @@ for (const r of results) {
   passed += r.lines.filter((l) => l.startsWith('✓')).length;
   failed += ok ? 0 : r.failed.length;
 }
+console.log(`\n各套件耗时：${timings.map(([n, s]) => `${n}=${s}s`).join(' · ')}`);
+console.log(`总耗时 ${((Date.now() - startedAll) / 1000).toFixed(1)}s`);
 console.log(`\n通过 ${passed} 项，失败 ${failed} 项`);
 process.exit(failed ? 1 : 0);

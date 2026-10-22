@@ -33,15 +33,38 @@ export async function launchBrowser() {
   return chromium.launch({ headless: true });
 }
 
+let ipSeq = 0;
+const RUN_TAG = 20 + Math.floor(Math.random() * 200);
+
+/**
+ * 每个测试上下文一个伪 CF-Connecting-IP：本地 Miniflare 会直接采用这个头，
+ * 各套件的上传/查询限流桶因此互不干扰，不必再等 60 秒窗口。
+ * 生产 Cloudflare 会覆盖该头，所以这只影响本地测试；测远程时请用 REAL_RATE_LIMITS=1。
+ */
+export function testClientIp() {
+  ipSeq += 1;
+  return `198.18.${RUN_TAG}.${20 + (ipSeq % 200)}`;
+}
+
+/** 给已存在的页面换一个限流桶（分片套件中途需要新的上传额度时用） */
+export async function setClientIp(page, ip = testClientIp()) {
+  await page.context().setExtraHTTPHeaders({ 'CF-Connecting-IP': ip });
+  page.clientIp = ip;
+  return ip;
+}
+
 /** 记录控制台错误、页面异常、失败请求与 CSP 违规；wrangler dev 的 live-reload socket 不算错误 */
 export async function newPage(browser, { scheme = 'light', tag = 'page', viewport } = {}) {
+  const clientIp = testClientIp();
   const ctx = await browser.newContext({
     colorScheme: scheme,
     viewport: viewport || { width: 1280, height: 900 },
     deviceScaleFactor: 2,
     permissions: ['clipboard-read', 'clipboard-write'],
+    extraHTTPHeaders: { 'CF-Connecting-IP': clientIp },
   });
   const page = await ctx.newPage();
+  page.clientIp = clientIp;
   const problems = [];
 
   await page.addInitScript(() => {
@@ -249,17 +272,21 @@ let lastBreatherAt = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * 上传接口有 10 次 / 60 秒 / IP 的限流（src/shared.ts checkRateLimit），
- * 而每个套件最多用 6 次额度。为保证整段用例都在一个干净窗口里跑：
- *   · 首个套件无条件等满一个窗口（可能是紧接 npm test 之后跑的，预算已被吃掉一部分）
- *   · 后续套件只补齐「距上次开跑不足一个窗口」的差额
- * 只想快速跑一轮且确认额度充足时，用 SKIP_RATE_WAIT=1 跳过。
+ * 默认不再等待：每个页面/上下文已经用独立伪 IP 隔离了限流桶。
+ * 传入 page 时换一个新 IP，适用于同一个上下文里已经快用完 10 次上传额度的套件。
+ *
+ * REAL_RATE_LIMITS=1 恢复旧行为：共享真实 IP、等满 60 秒窗口，
+ * 用于测远程（Cloudflare 会覆盖 CF-Connecting-IP）或需要验证真实限流交互时。
  */
-export async function rateLimitBreather() {
+export async function rateLimitBreather(page) {
+  if (process.env.REAL_RATE_LIMITS !== '1') {
+    if (page) await setClientIp(page);
+    return;
+  }
   if (process.env.SKIP_RATE_WAIT === '1') return;
   const wait = lastBreatherAt === 0 ? RATE_WINDOW_MS : RATE_WINDOW_MS - (Date.now() - lastBreatherAt);
   if (wait > 0) {
-    console.log(`  · 等待 ${Math.ceil(wait / 1000)}s 让上传限流窗口滚新（SKIP_RATE_WAIT=1 可跳过）`);
+    console.log(`  · 等待 ${Math.ceil(wait / 1000)}s 让上传限流窗口滚新（REAL_RATE_LIMITS=1）`);
     await sleep(wait + 1000);
   }
   lastBreatherAt = Date.now();

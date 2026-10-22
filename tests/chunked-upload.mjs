@@ -5,7 +5,7 @@
  * 一个大 PUT 拖太久会被半途掐断。所以这里用 70 MiB 的文件（阈值 16 MiB）走真实链路，
  * 而不是拿小文件模拟 —— 小文件根本不会进这条通道。
  */
-import { BASE, ADMIN_PASSWORD, newPage, Suite, dropImage, rateLimitBreather, apiJson } from './helpers.mjs';
+import { BASE, ADMIN_PASSWORD, newPage, Suite, dropImage, rateLimitBreather, apiJson, testClientIp } from './helpers.mjs';
 
 const PART = 16 * 1024 * 1024;
 const BIG = 70 * 1024 * 1024; // → 5 片（4 满片 + 1 个 6 MiB 尾片），也刚好越过 64 MiB 的分片阈值
@@ -13,7 +13,10 @@ const MB100 = 100 * 1024 * 1024;
 
 export async function chunkedSuite(browser) {
   const s = new Suite('分片上传回归');
-  const admin = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const admin = await browser.newContext({
+    viewport: { width: 1280, height: 900 },
+    extraHTTPHeaders: { 'CF-Connecting-IP': testClientIp() },
+  });
   const page = await admin.newPage();
   const problems = [];
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
@@ -41,7 +44,7 @@ export async function chunkedSuite(browser) {
 
   try {
     await page.goto(`${BASE}/admin`, { waitUntil: 'networkidle' });
-    await rateLimitBreather();
+    await rateLimitBreather(page);
     await page.fill('input[name="password"]', ADMIN_PASSWORD);
     await Promise.all([page.waitForNavigation(), page.click('button[type="submit"]')]);
 
@@ -204,7 +207,7 @@ export async function chunkedSuite(browser) {
     // ---- 后台必须能立刻放弃未完成的分片 ----
     // 上面已经把这一分钟的 10 次上传额度用掉大半（411、零字节那两条也各算一次），
     // 不等窗口滚新的话这里的两次 init 会撞 429，表现为「后台列表是空的」这种假失败
-    await rateLimitBreather();
+    await rateLimitBreather(page);
     // multipart 会话不是一个对象：不在 bucket.list() 里，R2 面板删不掉、bucket.delete 无效，
     // 「清理过期文件」的孤儿扫描同样看不见，只有 abort 能释放它的存储
     const mkOrphan = (name) => call('/api/upload/chunk/init', {
@@ -243,7 +246,7 @@ export async function chunkedSuite(browser) {
     // ---- 前端会自动选对通道 ----
     // 上面为了造会话、试参数已经用掉了十次上传额度（422/413 的 init 也各算一次），
     // 不等窗口滚新的话这里的真实上传会撞 429，看起来像「小文件传不上去」
-    await rateLimitBreather();
+    await rateLimitBreather(page);
     const ui = await newPage(browser, { tag: 'chunk-ui' });
     const chunkUrls = [];
     ui.on('request', (r) => { if (r.url().includes('/api/upload/chunk/')) chunkUrls.push(r.url()); });
