@@ -121,7 +121,8 @@ curl "https://你的域名/api/share/download?code=1234"
 
 `expire_style` 支持 `day` / `hour` / `minute` / `count`（限下载次数）/ `forever`。
 
-> 注意 `GET /api/share/select` 会**计入下载次数**（沿用上游语义）；只想查状态请用 `POST /api/share/select`。
+> 注意 `GET /api/share/select` 会**计入下载次数**（沿用上游语义）；只想查状态请用 `POST /api/share/select`（只返回元信息，不返回文本正文）。
+> 取件码查询按 IP 做失败限流：每分钟最多 5 次「查不到/已过期」，第 6 次起返回 `429`；成功取件不计数。4 位码只有 10,000 种，没有这道闸时一次全量扫描就能枚举所有活跃文件。
 > 上传与查询接口带不带结尾斜杠都能访问。
 
 ### 管理接口（Bearer token）
@@ -146,7 +147,7 @@ curl -X PATCH "https://你的域名/api/admin/config/update" -H "Authorization: 
   -d '{"openUpload":"1","maxFileSize":"26214400","defaultExpireDays":"7","maxTotalStorage":"536870912"}'
 ```
 
-上传相关的错误码：`413` 单个文件超上限、`507` R2 总占用已满、`429` 触发上传限流（分片用独立的桶，一次会话几十片不会把上传配额吃光）、`401` 游客上传被关、`411` 请求没有 `Content-Length`（长度未知，Worker 不接收）、`422` 分片序号越界 / 片长与账面对不上 / 缺片。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
+上传相关的错误码：`413` 单个文件超上限、`507` R2 总占用已满、`429` 触发上传/查询失败限流（分片用独立的桶，一次会话几十片不会把上传配额吃光）、`401` 游客上传被关、`411` 请求没有 `Content-Length`（长度未知，Worker 不接收）、`422` 分片序号越界 / 片长与账面对不上 / 缺片 / 有效期或下载次数非法（天数 1–3650，次数 1–1,000,000 或 -1）。`config/get` 会一并回报 `maxTotalStorage`（`"0"` = 不限）与 `storageUsed`。
 
 ### 网页接口一览
 
@@ -243,7 +244,7 @@ npm run dev           # http://localhost:8787
 ```bash
 npm run typecheck     # tsc --noEmit
 npm test              # 主流程冒烟（Playwright 无头）
-npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片，共 153 项断言
+npm run test:ui       # UI 回归：视觉结构 / 上传交互 / 后台设置 / 缩略图 / 分片 / 安全加固，共 168 项断言
 ```
 
 用例假设本地服务已启动且表已建好：

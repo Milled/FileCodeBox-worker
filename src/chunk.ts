@@ -16,9 +16,9 @@ import { getClientIp } from './utils';
 import {
   assertUploadAllowed,
   ensureCodeAvailable,
-  parseExpire,
   quotaMessage,
   remainingQuota,
+  resolveExpire,
   resolveLimits,
 } from './shared';
 import {
@@ -86,15 +86,12 @@ function sessionIdOf(c: Context<{ Bindings: Env }>): string {
 
 /** 与 uploadFile 一致的过期参数解析（兼容旧参数名 expire_days） */
 function expireFrom(body: Record<string, unknown>, defaultExpireDays: number): { expireAt: string; maxDownloads: number } {
-  const rawValue = body['expire_value'] ?? body['expire_days'] ?? defaultExpireDays;
-  const value = Number(rawValue);
-  const style = typeof body['expire_style'] === 'string' ? (body['expire_style'] as string) : 'day';
-  const maxRaw = Number(body['max_downloads']);
-  const parsed = parseExpire(Number.isFinite(value) && value > 0 ? Math.floor(value) : defaultExpireDays, style);
-  return {
-    expireAt: parsed.expireAt,
-    maxDownloads: Number.isFinite(maxRaw) && maxRaw >= 0 ? Math.floor(maxRaw) : parsed.maxDownloads,
-  };
+  return resolveExpire({
+    value: body['expire_value'] ?? body['expire_days'],
+    style: body['expire_style'],
+    maxDownloads: body['max_downloads'],
+    defaultDays: defaultExpireDays,
+  });
 }
 
 /** 预创建会话：校验大小与配额、抢占取件码、开 R2 multipart 会话 */

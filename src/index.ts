@@ -15,6 +15,7 @@ import {
   deleteFileRecord,
   listFilesAdvanced,
   cleanupExpired,
+  cleanupUsedCodes,
   cleanupOrphanedR2Objects,
   cleanupRateLimitEntries,
   incrementDownload,
@@ -27,7 +28,19 @@ import {
 } from './db';
 import { adminAuth, handleAdminLogin, handleAdminLogout } from './auth';
 import api from './api';
-import { uploadFile, uploadText, downloadFile, saveThumb, readThumb, allocateCodeRun, resolveLimits, FALLBACK_MAX_FILE_SIZE } from './shared';
+import {
+  uploadFile,
+  uploadText,
+  downloadFile,
+  saveThumb,
+  readThumb,
+  allocateCodeRun,
+  resolveLimits,
+  registerLookupFailure,
+  displayFilename,
+  LOOKUP_RATE_MESSAGE,
+  FALLBACK_MAX_FILE_SIZE,
+} from './shared';
 import { generateQRCodeGIF } from './qr';
 import { chunkInit, chunkPut, chunkStatus, chunkComplete, chunkAbort, abortChunkSession, abortAllChunkSessions, cleanupStaleChunkUploads } from './chunk';
 import { STYLE } from './templates/style';
@@ -152,12 +165,17 @@ app.get('/r/:code', async (c) => {
   c.header('Cache-Control', 'no-store');
   const code = c.req.param('code').trim();
   const file = await getFileByCode(c.env.DB, code);
-  if (!file) return c.html(retrievePage());
+  if (!file) {
+    if (!(await registerLookupFailure(c, c.env))) {
+      return c.html(errorPage('访问过于频繁', LOOKUP_RATE_MESSAGE), 429);
+    }
+    return c.html(retrievePage());
+  }
   // 上传成功后的回跳视图：与文本分享一致，只给取件码与「继续上传」，
   // 不提供下载入口。收件人拿到的 /r/{code}（无 sent）仍是下载页。
   if (c.req.query('sent') === '1') {
     return c.html(resultPage({
-      code: file.code, title: file.filename, baseUrl: getBaseUrl(c),
+      code: file.code, title: displayFilename(file), baseUrl: getBaseUrl(c),
       hasThumb: file.has_thumb === 1, meta: file,
     }));
   }
@@ -238,9 +256,14 @@ app.post('/api/upload/text', async (c) => {
 });
 
 app.get('/api/text/:code', async (c) => {
+  // 查看次数决定可见性，不能被浏览器/边缘缓存留在额度用完之后
+  c.header('Cache-Control', 'no-store');
   const code = c.req.param('code').trim();
   const file = await getFileByCode(c.env.DB, code);
-  if (!file || file.is_text !== 1) return c.text('Not found', 404);
+  if (!file || file.is_text !== 1) {
+    if (!(await registerLookupFailure(c, c.env))) return c.text(LOOKUP_RATE_MESSAGE, 429);
+    return c.text('Not found', 404);
+  }
 
   if (c.req.method !== 'HEAD' && !(await incrementDownload(c.env.DB, code))) {
     return c.text('Max downloads exceeded', 403);
@@ -253,6 +276,8 @@ app.get('/api/text/:code', async (c) => {
 // ===================== 下载 =====================
 
 app.get('/api/download/:code', async (c) => {
+  // 下载次数是配额，任何缓存命中都等于绕过计数
+  c.header('Cache-Control', 'no-store');
   try {
     const result = await downloadFile(c, c.env);
     if (result.notFound) return c.html(errorPage('文件不存在', '该文件可能已被清理'), 404);
@@ -281,16 +306,21 @@ app.post('/api/thumb/:code', async (c) => {
 });
 
 app.get('/api/thumb/:code', async (c) => {
-  const thumb = await readThumb(c, c.env);
-  if (!thumb) return c.text('Not found', 404);
-  // no-store：可见性取决于剩余下载次数，缓存会把它留在额度用完之后
-  return new Response(thumb.body, {
-    headers: {
-      'Content-Type': thumb.contentType,
-      'Cache-Control': 'no-store',
-      'X-Content-Type-Options': 'nosniff',
-    },
-  });
+  try {
+    const thumb = await readThumb(c, c.env);
+    if (!thumb) return c.text('Not found', 404);
+    // no-store：可见性取决于剩余下载次数，缓存会把它留在额度用完之后
+    return new Response(thumb.body, {
+      headers: {
+        'Content-Type': thumb.contentType,
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    });
+  } catch (e: any) {
+    if (e?.status === 429) return c.text(e.message, 429);
+    throw e;
+  }
 });
 
 // ===================== 连号取件码分配 =====================
@@ -312,7 +342,10 @@ app.get('/qrcode/:code', async (c) => {
       return c.text('Invalid code', 400);
     }
     const file = await getFileByCode(c.env.DB, code);
-    if (!file) return c.text('File not found', 404);
+    if (!file) {
+      if (!(await registerLookupFailure(c, c.env))) return c.text(LOOKUP_RATE_MESSAGE, 429);
+      return c.text('File not found', 404);
+    }
     const baseUrl = getBaseUrl(c);
     const url = `${baseUrl}/r/${code}`;
     const gif = generateQRCodeGIF(url, 200);
@@ -330,11 +363,17 @@ app.get('/qrcode/:code', async (c) => {
 // ===================== 文件信息 API =====================
 
 app.get('/api/info/:code', async (c) => {
+  // 文本标题会随查看次数遮蔽，元信息同样不能缓存
+  c.header('Cache-Control', 'no-store');
   const code = c.req.param('code').trim();
   const file = await getFileByCode(c.env.DB, code);
-  if (!file) return c.json({ error: 'not found' }, 404);
+  if (!file) {
+    if (!(await registerLookupFailure(c, c.env))) return c.json({ error: LOOKUP_RATE_MESSAGE }, 429);
+    return c.json({ error: 'not found' }, 404);
+  }
   return c.json({
-    filename: file.filename,
+    // 文本分享的 filename 是正文前 50 字，耗尽查看次数后与页面一样遮蔽
+    filename: displayFilename(file),
     size: file.size,
     download_count: file.download_count,
     max_downloads: file.max_downloads,
@@ -388,9 +427,15 @@ app.post('/admin/settings', async (c) => {
     const n = parseFloat(field(k));
     return Number.isFinite(n) && n > 0 ? String(Math.round(n * 1048576)) : '';
   };
+  const defaultDays = parseInt(field('defaultExpireDays'), 10);
   await setSetting(env.DB, 'open_upload', field('openUpload') === '0' ? '0' : '1');
   await setSetting(env.DB, 'max_file_size', mbField('maxFileSizeMb'));
-  await setSetting(env.DB, 'default_expire_days', field('defaultExpireDays'));
+  // 留空/非法一律回退到 wrangler 变量；上限 3650 天，避免一个手滑值让所有上传构造日期越界
+  await setSetting(
+    env.DB,
+    'default_expire_days',
+    Number.isFinite(defaultDays) && defaultDays >= 1 && defaultDays <= 3650 ? String(defaultDays) : '',
+  );
   await setSetting(env.DB, 'max_total_storage', mbField('maxTotalStorageMb'));
   return c.redirect('/admin/settings?saved=1');
 });
@@ -462,13 +507,31 @@ app.post('/admin/cleanup', async (c) => {
   const env = c.env;
   if (!(await adminAuth(c, env))) return c.redirect('/admin');
 
-  await cleanupExpired(env.DB, env.FILE_STORE);
-  // 也要扫超时未完成的分片会话：它们不是对象，孤儿扫描看不见
-  await cleanupStaleChunkUploads(env);
-  // 与 Cron 同一条路径：顺带清孤儿对象并把 storage_used 对账成 R2 实测值。
-  // 新部署或计数器漂移时，管理员点一次就能拿到准确数字，不必等半小时
-  const { usedBytes, scanned } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
-  if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
+  // 每个阶段独立 try/catch：任何一个撞上子请求上限/瞬时错误，
+  // 都不能连带跳过后面更要紧的清理（例如正在计费的分片会话）
+  const stages: Array<[string, () => Promise<unknown>]> = [
+    ['expired', () => cleanupExpired(env.DB, env.FILE_STORE)],
+    ['used_codes', () => cleanupUsedCodes(env.DB)],
+    // 也要扫超时未完成的分片会话：它们不是对象，孤儿扫描看不见
+    ['stale_chunks', () => cleanupStaleChunkUploads(env)],
+    // 与 Cron 同一条路径：顺带清孤儿对象并把 storage_used 对账成 R2 实测值。
+    // 新部署或计数器漂移时，管理员点一次就能拿到准确数字，不必等半小时
+    ['orphans', async () => {
+      const { usedBytes, scanned } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
+      if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
+    }],
+  ];
+  let budgetExhausted = false;
+  for (const [name, run] of stages) {
+    if (budgetExhausted) break;
+    try {
+      await run();
+    } catch (e) {
+      const msg = String((e as any)?.message ?? e);
+      if (/too many subrequests/i.test(msg)) budgetExhausted = true;
+      console.error(`[admin/cleanup] ${name} failed: ${msg}`);
+    }
+  }
   return c.redirect('/admin');
 });
 
@@ -510,30 +573,51 @@ export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
       (async () => {
-        try {
-          // 幂等初始化：确保首次部署后表结构自动就绪（/api/init 已需鉴权）
+        // Free 计划每次调用只有 50 个子请求。每个阶段独立 try/catch：
+        // 一个阶段失败不能连带跳过后面的清理；一旦确认撞上子请求上限，
+        // 后面的调用也只会继续报错，直接停止并留日志
+        const summary: Record<string, unknown> = { event: 'scheduled_cleanup' };
+        let budgetExhausted = false;
+        const stage = async (name: string, fn: () => Promise<void>): Promise<void> => {
+          if (budgetExhausted) return;
+          try {
+            await fn();
+          } catch (e) {
+            const msg = String((e as any)?.message ?? e);
+            if (/too many subrequests/i.test(msg)) budgetExhausted = true;
+            console.error(JSON.stringify({ event: 'scheduled_cleanup_error', stage: name, error: msg }));
+          }
+        };
+
+        // 幂等初始化：确保首次部署后表结构自动就绪（/api/init 已需鉴权）
+        await stage('init', async () => {
           await initDB(env.DB);
-          const { expiredCount, cleanedCodes } = await cleanupExpired(env.DB, env.FILE_STORE);
+        });
+        await stage('expired', async () => {
+          summary.expiredCount = (await cleanupExpired(env.DB, env.FILE_STORE)).expiredCount;
+        });
+        // 无条件下执行：修复“没有过期文件就永远不清理 used_codes”的漏洞
+        await stage('used_codes', async () => {
+          summary.cleanedCodes = await cleanupUsedCodes(env.DB);
+        });
+        // 超时未完成的分片会话必须 abort：已上传但未合并的分片会一直计费。
+        // 放在全桶扫描之前，先释放正在计费的部分
+        await stage('stale_chunks', async () => {
+          summary.staleChunks = await cleanupStaleChunkUploads(env);
+        });
+        // 对账：孤儿扫描已经逐页累加了实测占用，直接改写计数器，
+        // 修掉增量计数器在异常路径上可能攒出的漂移（0 表示桶确实空了，不是"没扫到"）
+        await stage('orphans', async () => {
           const { scanned, removed, usedBytes } = await cleanupOrphanedR2Objects(env.DB, env.FILE_STORE);
-          // 对账：孤儿扫描已经逐页累加了实测占用，直接改写计数器，
-          // 修掉增量计数器在异常路径上可能攒出的漂移（0 表示桶确实空了，不是"没扫到"）
+          summary.r2Scanned = scanned;
+          summary.r2Removed = removed;
+          summary.storageUsed = usedBytes;
           if (usedBytes > 0 || scanned === 0) await setStorageUsed(env.DB, usedBytes);
-          // 超时未完成的分片会话必须 abort：已上传但未合并的分片会一直计费
-          const staleChunks = await cleanupStaleChunkUploads(env);
-          const rateLimitCleaned = await cleanupRateLimitEntries(env.DB);
-          console.log(JSON.stringify({
-            event: 'scheduled_cleanup',
-            expiredCount,
-            cleanedCodes,
-            r2Scanned: scanned,
-            r2Removed: removed,
-            storageUsed: usedBytes,
-            staleChunks,
-            rateLimitCleaned,
-          }));
-        } catch (e) {
-          console.error(JSON.stringify({ event: 'scheduled_cleanup_error', error: String(e) }));
-        }
+        });
+        await stage('rate_limits', async () => {
+          summary.rateLimitCleaned = await cleanupRateLimitEntries(env.DB);
+        });
+        console.log(JSON.stringify(summary));
       })(),
     );
   },

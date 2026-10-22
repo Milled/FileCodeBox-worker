@@ -32,8 +32,10 @@ CREATE TABLE IF NOT EXISTS fc_settings (
   value TEXT NOT NULL
 );
 
+-- created_at 用于回收“抢了码但没落文件”的泄漏；老库由 initDB 补列并回填
 CREATE TABLE IF NOT EXISTS fc_used_codes (
-  code TEXT PRIMARY KEY
+  code TEXT PRIMARY KEY,
+  created_at TEXT
 );
 
 -- 分片上传：会话与已传片分两张表。

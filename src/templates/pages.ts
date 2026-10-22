@@ -519,6 +519,8 @@ function homeScript(): string {
 
     function uploadThumb(code, blob) {
       return fetch('/api/thumb/' + encodeURIComponent(code), { method: 'POST', body: blob })
+        // 同 filePage：错误响应也要把 body 读掉，避免请求一直挂在网络上
+        .then(function (r) { return r.arrayBuffer().catch(function () {}); })
         .then(function () { return null; })
         .catch(function () { return null; });
     }
@@ -1062,7 +1064,9 @@ export function filePage(file: FileRecord, baseUrl: string): string {
                         : '\u5185\u5bb9\u52a0\u8f7d\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002';
                 el.textContent = msg;
                 el.style.color = 'var(--color-danger)';
-                return null;
+                // 必须读掉错误响应体：不消费 403/404 的 body 时 Chromium 会一直把请求
+                // 算作在飞，页面永远到不了 networkidle（自动化测试与部分空闲检测会卡住）
+                return r.text().catch(function () { return null; }).then(function () { return null; });
               }
               return r.text();
             })

@@ -12,7 +12,7 @@ import type { Env } from './types';
 import { formatFileSize } from './utils';
 import { getFileById, deleteFileRecord, listFilesAdvanced, getDashboardStats, getSetting, getStorageUsed, setSetting } from './db';
 import { adminAuth, handleAdminLogin } from './auth';
-import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits } from './shared';
+import { uploadFile, uploadText, selectFile as sharedSelectFile, downloadFile as sharedDownloadFile, resolveLimits, displayFilename } from './shared';
 
 type Bindings = { Bindings: Env };
 
@@ -87,6 +87,8 @@ api.post('/share/file', shareFile);
 
 // ---- 获取/选择文件信息 ----
 async function selectFile(c: Context<Bindings>, countAsDownload: boolean) {
+  // GET 会计数、POST 会随查看次数遮蔽标题，两者都不能被缓存
+  c.header('Cache-Control', 'no-store');
   try {
     const result = await sharedSelectFile(c, c.env, countAsDownload);
     if (result.notFound) return fail(c, 404, '文件不存在或已过期');
@@ -94,7 +96,8 @@ async function selectFile(c: Context<Bindings>, countAsDownload: boolean) {
     const file = result.file!;
     return ok(c, {
       code: file.code,
-      name: file.filename,
+      // POST select 只查状态，不返回正文；文本标题在查看次数耗尽后同样遮蔽
+      name: displayFilename(file),
       size: file.size,
       text: result.text,
     });
@@ -110,6 +113,7 @@ api.post('/share/select', (c) => selectFile(c, false));
 
 // ---- 下载 ----
 api.get('/share/download', async (c) => {
+  c.header('Cache-Control', 'no-store');
   try {
     const result = await sharedDownloadFile(c, c.env);
     if (result.notFound) return fail(c, 404, '文件不存在或已过期');
@@ -205,7 +209,15 @@ adminApi.patch('/config/update', async (c) => {
 
   if (body.openUpload !== undefined) await setSetting(env.DB, 'open_upload', String(body.openUpload));
   if (body.maxFileSize !== undefined) await setSetting(env.DB, 'max_file_size', String(body.maxFileSize));
-  if (body.defaultExpireDays !== undefined) await setSetting(env.DB, 'default_expire_days', String(body.defaultExpireDays));
+  if (body.defaultExpireDays !== undefined) {
+    // 非法值写空串回退到 vars；上限 3650 天，避免一个值让全站上传构造日期越界
+    const days = parseInt(String(body.defaultExpireDays), 10);
+    await setSetting(
+      env.DB,
+      'default_expire_days',
+      Number.isFinite(days) && days >= 1 && days <= 3650 ? String(days) : '',
+    );
+  }
   if (body.maxTotalStorage !== undefined) await setSetting(env.DB, 'max_total_storage', String(body.maxTotalStorage));
 
   return ok(c, await effectiveConfig(c));

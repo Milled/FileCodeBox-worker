@@ -27,6 +27,11 @@ import {
 /** 100MB，与 wrangler.jsonc 的 MAX_FILE_SIZE 默认值一致 */
 export const FALLBACK_MAX_FILE_SIZE = 104857600;
 const FALLBACK_EXPIRE_DAYS = 7;
+const MAX_EXPIRE_DAYS = 3650;
+const MAX_DOWNLOADS = 1_000_000;
+/** 失败取件码查询：每 IP 每分钟最多 5 次，超过后连正常查询也先停一分钟 */
+export const LOOKUP_RATE_MAX = 5;
+export const LOOKUP_RATE_MESSAGE = '查询失败次数过多，请稍后再试';
 
 /**
  * 解析当前生效的文件大小上限与默认过期天数。
@@ -49,7 +54,12 @@ export async function resolveLimits(
 
   return {
     maxSize: positiveInt(dbMaxSize) || positiveInt(env.MAX_FILE_SIZE) || FALLBACK_MAX_FILE_SIZE,
-    defaultExpireDays: positiveInt(dbExpireDays) || positiveInt(env.DEFAULT_EXPIRE_DAYS) || FALLBACK_EXPIRE_DAYS,
+    // 后台/变量值也夹到 3650 天：否则一个错误的默认值会让所有未显式指定有效期的上传
+    // 在构造 Date 时越界，表现为全站上传 500
+    defaultExpireDays: Math.min(
+      MAX_EXPIRE_DAYS,
+      positiveInt(dbExpireDays) || positiveInt(env.DEFAULT_EXPIRE_DAYS) || FALLBACK_EXPIRE_DAYS,
+    ),
     // 总占用上限：0 = 不限制（清空后台设置即回到不限）
     maxTotalStorage: positiveInt(dbMaxTotal),
   };
@@ -76,6 +86,71 @@ export function parseExpire(
     default:
       return { expireAt: new Date(now + expireValue * 86_400_000).toISOString(), maxDownloads: -1 };
   }
+}
+
+const EXPIRE_MAX: Record<string, number> = {
+  day: MAX_EXPIRE_DAYS,
+  hour: MAX_EXPIRE_DAYS * 24,
+  minute: MAX_EXPIRE_DAYS * 24 * 60,
+  count: MAX_DOWNLOADS,
+  forever: Number.POSITIVE_INFINITY,
+};
+
+/**
+ * 解析并校验用户的过期/次数参数。必须在抢占取件码之前调用：
+ * 这里抛 422 时还没有占用任何码，旧代码把 parseExpire 放在抢码之后，
+ * 超大数值会先占码再抛 RangeError，把码永久泄漏。
+ *
+ * 未知单位、0/负数、超过 3650 天（或 100 万次）都明确拒绝，
+ * 不再静默回退或生成一个已经过期的文件。
+ */
+export function resolveExpire(args: {
+  value?: unknown;
+  style?: unknown;
+  maxDownloads?: unknown;
+  defaultDays: number;
+}): { expireAt: string; maxDownloads: number } {
+  const style = typeof args.style === 'string' && args.style ? args.style : 'day';
+  const max = EXPIRE_MAX[style];
+  if (max === undefined) {
+    throw { status: 422 as const, message: '不支持的有效期单位' };
+  }
+
+  let value = 1;
+  if (style !== 'forever') {
+    const raw =
+      args.value === undefined || args.value === null || String(args.value).trim() === ''
+        ? args.defaultDays
+        : args.value;
+    value = parseInt(String(raw).trim(), 10);
+    if (!Number.isFinite(value) || value < 1 || value > max) {
+      throw {
+        status: 422 as const,
+        message:
+          style === 'count'
+            ? `查看次数需为 1 到 ${MAX_DOWNLOADS} 之间的整数`
+            : `有效期数值需为 1 到 ${max} 之间的整数`,
+      };
+    }
+  }
+
+  let explicitMax = -1;
+  const maxRaw = args.maxDownloads;
+  if (maxRaw !== undefined && maxRaw !== null && String(maxRaw).trim() !== '') {
+    explicitMax = parseInt(String(maxRaw).trim(), 10);
+    if (!Number.isFinite(explicitMax) || explicitMax < -1 || explicitMax === 0 || explicitMax > MAX_DOWNLOADS) {
+      throw {
+        status: 422 as const,
+        message: `最大下载次数需为 -1 或 1 到 ${MAX_DOWNLOADS} 之间的整数`,
+      };
+    }
+  }
+
+  const parsed = parseExpire(value, style);
+  return {
+    expireAt: parsed.expireAt,
+    maxDownloads: explicitMax >= 0 ? explicitMax : parsed.maxDownloads,
+  };
 }
 
 // ===================== 取件码生成 =====================
@@ -179,12 +254,14 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
 
   const rawCode = (c.req.query('code') || '').trim();
   const limits = await resolveLimits(env);
-  // 兼容旧参数名 (expire_days/max_downloads) 和新参数名 (expire_value/expire_style)
-  const expireValueRaw = c.req.query('expire_value') || c.req.query('expire_days') || String(limits.defaultExpireDays);
-  const expireStyleRaw = c.req.query('expire_style') || 'day';
-  const maxDownloadsRaw = c.req.query('max_downloads') || '-1';
-  const safeExpireValue = Number.isFinite(parseInt(expireValueRaw)) ? parseInt(expireValueRaw) : limits.defaultExpireDays;
-  const safeMaxDownloads = Number.isFinite(parseInt(maxDownloadsRaw)) ? parseInt(maxDownloadsRaw) : -1;
+  // 兼容旧参数名 (expire_days/max_downloads) 和新参数名 (expire_value/expire_style)。
+  // 必须在 ensureCodeAvailable 之前校验：这里抛 422 时还没有占码
+  const { expireAt, maxDownloads: effectiveMaxDownloads } = resolveExpire({
+    value: c.req.query('expire_value') ?? c.req.query('expire_days'),
+    style: c.req.query('expire_style'),
+    maxDownloads: c.req.query('max_downloads'),
+    defaultDays: limits.defaultExpireDays,
+  });
   // decodeURIComponent 可能因非法 URI 编码抛 URIError，失败时回退到原始头值；
   // 先解码再截断，避免截断处切开多字节转义序列导致解码失败
   let filename = c.req.header('X-Filename') || '未命名';
@@ -216,10 +293,6 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   const code = await ensureCodeAvailable(rawCode, env);
   const key = `file:${code}`;
 
-  const { expireAt, maxDownloads: parsedMaxDownloads } = parseExpire(safeExpireValue, expireStyleRaw);
-  // 用户显式指定的 max_downloads 优先，否则用 expire_style=count 推得的次数（默认不限）
-  const effectiveMaxDownloads = safeMaxDownloads >= 0 ? safeMaxDownloads : parsedMaxDownloads;
-
   let size = 0;
   try {
     const meta = { httpMetadata: { contentType: mimeType }, customMetadata: { filename } };
@@ -244,6 +317,23 @@ export async function uploadFile(c: Context<{ Bindings: Env }>, env: Env): Promi
   }
 }
 
+// ===================== 查询防爆破 =====================
+
+/**
+ * 只统计“查不到”的请求：正常取件/浏览不消耗额度，失败 5 次/分钟/IP 后短暂封锁。
+ * 4 位码只有 10,000 种，没有失败限流时一次全量扫描就能枚举出所有活跃文件；
+ * 成功查询不计数，避免影响反复打开自己文件/正常分享链接的用户。
+ */
+export async function registerLookupFailure(c: Context<{ Bindings: Env }>, env: Env): Promise<boolean> {
+  return checkRateLimit(env.DB, 'lookup_ratelimit', getClientIp(c.req.raw.headers), LOOKUP_RATE_MAX);
+}
+
+/** 文本分享的 filename 就是正文前 50 字：查看次数耗尽后必须遮蔽，API 与页面同一口径 */
+export function displayFilename(file: FileRecord): string {
+  const exhausted = file.is_text === 1 && file.max_downloads >= 0 && file.download_count >= file.max_downloads;
+  return exhausted ? '***' : file.filename;
+}
+
 // ===================== 文件下载 =====================
 
 export interface DownloadResult {
@@ -263,7 +353,12 @@ export async function downloadFile(
   if (!code) throw { status: 422 as const, message: '缺少取件码' };
 
   const file = await getFileByCode(env.DB, code);
-  if (!file) return { file: null, obj: null, notFound: true, maxExceeded: false, isHead: false };
+  if (!file) {
+    if (!(await registerLookupFailure(c, env))) {
+      throw { status: 429 as const, message: LOOKUP_RATE_MESSAGE };
+    }
+    return { file: null, obj: null, notFound: true, maxExceeded: false, isHead: false };
+  }
 
   const obj = await env.FILE_STORE.get(`file:${code}`);
   if (!obj) return { file, obj: null, notFound: true, maxExceeded: false, isHead: false };
@@ -315,7 +410,12 @@ export async function saveThumb(
   }
 
   const file = await getFileByCode(env.DB, code);
-  if (!file) throw { status: 404 as const, message: '取件码不存在或已过期' };
+  if (!file) {
+    if (!(await registerLookupFailure(c, env))) {
+      throw { status: 429 as const, message: LOOKUP_RATE_MESSAGE };
+    }
+    throw { status: 404 as const, message: '取件码不存在或已过期' };
+  }
   // 只给图片挂缩略图，否则客户端可以把任意记录伪装成图片；
   // SVG 排除：它是脚本载体，且 canvas 无法可靠栅格化
   if (!file.mime_type.startsWith('image/') || file.mime_type.includes('svg')) {
@@ -350,7 +450,15 @@ export async function readThumb(
   if (!code) return null;
   // getFileByCode 已过滤过期记录
   const file = await getFileByCode(env.DB, code);
-  if (!file || file.has_thumb !== 1) return null;
+  if (!file) {
+    // 只对“码不存在/已过期”计数；正常图片没有缩略图、或额度耗尽时返回的 404
+    // 是页面预期行为，不能算爆破
+    if (!(await registerLookupFailure(c, env))) {
+      throw { status: 429 as const, message: LOOKUP_RATE_MESSAGE };
+    }
+    return null;
+  }
+  if (file.has_thumb !== 1) return null;
   // 与文本标题遮蔽成 *** 同一套逻辑：内容已被拒读时，缩略图同样不能外泄
   if (file.max_downloads >= 0 && file.download_count >= file.max_downloads) return null;
   const obj = await env.FILE_STORE.get(`thumb:${code}`);
@@ -424,13 +532,13 @@ export async function uploadText(
 
   const rawCode = typeof body['code'] === 'string' ? body['code'] : '';
   const limits = await resolveLimits(env);
-  const expireDefault = String(limits.defaultExpireDays);
-  const expireValueRaw = typeof body['expire_value'] === 'string' ? body['expire_value'] :
-                         typeof body['expire_days'] === 'string' ? body['expire_days'] : expireDefault;
-  const expireStyleRaw = typeof body['expire_style'] === 'string' ? body['expire_style'] : 'day';
-  const maxDownloadsRaw = typeof body['max_downloads'] === 'string' ? body['max_downloads'] : '-1';
-  const safeExpireValue = Number.isFinite(parseInt(expireValueRaw)) ? parseInt(expireValueRaw) : limits.defaultExpireDays;
-  const safeMaxDownloads = Number.isFinite(parseInt(maxDownloadsRaw)) ? parseInt(maxDownloadsRaw) : -1;
+  // 同 uploadFile：校验必须在抢码之前
+  const { expireAt, maxDownloads: effectiveMaxDownloads } = resolveExpire({
+    value: body['expire_value'] ?? body['expire_days'],
+    style: body['expire_style'],
+    maxDownloads: body['max_downloads'],
+    defaultDays: limits.defaultExpireDays,
+  });
 
   // 文本同样占 R2 对象，配额满了要一起拒绝，否则留个绕过口
   if (textSize > await remainingQuota(env, limits.maxTotalStorage)) {
@@ -438,9 +546,6 @@ export async function uploadText(
   }
 
   const code = await ensureCodeAvailable(rawCode, env);
-
-  const { expireAt, maxDownloads: parsedMaxDownloads } = parseExpire(safeExpireValue, expireStyleRaw);
-  const effectiveMaxDownloads = safeMaxDownloads >= 0 ? safeMaxDownloads : parsedMaxDownloads;
   const title = text.replace(/\s+/g, ' ').slice(0, 50) + (text.length > 50 ? '…' : '');
 
   try {
@@ -479,12 +584,19 @@ export async function selectFile(
   if (!code) throw { status: 422 as const, message: '缺少取件码' };
 
   const file = await getFileByCode(env.DB, code);
-  if (!file) return { file: null, notFound: true, maxExceeded: false };
+  if (!file) {
+    if (!(await registerLookupFailure(c, env))) {
+      throw { status: 429 as const, message: LOOKUP_RATE_MESSAGE };
+    }
+    return { file: null, notFound: true, maxExceeded: false };
+  }
 
-  // 并行化：同时执行下载计数和 R2 读取
+  // 并行化：同时执行下载计数和 R2 读取。
+  // POST select 只查状态，不能顺便把正文读出来 —— 否则 max_downloads 被完全绕过
+  const shouldReadText = countAsDownload && file.is_text === 1;
   const [downloaded, r2Obj] = await Promise.all([
     countAsDownload ? incrementDownload(env.DB, code) : Promise.resolve(true),
-    file.is_text === 1 ? env.FILE_STORE.get(`file:${code}`) : Promise.resolve(null),
+    shouldReadText ? env.FILE_STORE.get(`file:${code}`) : Promise.resolve(null),
   ]);
 
   if (!downloaded) return { file, notFound: false, maxExceeded: true };

@@ -44,25 +44,42 @@ export async function initDB(db: D1Database): Promise<void> {
       created_at TEXT NOT NULL,
       PRIMARY KEY (upload_id, part_number)
     )`,
+    // 取件码使用记录表：记录所有曾经使用过的取件码（含已过期/已删除），防止重复占用。
+    // created_at 用于回收“抢了码却再没落文件”的泄漏（崩溃、参数校验失败等），
+    // 没有它就只能把所有 used_codes 当成永久占用
+    `CREATE TABLE IF NOT EXISTS fc_used_codes (
+      code TEXT PRIMARY KEY,
+      created_at TEXT
+    )`,
   ];
   const migrations = [
     'ALTER TABLE fc_files ADD COLUMN is_text INTEGER DEFAULT 0',
     'ALTER TABLE fc_files ADD COLUMN has_thumb INTEGER DEFAULT 0',
     ADD_SESSION_COLUMN,
+    ADD_USED_CODES_TS,
   ];
-  for (const s of stmts) {
-    try { await db.prepare(s).run(); } catch { /* ignore */ }
-  }
+  // 一次 batch 建完全部表/索引：Free 计划每次调用只有 50 个子请求，
+  // initDB 每 30 分钟跑一次，不能在这里固定花掉十几次
+  await db.batch(stmts.map((s) => db.prepare(s)));
   for (const m of migrations) {
-    try { await db.prepare(m).run(); } catch { /* column already exists — ok */ }
+    try {
+      await db.prepare(m).run();
+    } catch (e: any) {
+      // 列已存在是正常情况；其他失败要留痕，别静默到后面才炸
+      if (!/duplicate column/i.test(String(e?.message ?? e))) {
+        console.error('initDB migration failed:', m, e);
+      }
+    }
   }
-
-  // 取件码使用记录表：记录所有曾经使用过的取件码（含已过期/已删除），防止重复占用
+  // 老库的 used_codes 没有时间戳：统一记为“现在”，给部署瞬间正在上传的请求留出宽限期。
+  // 之后 cleanupUsedCodes 只会回收超过宽限期、且没有对应文件/分片会话的记录
   try {
-    await db.prepare(`CREATE TABLE IF NOT EXISTS fc_used_codes (
-      code TEXT PRIMARY KEY
-    )`).run();
-  } catch { /* ignore */ }
+    await db.prepare('UPDATE fc_used_codes SET created_at = ? WHERE created_at IS NULL')
+      .bind(new Date().toISOString())
+      .run();
+  } catch (e) {
+    console.error('initDB used_codes backfill failed:', e);
+  }
 }
 
 // ---- 文件查询 ----
@@ -109,11 +126,23 @@ export async function isCodeTaken(db: D1Database, code: string): Promise<boolean
  * 并发同码时仅一个请求返回 true，消除 check-then-act 竞态窗口。
  */
 export async function claimCode(db: D1Database, code: string): Promise<boolean> {
-  const result = await db
-    .prepare('INSERT OR IGNORE INTO fc_used_codes(code) VALUES (?)')
-    .bind(code)
-    .run();
-  return result.meta.changes === 1;
+  const createdAt = new Date().toISOString();
+  const insert = () =>
+    db
+      .prepare('INSERT OR IGNORE INTO fc_used_codes(code, created_at) VALUES (?, ?)')
+      .bind(code, createdAt);
+  try {
+    return (await insert().run()).meta.changes === 1;
+  } catch (e: any) {
+    // 已部署的库可能还没跑过 initDB：就地补列，否则全新上传全部 500
+    if (!/has no column named|no such column/i.test(String(e?.message ?? e))) throw e;
+    try {
+      await db.prepare(ADD_USED_CODES_TS).run();
+    } catch (e2: any) {
+      if (!/duplicate column/i.test(String(e2?.message ?? e2))) throw e2;
+    }
+    return (await insert().run()).meta.changes === 1;
+  }
 }
 
 /** 释放取件码（删除/过期后允许复用） */
@@ -250,6 +279,7 @@ export async function markThumb(db: D1Database, code: string): Promise<void> {
  * 最长要等 30 分钟才补列，期间第一次分片 init 必须自己补上，否则整个分片通道都是 500
  */
 const ADD_SESSION_COLUMN = 'ALTER TABLE fc_chunk_uploads ADD COLUMN session_id TEXT';
+const ADD_USED_CODES_TS = 'ALTER TABLE fc_used_codes ADD COLUMN created_at TEXT';
 
 export async function insertChunkTask(db: D1Database, t: ChunkTask): Promise<void> {
   const stmt = () =>
@@ -364,21 +394,48 @@ export async function deleteFileRecord(
   return file;
 }
 
+/** 抢码后到落文件/分片行之间的保护期：单次上传最长 30s，1 小时足够覆盖重试与清理间隔 */
+export const CODE_RESERVATION_GRACE_MS = 3_600_000;
+
 /**
- * 清理 fc_used_codes 中已无对应文件的记录（含已过期未清理的）。
- * 作为防御性清理：若某次删除中途失败导致 releaseCode 未执行，
- * 此函数可在下次 scheduled 时补清，防止取件码被永久占用。
+ * 回收“抢了码但没有对应文件/分片会话”的记录。
+ *
+ * 必须同时排除 fc_chunk_uploads：分片会话在 init 时就占码，直到 complete 才写 fc_files，
+ * 只看 fc_files 会把正在上传的大文件码释放掉。
+ * 必须带宽限期：单文件上传同样是“先抢码、写完 R2 才写 fc_files”，
+ * 没有时间戳就无法区分“正在上传”和“泄漏”。老库由 initDB/本函数补时间戳。
+ * 作为防御性清理，scheduled 每轮无条件执行，而不是只在有过期文件时执行。
  */
-export async function cleanupUsedCodes(db: D1Database): Promise<number> {
-  const result = await db
-    .prepare(`
-      DELETE FROM fc_used_codes
-      WHERE code NOT IN (
-        SELECT code FROM fc_files
-      )
-    `)
-    .run();
-  return result.meta?.changes ?? 0;
+export async function cleanupUsedCodes(
+  db: D1Database,
+  olderThanMs = CODE_RESERVATION_GRACE_MS,
+): Promise<number> {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const remove = () =>
+    db
+      .prepare(`
+        DELETE FROM fc_used_codes
+        WHERE code NOT IN (SELECT code FROM fc_files)
+          AND code NOT IN (SELECT code FROM fc_chunk_uploads)
+          AND created_at IS NOT NULL
+          AND datetime(created_at) <= datetime(?)
+      `)
+      .bind(cutoff);
+  try {
+    return (await remove().run()).meta?.changes ?? 0;
+  } catch (e: any) {
+    if (!/has no column named|no such column/i.test(String(e?.message ?? e))) throw e;
+    try {
+      await db.prepare(ADD_USED_CODES_TS).run();
+    } catch (e2: any) {
+      if (!/duplicate column/i.test(String(e2?.message ?? e2))) throw e2;
+    }
+    // 存量行没有时间戳：记为现在，本次不删，留一个宽限期防止误伤正在上传的请求
+    await db.prepare('UPDATE fc_used_codes SET created_at = ? WHERE created_at IS NULL')
+      .bind(new Date().toISOString())
+      .run();
+    return 0;
+  }
 }
 
 // ---- 分页 ----
@@ -473,12 +530,12 @@ export async function getDashboardStats(db: D1Database): Promise<{
 export async function cleanupExpired(
   db: D1Database,
   bucket: R2Bucket,
-): Promise<{ expiredCount: number; cleanedCodes: number }> {
+): Promise<{ expiredCount: number }> {
   const expired = await db
     .prepare("SELECT * FROM fc_files WHERE datetime(expire_at) <= datetime('now')")
     .all<FileRecord>();
   const files = expired.results ?? [];
-  if (files.length === 0) return { expiredCount: 0, cleanedCodes: 0 };
+  if (files.length === 0) return { expiredCount: 0 };
 
   // 批量删除 R2 对象（每批最多 1000 键），避免逐个请求的 RTT。
   // 缩略图是内容的第二份副本，必须与主文件同时销毁，否则过期后仍能看图
@@ -487,14 +544,13 @@ export async function cleanupExpired(
     await bucket.delete(keys.slice(i, i + 1000));
   }
 
-  // 先删记录，再释放取件码（并行执行，释放顺序不影响结果）
+  // 不在这里逐个 releaseCode：过期文件一多，N 次 D1 调用会直接撞上 Free 计划
+  // 每次 50 个子请求的上限。cleanupUsedCodes 用一条 SQL 统一回收，
+  // 并且在 scheduled/admin 清理里独立执行，不再依赖“本次确实有文件过期”
   await db.prepare("DELETE FROM fc_files WHERE datetime(expire_at) <= datetime('now')").run();
   await adjustStorageUsed(db, -files.reduce((s, f) => s + (f.size || 0), 0));
-  await Promise.all(files.map((f) => releaseCode(db, f.code)));
 
-  const cleanedCodes = await cleanupUsedCodes(db);
-
-  return { expiredCount: files.length, cleanedCodes };
+  return { expiredCount: files.length };
 }
 
 // ---- 设置 ----
@@ -557,6 +613,12 @@ export function rateVerdict(
   return { allowed: next <= max, value: JSON.stringify({ count: next, windowStart }) };
 }
 
+/**
+ * 原子限流：读窗口、判断、递增在一条 UPSERT 里完成。
+ * 旧的“先 SELECT 再 SET”在并发下会互相覆盖计数，攻击者并发发起 N 个请求时
+ * 可以同时读到旧值并全部放行 —— 对 4 位取件码的失败查询尤其致命。
+ * 同时把两次 D1 调用压成一次，给 Free 计划的 50 子请求预算留余量。
+ */
 export async function checkRateLimit(
   db: D1Database,
   keyPrefix: string,
@@ -564,37 +626,57 @@ export async function checkRateLimit(
   max: number,
 ): Promise<boolean> {
   const key = `${keyPrefix}:${ip}`;
-  const raw = await getSetting(db, key);
-  const verdict = rateVerdict(raw, max);
-  await setSetting(db, key, verdict.value);
-  return verdict.allowed;
+  const now = Date.now();
+  const cutoff = now - RATE_WINDOW;
+  const row = await db
+    .prepare(`
+      INSERT INTO fc_settings(key, value)
+      VALUES (?, json_object('count', 1, 'windowStart', ?))
+      ON CONFLICT(key) DO UPDATE SET value = CASE
+        WHEN json_valid(fc_settings.value)
+         AND CAST(json_extract(fc_settings.value, '$.windowStart') AS INTEGER) > ?
+        THEN json_object(
+          'count', CAST(json_extract(fc_settings.value, '$.count') AS INTEGER) + 1,
+          'windowStart', CAST(json_extract(fc_settings.value, '$.windowStart') AS INTEGER)
+        )
+        ELSE json_object('count', 1, 'windowStart', ?)
+      END
+      RETURNING value
+    `)
+    .bind(key, now, cutoff, now)
+    .first<{ value: string }>();
+  try {
+    const count = Number(JSON.parse(row?.value ?? '').count);
+    return Number.isFinite(count) && count <= max;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * 清理已过窗口的限流键，防止 fc_settings 表随访问 IP 无限增长。
- * 由 scheduled 定期调用；损坏记录一并清除。
+ * 一条 SQL 清掉所有过期/损坏的限流键。
+ * 逐行删除会按 IP 数量线性消耗子请求，几十个上传 IP 就能把一次 Cron 打爆；
+ * 这里用 JSON1 直接在 SQL 里判断 windowStart。
  */
 export async function cleanupRateLimitEntries(db: D1Database): Promise<number> {
-  const rows = await db
-    .prepare(
-      "SELECT key, value FROM fc_settings WHERE key LIKE 'login_ratelimit:%' OR key LIKE 'upload_ratelimit:%' OR key LIKE 'thumb_ratelimit:%' OR key LIKE 'code_ratelimit:%' OR key LIKE 'chunk_ratelimit:%'",
-    )
-    .all<{ key: string; value: string }>();
-  const now = Date.now();
-  let removed = 0;
-  for (const row of rows.results ?? []) {
-    try {
-      const parsed = JSON.parse(row.value) as { windowStart: number };
-      if (now - parsed.windowStart > RATE_WINDOW) {
-        await db.prepare('DELETE FROM fc_settings WHERE key = ?').bind(row.key).run();
-        removed++;
-      }
-    } catch {
-      await db.prepare('DELETE FROM fc_settings WHERE key = ?').bind(row.key).run();
-      removed++;
-    }
-  }
-  return removed;
+  const cutoff = Date.now() - RATE_WINDOW;
+  const result = await db
+    .prepare(`
+      DELETE FROM fc_settings
+      WHERE (key LIKE 'login_ratelimit:%'
+          OR key LIKE 'upload_ratelimit:%'
+          OR key LIKE 'thumb_ratelimit:%'
+          OR key LIKE 'code_ratelimit:%'
+          OR key LIKE 'chunk_ratelimit:%'
+          OR key LIKE 'lookup_ratelimit:%')
+        AND (
+          NOT json_valid(value)
+          OR COALESCE(CAST(json_extract(value, '$.windowStart') AS INTEGER), 0) <= ?
+        )
+    `)
+    .bind(cutoff)
+    .run();
+  return result.meta?.changes ?? 0;
 }
 
 // ---- 孤儿 R2 对象清理 ----
@@ -628,20 +710,11 @@ export async function cleanupOrphanedR2Objects(
   }
   if (objects.length === 0) return { scanned: 0, removed: 0, usedBytes: 0 };
 
-  // 批量查询 D1 中存在的取件码（D1 单条查询绑定变量上限 100）；
-  // 主文件与缩略图共用一个 code，先去重再查，省掉一半绑定量
-  const BATCH = 100;
-  const codes = [...new Set(objects.map((o) => o.code))];
-  const activeCodes = new Set<string>();
-  for (let i = 0; i < codes.length; i += BATCH) {
-    const batch = codes.slice(i, i + BATCH);
-    const placeholders = batch.map(() => '?').join(',');
-    const rows = await db
-      .prepare(`SELECT code FROM fc_files WHERE code IN (${placeholders})`)
-      .bind(...batch)
-      .all<{ code: string }>();
-    for (const row of rows.results ?? []) activeCodes.add(row.code);
-  }
+  // 一次取回全部有效取件码，而不是按 100 个一批查。
+  // 4 位码最多 10,000 行，读取成本远小于 100 次 D1 往返 ——
+  // 后者在 Free 计划的 50 子请求上限下会让清理直接失败
+  const rows = await db.prepare('SELECT code FROM fc_files').all<{ code: string }>();
+  const activeCodes = new Set((rows.results ?? []).map((r) => r.code));
 
   // 删除孤儿对象（不在 D1 中的）。宽限期 1 小时：上传先写 R2 后写 D1，
   // 窗口内的正常对象无 D1 记录，过早清理会静默丢数据
@@ -655,6 +728,10 @@ export async function cleanupOrphanedR2Objects(
   const usedBytes = objects.reduce((s, o) => s + (removedSet.has(o.key) ? 0 : o.size), 0);
   if (orphanKeys.length === 0) return { scanned: objects.length, removed: 0, usedBytes };
 
-  await Promise.all(orphanKeys.map((k) => bucket.delete(k)));
+  // R2 的 delete 接受最多 1000 个键；逐个 delete 会同时撞上
+  // 6 个并发连接和 Free 计划 50 子请求的上限
+  for (let i = 0; i < orphanKeys.length; i += 1000) {
+    await bucket.delete(orphanKeys.slice(i, i + 1000));
+  }
   return { scanned: objects.length, removed: orphanKeys.length, usedBytes };
 }
